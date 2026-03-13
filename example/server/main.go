@@ -1,9 +1,11 @@
-// Command server starts a VNC server that serves a colour gradient test pattern.
-// Any standard VNC viewer (e.g. macOS Screen Sharing) can connect to it.
+// Command server starts a VNC server that shares the screen.
+// On macOS it captures the real screen and injects keyboard/mouse input.
+// Use -demo to show a test gradient pattern instead.
 //
 // Usage:
 //
-//	go run ./example/server                        # no auth, port 5900
+//	go run ./example/server                        # real screen sharing (macOS)
+//	go run ./example/server -demo                  # gradient test pattern
 //	go run ./example/server -port 5901             # custom port
 //	go run ./example/server -password secret       # VNC auth enabled
 package main
@@ -91,17 +93,37 @@ func main() {
 	password := flag.String("password", "", "VNC password (empty = no auth)")
 	width := flag.Int("width", 800, "Framebuffer width")
 	height := flag.Int("height", 600, "Framebuffer height")
+	demo := flag.Bool("demo", false, "Use gradient test pattern instead of real screen")
 	flag.Parse()
 
-	capturer := &gradientCapturer{
-		width:  uint16(*width),
-		height: uint16(*height),
+	var capturer rfb.ScreenCapturer
+	var inputHandler rfb.InputHandler
+
+	if *demo {
+		log.Println("using demo gradient capturer")
+		capturer = &gradientCapturer{
+			width:  uint16(*width),
+			height: uint16(*height),
+		}
+		inputHandler = &inputLogger{}
+	} else {
+		var err error
+		capturer, inputHandler, err = setupPlatformCaptureAndInput()
+		if err != nil {
+			log.Printf("platform capture/input unavailable: %v", err)
+			log.Println("falling back to demo gradient capturer")
+			capturer = &gradientCapturer{
+				width:  uint16(*width),
+				height: uint16(*height),
+			}
+			inputHandler = &inputLogger{}
+		}
 	}
 
 	config := rfb.ServerConfig{
-		Name:     "redvnc-example",
+		Name:     "redvnc",
 		Capturer: capturer,
-		Input:    &inputLogger{},
+		Input:    inputHandler,
 	}
 
 	if *password != "" {
