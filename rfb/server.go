@@ -353,6 +353,11 @@ func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) err
 		rectData = append(rectData, pixels[srcOffset:srcEnd]...)
 	}
 
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	rectData = ConvertPixels(c.pixelFormat, c.server.config.PixelFormat, rectData, w, h)
+
 	rect := Rectangle{
 		Header: RectHeader{
 			X:        req.X,
@@ -364,9 +369,6 @@ func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) err
 		Data: rectData,
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if err := WriteFramebufferUpdate(c.bw, []Rectangle{rect}); err != nil {
 		return err
 	}
@@ -374,7 +376,10 @@ func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) err
 }
 
 func (c *ClientConn) sendBlankFrame(req *FramebufferUpdateRequest) error {
-	bpp := 4
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	bpp := int(c.pixelFormat.BitsPerPixel) / 8
 	data := make([]byte, int(req.Width)*int(req.Height)*bpp)
 
 	rect := Rectangle{
@@ -387,9 +392,6 @@ func (c *ClientConn) sendBlankFrame(req *FramebufferUpdateRequest) error {
 		},
 		Data: data,
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	if err := WriteFramebufferUpdate(c.bw, []Rectangle{rect}); err != nil {
 		return err
