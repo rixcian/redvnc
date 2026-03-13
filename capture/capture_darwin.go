@@ -3,64 +3,10 @@
 package capture
 
 /*
-#cgo LDFLAGS: -framework CoreGraphics -framework CoreFoundation
-#include <CoreGraphics/CoreGraphics.h>
-
-// captureScreen captures the main display and returns BGRA pixel data.
-// The caller must free the returned buffer with free().
-static int captureScreen(uint32_t displayID, void **outBuf, int *outWidth, int *outHeight, int *outStride) {
-    CGImageRef image = CGDisplayCreateImage(displayID);
-    if (!image) {
-        return -1;
-    }
-
-    size_t w = CGImageGetWidth(image);
-    size_t h = CGImageGetHeight(image);
-
-    // Create a BGRA bitmap context.
-    size_t stride = w * 4;
-    void *buf = malloc(h * stride);
-    if (!buf) {
-        CGImageRelease(image);
-        return -2;
-    }
-
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(
-        buf, w, h, 8, stride,
-        cs,
-        kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little // BGRA
-    );
-    CGColorSpaceRelease(cs);
-    if (!ctx) {
-        free(buf);
-        CGImageRelease(image);
-        return -3;
-    }
-
-    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), image);
-    CGContextRelease(ctx);
-    CGImageRelease(image);
-
-    *outBuf = buf;
-    *outWidth = (int)w;
-    *outHeight = (int)h;
-    *outStride = (int)stride;
-    return 0;
-}
-
-static void getDisplaySize(uint32_t displayID, int *outWidth, int *outHeight) {
-    CGImageRef image = CGDisplayCreateImage(displayID);
-    if (image) {
-        *outWidth = (int)CGImageGetWidth(image);
-        *outHeight = (int)CGImageGetHeight(image);
-        CGImageRelease(image);
-    } else {
-        CGRect bounds = CGDisplayBounds(displayID);
-        *outWidth = (int)bounds.size.width;
-        *outHeight = (int)bounds.size.height;
-    }
-}
+#cgo CFLAGS: -x objective-c
+#cgo LDFLAGS: -framework ScreenCaptureKit -framework CoreGraphics -framework CoreFoundation -framework Foundation
+#include "screencapture_darwin.h"
+#include <stdlib.h>
 */
 import "C"
 
@@ -69,24 +15,24 @@ import (
 	"unsafe"
 )
 
-// CGCapture captures the screen using macOS CoreGraphics.
+// CGCapture captures the screen using macOS ScreenCaptureKit.
 type CGCapture struct {
-	displayID C.uint32_t
-	width     uint16
-	height    uint16
+	width  uint16
+	height uint16
 }
 
 func NewScreenCapture() (ScreenCapture, error) {
-	return &CGCapture{
-		displayID: C.CGMainDisplayID(),
-	}, nil
+	return &CGCapture{}, nil
 }
 
 func (c *CGCapture) Init() error {
 	var w, h C.int
-	C.getDisplaySize(c.displayID, &w, &h)
+	rc := C.sckit_get_display_size(&w, &h)
+	if rc != 0 {
+		return fmt.Errorf("failed to get display size (rc=%d, is Screen Recording permission granted?)", rc)
+	}
 	if w == 0 || h == 0 {
-		return fmt.Errorf("failed to get display size (is Screen Recording permission granted?)")
+		return fmt.Errorf("display size is 0x0")
 	}
 	c.width = uint16(w)
 	c.height = uint16(h)
@@ -101,9 +47,9 @@ func (c *CGCapture) Capture() ([]byte, int, error) {
 	var buf unsafe.Pointer
 	var w, h, stride C.int
 
-	rc := C.captureScreen(c.displayID, &buf, &w, &h, &stride)
+	rc := C.sckit_capture_screen(&buf, &w, &h, &stride)
 	if rc != 0 {
-		return nil, 0, fmt.Errorf("captureScreen failed: %d (is Screen Recording permission granted?)", rc)
+		return nil, 0, fmt.Errorf("screen capture failed (rc=%d)", rc)
 	}
 	defer C.free(buf)
 
