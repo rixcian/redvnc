@@ -26,6 +26,9 @@ redvnc/
 │   ├── input_linux.go           # XTest (stub)
 │   ├── input_windows.go         # SendInput (stub)
 │   └── input_darwin.go          # CGEvent (stub)
+├── example/                     # Ready-to-run examples
+│   ├── server/main.go           # VNC server with animated gradient
+│   └── client/main.go           # VNC client with PPM screenshot export
 └── capi/                        # C shared library exports
     └── exports.go               # //export functions for P/Invoke
 ```
@@ -56,6 +59,72 @@ go test ./...
 # Run tests with verbose output
 go test -v ./rfb/...
 ```
+
+## Quick Start (macOS)
+
+The `example/` folder contains a working server and client you can run in two terminal windows to see redvnc in action. No external VNC viewer required — but you can also use macOS **Screen Sharing** for a graphical view.
+
+### 1. Start the example server
+
+```bash
+# Terminal 1 — starts a VNC server on port 5900 with an animated gradient
+go run ./example/server
+
+# With a password:
+go run ./example/server -password secret
+
+# Custom resolution:
+go run ./example/server -width 1280 -height 720 -port 5901
+```
+
+The server generates a shifting colour gradient and logs all keyboard/pointer events received from clients.
+
+### 2. Connect with the example client
+
+```bash
+# Terminal 2 — connects, fetches one frame, and prints info
+go run ./example/client
+
+# Save a screenshot as PPM (opens natively in macOS Preview):
+go run ./example/client -output frame.ppm
+
+# Send test input events to the server:
+go run ./example/client -send-input
+
+# With password:
+go run ./example/client -password secret
+
+# Open the saved screenshot:
+open frame.ppm
+```
+
+### 3. Connect with macOS Screen Sharing
+
+macOS has a built-in VNC viewer. While the example server is running:
+
+```bash
+# Open Screen Sharing via the "Connect to Server" dialog:
+open vnc://localhost:5900
+```
+
+Or manually: **Finder > Go > Connect to Server** (Cmd+K) and enter `vnc://localhost:5900`.
+
+You should see the animated gradient pattern. Move your mouse or press keys — the server terminal will log each event.
+
+### All example flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| **Server** | | |
+| `-port` | `5900` | TCP port to listen on |
+| `-password` | *(none)* | VNC password (empty = no auth) |
+| `-width` | `800` | Framebuffer width in pixels |
+| `-height` | `600` | Framebuffer height in pixels |
+| **Client** | | |
+| `-addr` | `127.0.0.1:5900` | Server address to connect to |
+| `-password` | *(none)* | VNC password |
+| `-output` | *(none)* | Save first frame as PPM image |
+| `-send-input` | `false` | Send test key/pointer events |
 
 ## Usage
 
