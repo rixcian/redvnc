@@ -1,0 +1,125 @@
+// Command server starts a VNC server that serves a colour gradient test pattern.
+// Any standard VNC viewer (e.g. macOS Screen Sharing) can connect to it.
+//
+// Usage:
+//
+//	go run ./example/server                        # no auth, port 5900
+//	go run ./example/server -port 5901             # custom port
+//	go run ./example/server -password secret       # VNC auth enabled
+package main
+
+import (
+	"flag"
+	"fmt"
+	"log"
+	"math"
+	"sync"
+	"time"
+
+	"github.com/redamp-io/redvnc/rfb"
+	"github.com/redamp-io/redvnc/rfb/security"
+)
+
+// ---------------------------------------------------------------------------
+// Gradient screen capturer – generates a colour pattern that shifts over time
+// so you can visually confirm the framebuffer is updating.
+// ---------------------------------------------------------------------------
+
+type gradientCapturer struct {
+	width, height uint16
+	mu            sync.Mutex
+	frame         int
+}
+
+func (g *gradientCapturer) Bounds() (uint16, uint16) {
+	return g.width, g.height
+}
+
+func (g *gradientCapturer) Capture() ([]byte, int, error) {
+	g.mu.Lock()
+	g.frame++
+	frame := g.frame
+	g.mu.Unlock()
+
+	w := int(g.width)
+	h := int(g.height)
+	stride := w * 4
+	pixels := make([]byte, h*stride)
+
+	// Phase shifts the gradient so it visibly animates when the client
+	// requests successive frames.
+	phase := float64(frame) * 0.05
+
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			off := y*stride + x*4
+			r := uint8(127 + 127*math.Sin(phase+float64(x)*0.02))
+			g := uint8(127 + 127*math.Sin(phase+float64(y)*0.02))
+			b := uint8(127 + 127*math.Sin(phase+float64(x+y)*0.01))
+			// BGRA order (default pixel format)
+			pixels[off+0] = b
+			pixels[off+1] = g
+			pixels[off+2] = r
+			pixels[off+3] = 255
+		}
+	}
+	return pixels, stride, nil
+}
+
+// ---------------------------------------------------------------------------
+// Input logger – prints received keyboard and pointer events.
+// ---------------------------------------------------------------------------
+
+type inputLogger struct{}
+
+func (i *inputLogger) KeyEvent(down bool, key uint32) {
+	action := "up"
+	if down {
+		action = "down"
+	}
+	log.Printf("[input] key %s  keysym=0x%04x", action, key)
+}
+
+func (i *inputLogger) PointerEvent(buttonMask uint8, x, y uint16) {
+	log.Printf("[input] pointer  x=%d y=%d buttons=0b%08b", x, y, buttonMask)
+}
+
+// ---------------------------------------------------------------------------
+
+func main() {
+	port := flag.Int("port", 5900, "TCP port to listen on")
+	password := flag.String("password", "", "VNC password (empty = no auth)")
+	width := flag.Int("width", 800, "Framebuffer width")
+	height := flag.Int("height", 600, "Framebuffer height")
+	flag.Parse()
+
+	capturer := &gradientCapturer{
+		width:  uint16(*width),
+		height: uint16(*height),
+	}
+
+	config := rfb.ServerConfig{
+		Name:     "redvnc-example",
+		Capturer: capturer,
+		Input:    &inputLogger{},
+	}
+
+	if *password != "" {
+		config.Security = []rfb.SecurityHandler{
+			&security.VNCAuth{Password: *password},
+		}
+	}
+
+	// Periodically log that the server is alive.
+	go func() {
+		for {
+			time.Sleep(30 * time.Second)
+			log.Println("server running …")
+		}
+	}()
+
+	addr := fmt.Sprintf(":%d", *port)
+	server := rfb.NewServer(config)
+	log.Printf("starting VNC server on %s (password protected: %v)", addr, *password != "")
+	log.Fatal(server.ListenAndServe(addr))
+}

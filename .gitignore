@@ -1,0 +1,13 @@
+# Compiled binaries
+/server
+/client
+*.exe
+*.dll
+*.so
+*.dylib
+
+# C shared library output
+redvnc.h
+
+# Test/example output
+*.ppm
