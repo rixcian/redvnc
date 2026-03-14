@@ -153,7 +153,9 @@ type ClientConn struct {
 	pixelFormat PixelFormat
 	encodings   []int32
 
-	mu sync.Mutex
+	mu      sync.Mutex
+	fbReqCh chan *FramebufferUpdateRequest // async framebuffer updates
+	errCh   chan error                     // errors from the fb writer goroutine
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
@@ -166,6 +168,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 	s.addClient(c)
 	defer func() {
+		if c.fbReqCh != nil {
+			close(c.fbReqCh)
+		}
 		s.removeClient(c)
 		conn.Close()
 		log.Printf("client disconnected: %s", conn.RemoteAddr())
@@ -177,6 +182,11 @@ func (s *Server) handleConnection(conn net.Conn) {
 		log.Printf("handshake failed for %s: %v", conn.RemoteAddr(), err)
 		return
 	}
+
+	// Start async framebuffer writer goroutine
+	c.fbReqCh = make(chan *FramebufferUpdateRequest, 1)
+	c.errCh = make(chan error, 1)
+	go c.framebufferWriter()
 
 	if err := c.serveMessages(); err != nil {
 		log.Printf("client %s error: %v", conn.RemoteAddr(), err)
@@ -262,6 +272,13 @@ func (c *ClientConn) handshake() error {
 
 func (c *ClientConn) serveMessages() error {
 	for {
+		// Check for errors from the framebuffer writer goroutine
+		select {
+		case err := <-c.errCh:
+			return err
+		default:
+		}
+
 		var msgType uint8
 		if err := binary.Read(c.br, binary.BigEndian, &msgType); err != nil {
 			return fmt.Errorf("read message type: %w", err)
@@ -291,8 +308,11 @@ func (c *ClientConn) serveMessages() error {
 			if err != nil {
 				return err
 			}
-			if err := c.handleFramebufferRequest(req); err != nil {
-				return err
+			// Send to async framebuffer writer; drop if it's busy with a previous frame
+			select {
+			case c.fbReqCh <- req:
+			default:
+				// Writer is busy — drop this request; client will send another
 			}
 
 		case MsgKeyEvent:
@@ -300,6 +320,7 @@ func (c *ClientConn) serveMessages() error {
 			if err != nil {
 				return err
 			}
+			log.Printf("[input] key %s keysym=0x%04X", boolToAction(evt.DownFlag != 0), evt.Key)
 			if c.server.config.Input != nil {
 				c.server.config.Input.KeyEvent(evt.DownFlag != 0, evt.Key)
 			}
@@ -309,6 +330,7 @@ func (c *ClientConn) serveMessages() error {
 			if err != nil {
 				return err
 			}
+			log.Printf("[input] pointer x=%d y=%d buttons=0b%08b", evt.X, evt.Y, evt.ButtonMask)
 			if c.server.config.Input != nil {
 				c.server.config.Input.PointerEvent(evt.ButtonMask, evt.X, evt.Y)
 			}
@@ -324,6 +346,25 @@ func (c *ClientConn) serveMessages() error {
 			return fmt.Errorf("unknown message type: %d", msgType)
 		}
 	}
+}
+
+// framebufferWriter runs in a separate goroutine and processes framebuffer
+// update requests. This prevents slow screen captures from blocking the
+// message reading loop where input events are processed.
+func (c *ClientConn) framebufferWriter() {
+	for req := range c.fbReqCh {
+		if err := c.handleFramebufferRequest(req); err != nil {
+			c.errCh <- err
+			return
+		}
+	}
+}
+
+func boolToAction(down bool) string {
+	if down {
+		return "down"
+	}
+	return "up"
 }
 
 func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) error {
