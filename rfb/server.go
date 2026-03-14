@@ -2,6 +2,8 @@ package rfb
 
 import (
 	"bufio"
+	"bytes"
+	"compress/zlib"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -172,7 +174,9 @@ type ClientConn struct {
 	fbReqCh chan *FramebufferUpdateRequest // async framebuffer updates
 	errCh   chan error                     // errors from the fb writer goroutine
 
-	tightEnc MultiEncoder // lazy-initialized per-connection Tight encoder
+	tightEnc   MultiEncoder // lazy-initialized per-connection Tight encoder
+	zlibBuf    bytes.Buffer // persistent zlib buffer for Zlib encoding
+	zlibWriter *zlib.Writer // persistent zlib writer
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
@@ -448,6 +452,43 @@ func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) err
 			return fmt.Errorf("tight encode: %w", err)
 		}
 		if err := WriteFramebufferUpdate(c.bw, rects); err != nil {
+			return err
+		}
+		return c.bw.Flush()
+
+	case EncodingZlib:
+		rectData = ConvertPixels(c.pixelFormat, c.server.config.PixelFormat, rectData, w, h)
+
+		c.zlibBuf.Reset()
+		if c.zlibWriter == nil {
+			c.zlibWriter = zlib.NewWriter(&c.zlibBuf)
+		} else {
+			c.zlibWriter.Reset(&c.zlibBuf)
+		}
+		if _, err := c.zlibWriter.Write(rectData); err != nil {
+			return fmt.Errorf("zlib write: %w", err)
+		}
+		if err := c.zlibWriter.Close(); err != nil {
+			return fmt.Errorf("zlib close: %w", err)
+		}
+		c.zlibWriter = nil
+
+		compressedLen := c.zlibBuf.Len()
+		data := make([]byte, 4+compressedLen)
+		binary.BigEndian.PutUint32(data[0:4], uint32(compressedLen))
+		copy(data[4:], c.zlibBuf.Bytes())
+
+		rect := Rectangle{
+			Header: RectHeader{
+				X:        req.X,
+				Y:        req.Y,
+				Width:    req.Width,
+				Height:   req.Height,
+				Encoding: EncodingZlib,
+			},
+			Data: data,
+		}
+		if err := WriteFramebufferUpdate(c.bw, []Rectangle{rect}); err != nil {
 			return err
 		}
 		return c.bw.Flush()
