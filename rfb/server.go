@@ -10,6 +10,22 @@ import (
 	"sync"
 )
 
+// Encoder encodes framebuffer pixel data into RFB rectangles.
+type Encoder interface {
+	Encode(x, y, width, height uint16, pixels []byte, stride int) (*Rectangle, error)
+	Type() int32
+}
+
+// EncoderResetter is an Encoder that can release resources.
+type EncoderResetter interface {
+	Encoder
+	Reset()
+}
+
+// TightEncoderFactory creates a new Tight encoder instance.
+// Set this in ServerConfig to enable Tight encoding support.
+type TightEncoderFactory func() EncoderResetter
+
 // ScreenCapturer provides screen framebuffer data to the VNC server.
 type ScreenCapturer interface {
 	// Bounds returns the screen width and height.
@@ -54,6 +70,10 @@ type ServerConfig struct {
 
 	// PixelFormat is the server's native pixel format. If zero, DefaultPixelFormat() is used.
 	PixelFormat PixelFormat
+
+	// NewTightEncoder creates a Tight encoder for a client connection.
+	// If nil, Tight encoding is not available.
+	NewTightEncoder TightEncoderFactory
 }
 
 // Server is an RFB protocol server that accepts VNC client connections.
@@ -156,6 +176,8 @@ type ClientConn struct {
 	mu      sync.Mutex
 	fbReqCh chan *FramebufferUpdateRequest // async framebuffer updates
 	errCh   chan error                     // errors from the fb writer goroutine
+
+	tightEnc EncoderResetter // lazy-initialized per-connection Tight encoder
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
@@ -170,6 +192,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 	defer func() {
 		if c.fbReqCh != nil {
 			close(c.fbReqCh)
+		}
+		if c.tightEnc != nil {
+			c.tightEnc.Reset()
 		}
 		s.removeClient(c)
 		conn.Close()
@@ -367,6 +392,23 @@ func boolToAction(down bool) string {
 	return "up"
 }
 
+// bestEncoding returns the best encoding supported by the client, in preference
+// order: Tight > Zlib > Raw. Must be called with c.mu held.
+func (c *ClientConn) bestEncoding() int32 {
+	preference := []int32{EncodingTight, EncodingZlib, EncodingRaw}
+	for _, pref := range preference {
+		if pref == EncodingTight && c.server.config.NewTightEncoder == nil {
+			continue
+		}
+		for _, enc := range c.encodings {
+			if enc == pref {
+				return pref
+			}
+		}
+	}
+	return EncodingRaw
+}
+
 func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) error {
 	capturer := c.server.config.Capturer
 	if capturer == nil {
@@ -397,23 +439,41 @@ func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) err
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	rectData = ConvertPixels(c.pixelFormat, c.server.config.PixelFormat, rectData, w, h)
+	bestEnc := c.bestEncoding()
 
-	rect := Rectangle{
-		Header: RectHeader{
-			X:        req.X,
-			Y:        req.Y,
-			Width:    req.Width,
-			Height:   req.Height,
-			Encoding: EncodingRaw,
-		},
-		Data: rectData,
-	}
+	switch bestEnc {
+	case EncodingTight:
+		if c.tightEnc == nil {
+			c.tightEnc = c.server.config.NewTightEncoder()
+		}
+		rect, err := c.tightEnc.Encode(req.X, req.Y, req.Width, req.Height, pixels, stride)
+		if err != nil {
+			return fmt.Errorf("tight encode: %w", err)
+		}
+		if err := WriteFramebufferUpdate(c.bw, []Rectangle{*rect}); err != nil {
+			return err
+		}
+		return c.bw.Flush()
 
-	if err := WriteFramebufferUpdate(c.bw, []Rectangle{rect}); err != nil {
-		return err
+	default:
+		rectData = ConvertPixels(c.pixelFormat, c.server.config.PixelFormat, rectData, w, h)
+
+		rect := Rectangle{
+			Header: RectHeader{
+				X:        req.X,
+				Y:        req.Y,
+				Width:    req.Width,
+				Height:   req.Height,
+				Encoding: EncodingRaw,
+			},
+			Data: rectData,
+		}
+
+		if err := WriteFramebufferUpdate(c.bw, []Rectangle{rect}); err != nil {
+			return err
+		}
+		return c.bw.Flush()
 	}
-	return c.bw.Flush()
 }
 
 func (c *ClientConn) sendBlankFrame(req *FramebufferUpdateRequest) error {
