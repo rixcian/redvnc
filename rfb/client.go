@@ -455,13 +455,12 @@ func (c *Client) readServerCutText() (string, error) {
 	return string(text), nil
 }
 
-// readTightRect reads a Tight-encoded rectangle and returns decompressed BGRA pixel data.
+// readTightRect reads a Tight-encoded rectangle and returns decompressed BGRA pixel data
+// in scanline order (compatible with raw encoding layout).
 func (c *Client) readTightRect(width, height int) ([]byte, error) {
 	const tileSize = 64
-	var result []byte
 
-	totalPixels := width * height
-	result = make([]byte, 0, totalPixels*4)
+	result := make([]byte, width*height*4)
 
 	for tileY := 0; tileY < height; tileY += tileSize {
 		tileH := tileSize
@@ -478,7 +477,13 @@ func (c *Client) readTightRect(width, height int) ([]byte, error) {
 			if err != nil {
 				return nil, fmt.Errorf("tight tile (%d,%d): %w", tileX, tileY, err)
 			}
-			result = append(result, tileData...)
+
+			// Copy tile pixels into the correct scanline positions
+			for row := 0; row < tileH; row++ {
+				dstOff := ((tileY+row)*width + tileX) * 4
+				srcOff := row * tileW * 4
+				copy(result[dstOff:dstOff+tileW*4], tileData[srcOff:srcOff+tileW*4])
+			}
 		}
 	}
 

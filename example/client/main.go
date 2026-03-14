@@ -33,7 +33,7 @@ func main() {
 	client, err := rfb.Connect(*addr, rfb.ClientConfig{
 		Password:  *password,
 		Shared:    true,
-		Encodings: []int32{rfb.EncodingRaw},
+		Encodings: []int32{rfb.EncodingTight, rfb.EncodingRaw},
 	})
 	if err != nil {
 		log.Fatalf("connect failed: %v", err)
