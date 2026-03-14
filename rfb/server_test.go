@@ -1,9 +1,15 @@
 package rfb
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"testing"
 	"time"
@@ -245,4 +251,162 @@ func TestServerMultipleClients(t *testing.T) {
 	numClients = len(server.clients)
 	server.mu.Unlock()
 	fmt.Printf("remaining clients after close: %d\n", numClients)
+}
+
+// generateSelfSignedCert creates a self-signed TLS certificate for testing.
+func generateSelfSignedCert() (tls.Certificate, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("generate key: %w", err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(1 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost"},
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("create certificate: %w", err)
+	}
+
+	return tls.Certificate{
+		Certificate: [][]byte{certDER},
+		PrivateKey:  key,
+	}, nil
+}
+
+func TestTLSConnection(t *testing.T) {
+	cert, err := generateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("generate cert: %v", err)
+	}
+
+	server := NewServer(ServerConfig{
+		Width:  1024,
+		Height: 768,
+		Name:   "tls-test-server",
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{cert},
+		},
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go server.handleConnection(conn)
+		}
+	}()
+
+	addr := ln.Addr().String()
+
+	// Connect with TLS client
+	client, err := Connect(addr, ClientConfig{
+		Shared: true,
+		TLSConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Connect with TLS: %v", err)
+	}
+	defer client.Close()
+
+	if client.Width != 1024 || client.Height != 768 {
+		t.Errorf("expected 1024x768, got %dx%d", client.Width, client.Height)
+	}
+	if client.Name != "tls-test-server" {
+		t.Errorf("expected name 'tls-test-server', got '%s'", client.Name)
+	}
+
+	// Verify we can exchange data over the TLS connection
+	err = client.RequestFramebufferUpdate(false, 0, 0, client.Width, client.Height)
+	if err != nil {
+		t.Fatalf("RequestFramebufferUpdate: %v", err)
+	}
+
+	msgType, msg, err := client.ReadMessage()
+	if err != nil {
+		t.Fatalf("ReadMessage: %v", err)
+	}
+	if msgType != MsgFramebufferUpdate {
+		t.Fatalf("expected FramebufferUpdate, got %d", msgType)
+	}
+
+	update := msg.(*FramebufferUpdate)
+	if len(update.Rects) != 1 {
+		t.Fatalf("expected 1 rect, got %d", len(update.Rects))
+	}
+}
+
+func TestTLSConnectionFailsWithoutTLSClient(t *testing.T) {
+	cert, err := generateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("generate cert: %v", err)
+	}
+
+	server := NewServer(ServerConfig{
+		Width:  800,
+		Height: 600,
+		Name:   "tls-only",
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{cert},
+		},
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go server.handleConnection(conn)
+		}
+	}()
+
+	addr := ln.Addr().String()
+
+	// Connect WITHOUT TLS — should fail during handshake.
+	// Use a raw connection with a deadline since the TLS server will block
+	// waiting for a ClientHello that never comes in proper TLS format.
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
+
+	// Send a plain-text RFB version string (not TLS)
+	_, _ = conn.Write([]byte(VersionString3_8))
+
+	// Try to read — should get garbage or error since the server is speaking TLS
+	buf := make([]byte, 12)
+	_, err = io.ReadFull(conn, buf)
+	if err == nil {
+		// If we got data, it should not be a valid RFB version string
+		if string(buf) == VersionString3_8 {
+			t.Fatal("expected TLS server to not respond with plain RFB version")
+		}
+	}
+	// Either an error or non-RFB data confirms the plain client can't talk to a TLS server
 }

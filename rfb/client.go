@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/zlib"
 	"crypto/des"
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"image/jpeg"
@@ -24,6 +25,10 @@ type ClientConfig struct {
 	// Encodings is the list of supported encodings, in order of preference.
 	// If empty, only Raw encoding is requested.
 	Encodings []int32
+
+	// TLSConfig enables TLS encryption on the client. If non-nil, the client
+	// wraps the connection in TLS before the RFB handshake.
+	TLSConfig *tls.Config
 }
 
 // Client represents a VNC client connected to a server.
@@ -49,6 +54,10 @@ func Connect(addr string, config ClientConfig) (*Client, error) {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial: %w", err)
+	}
+
+	if config.TLSConfig != nil {
+		conn = tls.Client(conn, config.TLSConfig)
 	}
 
 	c := &Client{

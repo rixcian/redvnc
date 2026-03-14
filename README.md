@@ -256,6 +256,41 @@ client, err := rfb.Connect("192.168.1.100:5900", rfb.ClientConfig{
 })
 ```
 
+### Server with TLS Encryption
+
+```go
+import "crypto/tls"
+
+// Load or generate a TLS certificate
+cert, err := tls.LoadX509KeyPair("server.crt", "server.key")
+if err != nil {
+    log.Fatal(err)
+}
+
+server := rfb.NewServer(rfb.ServerConfig{
+    Width:  1024,
+    Height: 768,
+    Name:   "secure-desktop",
+    TLSConfig: &tls.Config{
+        Certificates: []tls.Certificate{cert},
+    },
+})
+
+log.Fatal(server.ListenAndServe(":5900"))
+```
+
+### Client with TLS Encryption
+
+```go
+import "crypto/tls"
+
+client, err := rfb.Connect("192.168.1.100:5900", rfb.ClientConfig{
+    TLSConfig: &tls.Config{
+        InsecureSkipVerify: true, // or configure proper CA verification
+    },
+})
+```
+
 ### Sending Input Events
 
 ```go
