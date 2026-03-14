@@ -201,8 +201,6 @@ static int win_pointer_button(uint32_t flags, int32_t mouseData) {
 */
 import "C"
 
-import "fmt"
-
 // WindowsInput injects input using the Windows SendInput API.
 type WindowsInput struct {
 	lastButtonMask uint8
