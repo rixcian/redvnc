@@ -6,7 +6,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/redamp-io/redvnc/rfb"
+	"github.com/rixcian/redvnc/rfb"
 )
 
 func makeTestPixels(width, height int) ([]byte, int) {

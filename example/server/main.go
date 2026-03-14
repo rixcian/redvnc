@@ -18,8 +18,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/redamp-io/redvnc/rfb"
-	"github.com/redamp-io/redvnc/rfb/security"
+	"github.com/rixcian/redvnc/rfb"
+	"github.com/rixcian/redvnc/rfb/security"
 )
 
 // ---------------------------------------------------------------------------

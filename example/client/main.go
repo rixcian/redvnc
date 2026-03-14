@@ -18,7 +18,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/redamp-io/redvnc/rfb"
+	"github.com/rixcian/redvnc/rfb"
 )
 
 func main() {

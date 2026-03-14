@@ -7,7 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/redamp-io/redvnc/rfb"
+	"github.com/rixcian/redvnc/rfb"
 )
 
 // Encoder encodes framebuffer pixel data into RFB rectangles.

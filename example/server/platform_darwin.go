@@ -5,9 +5,9 @@ package main
 import (
 	"log"
 
-	"github.com/redamp-io/redvnc/capture"
-	"github.com/redamp-io/redvnc/input"
-	"github.com/redamp-io/redvnc/rfb"
+	"github.com/rixcian/redvnc/capture"
+	"github.com/rixcian/redvnc/input"
+	"github.com/rixcian/redvnc/rfb"
 )
 
 // inputInjectorAdapter wraps input.InputInjector to implement rfb.InputHandler.
