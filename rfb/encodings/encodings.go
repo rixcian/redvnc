@@ -89,13 +89,14 @@ func (z *Zlib) Type() int32 { return rfb.EncodingZlib }
 func (z *Zlib) Encode(x, y, width, height uint16, pixels []byte, stride int) (*rfb.Rectangle, error) {
 	bpp := 4
 
-	// Initialize zlib writer on first use (reuse across calls for better compression)
+	// The zlib stream must persist across calls — the client maintains a single
+	// decompressor. Reset only the buffer so the dictionary is preserved, then
+	// Flush (Z_SYNC_FLUSH) instead of Close to avoid writing final block markers.
 	if z.writer == nil {
 		z.writer = zlib.NewWriter(&z.buf)
 	}
 
 	z.buf.Reset()
-	z.writer.Reset(&z.buf)
 
 	for row := 0; row < int(height); row++ {
 		srcY := int(y) + row
@@ -109,10 +110,9 @@ func (z *Zlib) Encode(x, y, width, height uint16, pixels []byte, stride int) (*r
 		}
 	}
 
-	if err := z.writer.Close(); err != nil {
-		return nil, fmt.Errorf("zlib close: %w", err)
+	if err := z.writer.Flush(); err != nil {
+		return nil, fmt.Errorf("zlib flush: %w", err)
 	}
-	z.writer = nil
 
 	// Zlib encoding: 4-byte length prefix + compressed data
 	compressedLen := z.buf.Len()

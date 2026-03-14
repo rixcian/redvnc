@@ -459,19 +459,19 @@ func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) err
 	case EncodingZlib:
 		rectData = ConvertPixels(c.pixelFormat, c.server.config.PixelFormat, rectData, w, h)
 
+		// The zlib stream must persist across frames — the client maintains a
+		// single decompressor. Reset only the buffer (not the writer) so the
+		// dictionary is preserved, then Flush (Z_SYNC_FLUSH) instead of Close.
 		c.zlibBuf.Reset()
 		if c.zlibWriter == nil {
 			c.zlibWriter = zlib.NewWriter(&c.zlibBuf)
-		} else {
-			c.zlibWriter.Reset(&c.zlibBuf)
 		}
 		if _, err := c.zlibWriter.Write(rectData); err != nil {
 			return fmt.Errorf("zlib write: %w", err)
 		}
-		if err := c.zlibWriter.Close(); err != nil {
-			return fmt.Errorf("zlib close: %w", err)
+		if err := c.zlibWriter.Flush(); err != nil {
+			return fmt.Errorf("zlib flush: %w", err)
 		}
-		c.zlibWriter = nil
 
 		compressedLen := c.zlibBuf.Len()
 		data := make([]byte, 4+compressedLen)
