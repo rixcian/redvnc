@@ -4,23 +4,33 @@
 
 This document specifies two new components for the redvnc project:
 
-1. **`wsproxy`** — A Go WebSocket-to-TCP proxy that bridges browser clients to the existing RFB/VNC server, with extended message types for clipboard sync and file upload.
-2. **`web`** — A React/TypeScript browser client library that renders VNC framebuffers on a `<canvas>`, handles user input, clipboard integration, and file uploads.
+1. **`wsproxy`** — A Go WebSocket-to-TCP proxy that bridges browser clients to VNC servers. The proxy handles multiple simultaneous client connections, each to a potentially different VNC server. It supports extended message types for clipboard sync and file upload.
+2. **`web`** — A React/TypeScript browser client library that renders VNC framebuffers on a `<canvas>`, handles user input, clipboard integration, and file uploads. The client specifies which VNC server (IP:port) to connect to when opening the WebSocket.
 
-Both components communicate over a single WebSocket connection using a binary protocol that wraps standard RFB messages and adds custom extension messages.
+Each client–proxy session communicates over a single WebSocket connection using a binary protocol that wraps standard RFB messages and adds custom extension messages. The proxy manages all sessions independently and concurrently.
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────────┐         WebSocket (wss://)         ┌──────────────────┐        TCP (:5900)        ┌──────────────────┐
-│   Browser Client │ ◄────────────────────────────────► │   wsproxy        │ ◄──────────────────────► │   redvnc Server  │
-│   (React/TS)     │   Binary frames (RFB + extensions) │   (Go)           │   Standard RFB protocol  │   (Go)           │
-└──────────────────┘                                    └──────────────────┘                          └──────────────────┘
+┌──────────────────┐                                    ┌──────────────────┐                          ┌──────────────────┐
+│  Browser Client  │ ──  WebSocket (wss://)  ──────────►│                  │ ──  TCP (10.0.0.1:5900)─►│  VNC Server A    │
+│  (React/TS)      │   target=10.0.0.1:5900             │                  │                          └──────────────────┘
+└──────────────────┘                                    │                  │
+                                                        │   wsproxy (Go)   │
+┌──────────────────┐                                    │                  │                          ┌──────────────────┐
+│  Browser Client  │ ──  WebSocket (wss://)  ──────────►│                  │ ──  TCP (10.0.0.2:5901)─►│  VNC Server B    │
+│  (React/TS)      │   target=10.0.0.2:5901             │                  │                          └──────────────────┘
+└──────────────────┘                                    │                  │
+                                                        │                  │                          ┌──────────────────┐
+┌──────────────────┐                                    │                  │ ──  TCP (10.0.0.1:5900)─►│  VNC Server A    │
+│  Browser Client  │ ──  WebSocket (wss://)  ──────────►│                  │     (2nd connection)     │  (shared)        │
+│  (React/TS)      │   target=10.0.0.1:5900             │                  │                          └──────────────────┘
+└──────────────────┘                                    └──────────────────┘
 ```
 
-The proxy is **not** a VNC client itself — it performs a byte-level relay of the RFB protocol between the WebSocket and the TCP connection. Extension messages (clipboard, file upload) are intercepted and handled by the proxy before/after relay.
+The proxy is **not** a VNC client itself — it performs a byte-level relay of the RFB protocol between each WebSocket and its corresponding TCP connection. Extension messages (clipboard, file upload) are intercepted and handled by the proxy before/after relay. Each client connection results in an independent TCP connection to the target VNC server; the proxy does not multiplex or share TCP connections between clients.
 
 ---
 
@@ -30,8 +40,9 @@ The proxy is **not** a VNC client itself — it performs a byte-level relay of t
 
 ```
 wsproxy/
-├── proxy.go          # Core proxy logic, WebSocket ↔ TCP relay
-├── server.go         # HTTP server, WebSocket upgrade, configuration
+├── proxy.go          # Core proxy logic, WebSocket ↔ TCP relay (per-session)
+├── session.go        # Session lifecycle and state management
+├── server.go         # HTTP server, WebSocket upgrade, configuration, connection manager
 ├── clipboard.go      # Clipboard extension message handling
 ├── fileupload.go     # File upload extension message handling
 └── wsproxy_test.go   # Tests
@@ -44,11 +55,25 @@ type Config struct {
     // ListenAddr is the HTTP/WebSocket listen address (e.g. ":8080").
     ListenAddr string
 
-    // VNCAddr is the backend VNC server address (e.g. "localhost:5900").
-    VNCAddr string
+    // AllowedVNCTargets is a whitelist of VNC server addresses (host:port) that
+    // clients are permitted to connect to. Each entry is a "host:port" string.
+    // If empty, clients may connect to ANY target (open relay — use with caution).
+    // The proxy rejects connection requests to targets not in this list.
+    AllowedVNCTargets []string
 
-    // VNCPassword is the VNC authentication password. Empty means no auth.
-    VNCPassword string
+    // DefaultVNCPassword is the VNC authentication password used when the
+    // client does not supply one. Empty means no auth.
+    DefaultVNCPassword string
+
+    // MaxConnections is the maximum number of simultaneous client sessions
+    // (WebSocket ↔ TCP pairs) the proxy will accept. New connections beyond
+    // this limit receive HTTP 503 Service Unavailable. Default: 100.
+    MaxConnections int
+
+    // MaxConnectionsPerTarget limits how many simultaneous sessions can
+    // connect to the same VNC target (host:port). 0 means unlimited.
+    // Default: 10.
+    MaxConnectionsPerTarget int
 
     // DefaultUploadDir is the fallback directory used when the client does not
     // specify a destination in UploadBegin. Defaults to the OS-specific
@@ -77,17 +102,25 @@ type Config struct {
 
 ### 1.3 Connection Lifecycle
 
-1. Browser opens WebSocket to `ws(s)://host:port/ws?password=<optional>`
-2. Proxy opens TCP connection to the VNC server at `VNCAddr`
-3. Proxy performs the RFB handshake with the VNC server on behalf of the browser client:
+1. Browser opens WebSocket to `ws(s)://host:port/ws?target=<ip:port>&password=<optional>`
+   - The **`target`** query parameter is **required** and specifies the VNC server address the client wants to connect to (e.g. `target=192.168.1.50:5900`).
+   - The `password` query parameter is optional and overrides `DefaultVNCPassword` for this session.
+2. Proxy validates the request:
+   - Checks that `target` is present and well-formed (`host:port`)
+   - If `AllowedVNCTargets` is non-empty, verifies the target is in the allowlist. If not, the proxy rejects the WebSocket upgrade with HTTP 403 Forbidden and a JSON error body: `{"error": "target not allowed"}`.
+   - Checks that `MaxConnections` and `MaxConnectionsPerTarget` limits are not exceeded. If exceeded, responds with HTTP 503 Service Unavailable.
+3. Proxy opens a new TCP connection to the VNC server at the client-specified `target`
+4. Proxy performs the RFB handshake with the VNC server on behalf of the browser client:
    - Sends RFB 3.8 version
-   - Handles security negotiation (None or VNCAuth using configured password)
+   - Handles security negotiation (None or VNCAuth using the client-supplied or default password)
    - Sends ClientInit with shared=1
    - Receives ServerInit
-4. Proxy sends a **session init** extension message to the browser (see §3.1) containing the ServerInit data
-5. From this point, the proxy enters **relay mode**:
+5. Proxy sends a **session init** extension message to the browser (see §3.1) containing the ServerInit data
+6. From this point, the proxy enters **relay mode** for this session:
    - **Browser → VNC**: Binary WebSocket frames are parsed for the message type byte. Standard RFB client messages (types 0–6) are forwarded to the VNC TCP connection as-is. Extension messages (types 128+) are intercepted and handled by the proxy.
    - **VNC → Browser**: TCP data from the VNC server is forwarded to the browser as binary WebSocket frames, unchanged. The proxy also injects extension messages when needed (e.g., clipboard pushes).
+
+Each WebSocket connection creates an independent session with its own TCP connection to the target VNC server. Multiple clients can connect to the same or different VNC servers simultaneously.
 
 ### 1.4 VNC Handshake Delegation
 
@@ -97,9 +130,34 @@ The proxy performs the full RFB handshake with the VNC server so the browser nev
 - The browser immediately starts sending `SetPixelFormat`, `SetEncodings`, and `FramebufferUpdateRequest` messages (standard RFB, relayed directly)
 - The browser receives `FramebufferUpdate`, `ServerCutText`, and `Bell` messages from the VNC server (relayed directly)
 
-### 1.5 Proxy Shutdown
+### 1.5 Session Teardown
 
-On WebSocket close or TCP disconnect, the proxy tears down both connections and cleans up any in-progress file upload state.
+On WebSocket close or TCP disconnect, the proxy tears down both sides of that individual session and cleans up any in-progress file upload state. Other active sessions are not affected.
+
+### 1.6 Connection Management
+
+The proxy maintains a connection manager that tracks all active sessions. Each session is identified by a unique session ID (UUID) assigned at WebSocket upgrade time.
+
+**Session state tracked per connection:**
+- Session ID (UUID)
+- Client remote address
+- Target VNC address (from the `target` query parameter)
+- WebSocket connection handle
+- TCP connection handle
+- Active upload state (upload IDs, partial files)
+- Connection timestamps (created, last activity)
+
+**Concurrency controls:**
+- `MaxConnections` limits the total number of active sessions across all targets. Default: 100.
+- `MaxConnectionsPerTarget` limits how many sessions can be connected to the same `host:port` at once. Default: 10. This prevents a single target from being overwhelmed.
+- Connection counts are updated atomically on session creation and teardown.
+
+**Graceful shutdown:**
+- On SIGTERM/SIGINT, the proxy stops accepting new WebSocket connections, sends a WebSocket close frame to all active clients, waits up to 10 seconds for sessions to drain, then forcefully closes remaining connections.
+
+### 1.7 Proxy Shutdown
+
+On process shutdown, the proxy gracefully drains all active sessions as described in §1.6.
 
 ---
 
@@ -178,7 +236,8 @@ export class VncClient {
 
 interface VncClientOptions {
   url: string;           // WebSocket URL: "ws://host:port/ws"
-  password?: string;     // Sent as query param or in session init
+  target: string;        // VNC server address to connect to (e.g. "192.168.1.50:5900")
+  password?: string;     // VNC password, sent as query param
   viewOnly?: boolean;    // Disable input events
   scaleToFit?: boolean;  // Scale framebuffer to canvas size
   clipboardSync?: boolean; // Auto-sync browser clipboard (default: true)
@@ -195,6 +254,7 @@ interface UploadOptions {
 
 interface VncViewerProps {
   url: string;
+  target: string;        // VNC server address (e.g. "192.168.1.50:5900")
   password?: string;
   viewOnly?: boolean;
   scaleToFit?: boolean;
@@ -411,19 +471,24 @@ The proxy's `AllowedUploadDirs` restricts which directories clients may write to
 - CLI flag: `--allowed-upload-dir /path/a --allowed-upload-dir /path/b` (repeatable)
 - Config struct: `Config.DefaultUploadDir`, `Config.AllowedUploadDirs`
 
+Note: Upload directories are local to the proxy host, not the VNC server. This is relevant when the proxy and VNC server run on different machines.
+
 The directory is created if it doesn't exist (provided it passes the authorization check).
 
 ---
 
 ## 5. Security Considerations
 
-1. **Origin checking**: The proxy validates the `Origin` header against `AllowedOrigins` to prevent unauthorized cross-origin connections.
-2. **Filename sanitization**: Uploaded filenames are stripped of path separators, `..`, null bytes, and control characters. Only the basename is used.
-3. **Upload size limits**: Enforced at both UploadBegin (reject immediately) and UploadChunk (track running total).
-4. **Upload directory authorization**: The proxy resolves the client-requested directory to an absolute path, follows symlinks, and verifies it falls within `AllowedUploadDirs` (or `DefaultUploadDir`). Path traversal via `..` or symlinks outside allowed directories is rejected.
-5. **WebSocket binary mode**: All frames use binary mode (opcode 0x02). Text frames are rejected.
-6. **Password handling**: VNC passwords are sent to the proxy via query parameter over WSS (TLS), or via the SessionInit handshake. They are never logged.
-7. **Rate limiting**: The proxy limits concurrent uploads per connection (max 4) and rejects new upload requests beyond the limit.
+1. **VNC target allowlisting**: When `AllowedVNCTargets` is configured, the proxy only permits connections to listed `host:port` pairs. Requests to unlisted targets are rejected at WebSocket upgrade time (HTTP 403). **If `AllowedVNCTargets` is empty, the proxy operates as an open relay — this should only be used in trusted networks.**
+2. **Connection limits**: `MaxConnections` and `MaxConnectionsPerTarget` prevent resource exhaustion and protect individual VNC servers from being overwhelmed by too many proxied sessions.
+3. **Origin checking**: The proxy validates the `Origin` header against `AllowedOrigins` to prevent unauthorized cross-origin connections.
+4. **Filename sanitization**: Uploaded filenames are stripped of path separators, `..`, null bytes, and control characters. Only the basename is used.
+5. **Upload size limits**: Enforced at both UploadBegin (reject immediately) and UploadChunk (track running total).
+6. **Upload directory authorization**: The proxy resolves the client-requested directory to an absolute path, follows symlinks, and verifies it falls within `AllowedUploadDirs` (or `DefaultUploadDir`). Path traversal via `..` or symlinks outside allowed directories is rejected.
+7. **WebSocket binary mode**: All frames use binary mode (opcode 0x02). Text frames are rejected.
+8. **Password handling**: VNC passwords are sent to the proxy via query parameter over WSS (TLS). They are never logged. The `target` query parameter is also not logged in production mode.
+9. **Rate limiting**: The proxy limits concurrent uploads per connection (max 4) and rejects new upload requests beyond the limit.
+10. **Session isolation**: Each client session is fully isolated — a misbehaving or disconnected client cannot affect other sessions.
 
 ---
 
@@ -433,8 +498,12 @@ The directory is created if it doesn't exist (provided it passes the authorizati
 
 ```
 Browser                         Proxy                          VNC Server
+   │                              │                          (10.0.0.5:5900)
    │                              │                               │
-   │──── WS Connect ─────────────►│                               │
+   │── WS Connect ───────────────►│                               │
+   │   ?target=10.0.0.5:5900      │                               │
+   │   &password=secret           │  (validate target allowlist)  │
+   │                              │  (check connection limits)    │
    │                              │──── TCP Connect ──────────────►│
    │                              │◄─── RFB 003.008\n ────────────│
    │                              │──── RFB 003.008\n ────────────►│
@@ -533,14 +602,28 @@ Byte offset   Value                       Field
 # Build
 cd wsproxy && go build -o redvnc-wsproxy ./cmd
 
-# Run (connects to local VNC server on :5900)
-./redvnc-wsproxy --listen :8080 --vnc localhost:5900
+# Run as open relay (any VNC target allowed — use only in trusted networks)
+./redvnc-wsproxy --listen :8080
+
+# Restrict to specific VNC targets
+./redvnc-wsproxy --listen :8080 \
+  --allowed-vnc-target 10.0.0.5:5900 \
+  --allowed-vnc-target 10.0.0.6:5900 \
+  --allowed-vnc-target 192.168.1.100:5901
 
 # With TLS
-./redvnc-wsproxy --listen :8443 --vnc localhost:5900 --tls-cert cert.pem --tls-key key.pem
+./redvnc-wsproxy --listen :8443 --tls-cert cert.pem --tls-key key.pem \
+  --allowed-vnc-target 10.0.0.5:5900
+
+# With connection limits
+./redvnc-wsproxy --listen :8080 \
+  --max-connections 200 \
+  --max-connections-per-target 20 \
+  --allowed-vnc-target 10.0.0.5:5900
 
 # Custom default upload directory and allowed directories
-./redvnc-wsproxy --listen :8080 --vnc localhost:5900 \
+./redvnc-wsproxy --listen :8080 \
+  --allowed-vnc-target 10.0.0.5:5900 \
   --default-upload-dir /tmp/uploads \
   --allowed-upload-dir /tmp/uploads \
   --allowed-upload-dir /home/user/Documents
@@ -566,6 +649,7 @@ function App() {
   return (
     <VncViewer
       url="ws://localhost:8080/ws"
+      target="10.0.0.5:5900"
       scaleToFit
       onConnect={() => console.log('Connected')}
     />
@@ -594,8 +678,9 @@ function App() {
 
 Recommended implementation sequence:
 
-1. **Proxy: basic relay** — WebSocket upgrade, TCP connect, RFB handshake, bidirectional byte relay, SessionInit message
-2. **Browser: connection + raw rendering** — WebSocket connect, SessionInit parse, SetPixelFormat/SetEncodings, FramebufferUpdateRequest loop, Raw encoding decoder, canvas rendering
+1. **Proxy: basic relay with target routing** — WebSocket upgrade, `target` query param parsing, target allowlist validation, TCP connect to client-specified target, RFB handshake, bidirectional byte relay, SessionInit message
+2. **Proxy: connection manager** — Session tracking, `MaxConnections` / `MaxConnectionsPerTarget` enforcement, graceful shutdown with session draining
+3. **Browser: connection + raw rendering** — WebSocket connect with `target` param, SessionInit parse, SetPixelFormat/SetEncodings, FramebufferUpdateRequest loop, Raw encoding decoder, canvas rendering
 3. **Browser: input** — Keyboard keysym mapping, pointer events, touch events
 4. **Browser: CopyRect + Zlib decoders** — Add remaining encoding decoders
 5. **Browser: Tight decoder** — Tight encoding with JPEG tiles
