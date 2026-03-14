@@ -437,6 +437,23 @@ func (c *Client) readFramebufferUpdate() (*FramebufferUpdate, error) {
 				return nil, fmt.Errorf("read tight rect: %w", err)
 			}
 			rect.Data = data
+		case EncodingCursor:
+			// Cursor pseudo-encoding: pixel data + bitmask.
+			// X,Y in the header are the hotspot coordinates.
+			bpp := int(c.PixelFormat.BitsPerPixel) / 8
+			pixelDataLen := int(rect.Width) * int(rect.Height) * bpp
+			maskRowBytes := (int(rect.Width) + 7) / 8
+			maskLen := maskRowBytes * int(rect.Height)
+			rect.Data = make([]byte, pixelDataLen+maskLen)
+			if _, err := io.ReadFull(c.br, rect.Data); err != nil {
+				return nil, fmt.Errorf("read cursor data: %w", err)
+			}
+		case EncodingDesktopSize:
+			// DesktopSize pseudo-encoding: no pixel data.
+			// Width/Height in the header carry the new screen dimensions.
+			c.Width = rect.Width
+			c.Height = rect.Height
+			rect.Data = nil
 		default:
 			return nil, fmt.Errorf("unsupported encoding: %d", rect.Encoding)
 		}

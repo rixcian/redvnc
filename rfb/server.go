@@ -41,6 +41,14 @@ type InputHandler interface {
 	PointerEvent(buttonMask uint8, x, y uint16)
 }
 
+// CursorProvider supplies cursor image data to the server.
+// The server calls Cursor() when building framebuffer updates for clients
+// that support the Cursor pseudo-encoding.
+type CursorProvider interface {
+	// Cursor returns the current cursor image, or nil if no cursor update is needed.
+	Cursor() *CursorImage
+}
+
 // SecurityHandler performs the security handshake with a client.
 type SecurityHandler interface {
 	Type() uint8
@@ -72,6 +80,10 @@ type ServerConfig struct {
 	// NewTightEncoder creates a Tight encoder for a client connection.
 	// If nil, Tight encoding is not available.
 	NewTightEncoder TightEncoderFactory
+
+	// CursorProvider supplies cursor images for the Cursor pseudo-encoding.
+	// If nil, cursor pseudo-encoding is not used.
+	CursorProvider CursorProvider
 
 	// TLSConfig enables TLS encryption on the server. If non-nil, the server
 	// wraps each accepted connection in TLS before the RFB handshake.
@@ -182,6 +194,8 @@ type ClientConn struct {
 	tightEnc   MultiEncoder // lazy-initialized per-connection Tight encoder
 	zlibBuf    bytes.Buffer // persistent zlib buffer for Zlib encoding
 	zlibWriter *zlib.Writer // persistent zlib writer
+
+	lastCursor *CursorImage // last cursor sent to this client
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
@@ -418,6 +432,26 @@ func (c *ClientConn) bestEncoding() int32 {
 	return EncodingRaw
 }
 
+// supportsCursor returns true if the client advertised EncodingCursor. Must be called with c.mu held.
+func (c *ClientConn) supportsCursor() bool {
+	for _, enc := range c.encodings {
+		if enc == EncodingCursor {
+			return true
+		}
+	}
+	return false
+}
+
+// supportsDesktopSize returns true if the client advertised EncodingDesktopSize. Must be called with c.mu held.
+func (c *ClientConn) supportsDesktopSize() bool {
+	for _, enc := range c.encodings {
+		if enc == EncodingDesktopSize {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) error {
 	capturer := c.server.config.Capturer
 	if capturer == nil {
@@ -429,6 +463,9 @@ func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) err
 	if err != nil {
 		return fmt.Errorf("capture: %w", err)
 	}
+
+	// Check if the screen has been resized since the last frame.
+	capW, capH := capturer.Bounds()
 
 	bpp := 4 // 32-bit pixels
 	w := int(req.Width)
@@ -448,6 +485,30 @@ func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) err
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Collect pseudo-encoding rectangles to prepend to the update.
+	var pseudoRects []Rectangle
+
+	// Desktop resize: if the capturer's bounds differ from what we last told the client,
+	// send a DesktopSize pseudo-rect so the client can reallocate its framebuffer.
+	if c.supportsDesktopSize() {
+		if capW != c.server.config.Width || capH != c.server.config.Height {
+			c.server.config.Width = capW
+			c.server.config.Height = capH
+			pseudoRects = append(pseudoRects, EncodeDesktopSizeRect(capW, capH))
+			log.Printf("sending desktop resize: %dx%d", capW, capH)
+		}
+	}
+
+	// Cursor: send a cursor shape update if the provider has a new cursor image.
+	if c.supportsCursor() && c.server.config.CursorProvider != nil {
+		cursor := c.server.config.CursorProvider.Cursor()
+		if cursor != nil && cursor != c.lastCursor {
+			pseudoRects = append(pseudoRects, EncodeCursorRect(cursor, c.pixelFormat, c.server.config.PixelFormat))
+			c.lastCursor = cursor
+			log.Printf("sending cursor update: %dx%d hotspot=(%d,%d)", cursor.Width, cursor.Height, cursor.HotspotX, cursor.HotspotY)
+		}
+	}
+
 	bestEnc := c.bestEncoding()
 	log.Printf("best encoding: %d (encodings=%v, tightFactory=%v)", bestEnc, c.encodings, c.server.config.NewTightEncoder != nil)
 
@@ -460,6 +521,7 @@ func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) err
 		if err != nil {
 			return fmt.Errorf("tight encode: %w", err)
 		}
+		rects = append(pseudoRects, rects...)
 		if err := WriteFramebufferUpdate(c.bw, rects); err != nil {
 			return err
 		}
@@ -497,7 +559,8 @@ func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) err
 			},
 			Data: data,
 		}
-		if err := WriteFramebufferUpdate(c.bw, []Rectangle{rect}); err != nil {
+		allRects := append(pseudoRects, rect)
+		if err := WriteFramebufferUpdate(c.bw, allRects); err != nil {
 			return err
 		}
 		return c.bw.Flush()
@@ -516,10 +579,74 @@ func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) err
 			Data: rectData,
 		}
 
-		if err := WriteFramebufferUpdate(c.bw, []Rectangle{rect}); err != nil {
+		allRects := append(pseudoRects, rect)
+		if err := WriteFramebufferUpdate(c.bw, allRects); err != nil {
 			return err
 		}
 		return c.bw.Flush()
+	}
+}
+
+// NotifyDesktopResize notifies all connected clients that support the DesktopSize
+// pseudo-encoding about a screen resolution change. Clients that don't support
+// the encoding are unaffected — they continue at the old resolution.
+func (s *Server) NotifyDesktopResize(width, height uint16) {
+	s.mu.Lock()
+	s.config.Width = width
+	s.config.Height = height
+	clients := make([]*ClientConn, 0, len(s.clients))
+	for c := range s.clients {
+		clients = append(clients, c)
+	}
+	s.mu.Unlock()
+
+	for _, c := range clients {
+		c.mu.Lock()
+		if c.supportsDesktopSize() {
+			rect := EncodeDesktopSizeRect(width, height)
+			if err := WriteFramebufferUpdate(c.bw, []Rectangle{rect}); err != nil {
+				c.mu.Unlock()
+				log.Printf("desktop resize notify error for %s: %v", c.conn.RemoteAddr(), err)
+				continue
+			}
+			if err := c.bw.Flush(); err != nil {
+				c.mu.Unlock()
+				log.Printf("desktop resize flush error for %s: %v", c.conn.RemoteAddr(), err)
+				continue
+			}
+			log.Printf("notified %s of desktop resize: %dx%d", c.conn.RemoteAddr(), width, height)
+		}
+		c.mu.Unlock()
+	}
+}
+
+// SendCursorUpdate sends a cursor shape update to all connected clients that
+// support the Cursor pseudo-encoding.
+func (s *Server) SendCursorUpdate(cursor *CursorImage) {
+	s.mu.Lock()
+	clients := make([]*ClientConn, 0, len(s.clients))
+	for c := range s.clients {
+		clients = append(clients, c)
+	}
+	s.mu.Unlock()
+
+	for _, c := range clients {
+		c.mu.Lock()
+		if c.supportsCursor() {
+			rect := EncodeCursorRect(cursor, c.pixelFormat, s.config.PixelFormat)
+			if err := WriteFramebufferUpdate(c.bw, []Rectangle{rect}); err != nil {
+				c.mu.Unlock()
+				log.Printf("cursor update error for %s: %v", c.conn.RemoteAddr(), err)
+				continue
+			}
+			if err := c.bw.Flush(); err != nil {
+				c.mu.Unlock()
+				log.Printf("cursor flush error for %s: %v", c.conn.RemoteAddr(), err)
+				continue
+			}
+			c.lastCursor = cursor
+		}
+		c.mu.Unlock()
 	}
 }
 
