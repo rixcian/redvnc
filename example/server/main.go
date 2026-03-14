@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/rixcian/redvnc/rfb"
+	"github.com/rixcian/redvnc/rfb/encodings"
 	"github.com/rixcian/redvnc/rfb/security"
 )
 
@@ -124,6 +125,9 @@ func main() {
 		Name:     "redvnc",
 		Capturer: capturer,
 		Input:    inputHandler,
+		NewTightEncoder: func() rfb.EncoderResetter {
+			return encodings.NewTight(75)
+		},
 	}
 
 	if *password != "" {

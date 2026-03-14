@@ -2,9 +2,12 @@ package rfb
 
 import (
 	"bufio"
+	"bytes"
+	"compress/zlib"
 	"crypto/des"
 	"encoding/binary"
 	"fmt"
+	"image/jpeg"
 	"io"
 	"net"
 	"sync"
@@ -37,6 +40,8 @@ type Client struct {
 	Name        string
 
 	mu sync.Mutex
+
+	tightStreams [4]*bytes.Buffer // persistent zlib decompression buffers for Tight
 }
 
 // Connect establishes a VNC client connection to the given address.
@@ -417,6 +422,12 @@ func (c *Client) readFramebufferUpdate() (*FramebufferUpdate, error) {
 			if _, err := io.ReadFull(c.br, rect.Data); err != nil {
 				return nil, fmt.Errorf("read zlib data: %w", err)
 			}
+		case EncodingTight:
+			data, err := c.readTightRect(int(rect.Width), int(rect.Height))
+			if err != nil {
+				return nil, fmt.Errorf("read tight rect: %w", err)
+			}
+			rect.Data = data
 		default:
 			return nil, fmt.Errorf("unsupported encoding: %d", rect.Encoding)
 		}
@@ -442,6 +453,150 @@ func (c *Client) readServerCutText() (string, error) {
 		return "", err
 	}
 	return string(text), nil
+}
+
+// readTightRect reads a Tight-encoded rectangle and returns decompressed BGRA pixel data
+// in scanline order (compatible with raw encoding layout).
+func (c *Client) readTightRect(width, height int) ([]byte, error) {
+	const tileSize = 64
+
+	result := make([]byte, width*height*4)
+
+	for tileY := 0; tileY < height; tileY += tileSize {
+		tileH := tileSize
+		if tileY+tileH > height {
+			tileH = height - tileY
+		}
+		for tileX := 0; tileX < width; tileX += tileSize {
+			tileW := tileSize
+			if tileX+tileW > width {
+				tileW = width - tileX
+			}
+
+			tileData, err := c.readTightTile(tileW, tileH)
+			if err != nil {
+				return nil, fmt.Errorf("tight tile (%d,%d): %w", tileX, tileY, err)
+			}
+
+			// Copy tile pixels into the correct scanline positions
+			for row := 0; row < tileH; row++ {
+				dstOff := ((tileY+row)*width + tileX) * 4
+				srcOff := row * tileW * 4
+				copy(result[dstOff:dstOff+tileW*4], tileData[srcOff:srcOff+tileW*4])
+			}
+		}
+	}
+
+	return result, nil
+}
+
+func (c *Client) readTightTile(tileW, tileH int) ([]byte, error) {
+	// Read compression control byte
+	var controlByte uint8
+	if err := binary.Read(c.br, binary.BigEndian, &controlByte); err != nil {
+		return nil, fmt.Errorf("read tight control byte: %w", err)
+	}
+
+	subEncoding := controlByte & 0x0F
+
+	switch {
+	case subEncoding == 0x08: // Fill
+		rgb := make([]byte, 3)
+		if _, err := io.ReadFull(c.br, rgb); err != nil {
+			return nil, fmt.Errorf("read tight fill color: %w", err)
+		}
+		// Convert RGB to BGRA tiles
+		pixels := make([]byte, tileW*tileH*4)
+		for i := 0; i < tileW*tileH; i++ {
+			off := i * 4
+			pixels[off] = rgb[2]   // B
+			pixels[off+1] = rgb[1] // G
+			pixels[off+2] = rgb[0] // R
+			pixels[off+3] = 255    // A
+		}
+		return pixels, nil
+
+	case subEncoding == 0x09: // JPEG
+		length, err := c.readCompactLen()
+		if err != nil {
+			return nil, fmt.Errorf("read tight jpeg length: %w", err)
+		}
+		jpegData := make([]byte, length)
+		if _, err := io.ReadFull(c.br, jpegData); err != nil {
+			return nil, fmt.Errorf("read tight jpeg data: %w", err)
+		}
+		img, err := jpeg.Decode(bytes.NewReader(jpegData))
+		if err != nil {
+			return nil, fmt.Errorf("decode tight jpeg: %w", err)
+		}
+		bounds := img.Bounds()
+		pixels := make([]byte, bounds.Dx()*bounds.Dy()*4)
+		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+			for x := bounds.Min.X; x < bounds.Max.X; x++ {
+				r, g, b, _ := img.At(x, y).RGBA()
+				off := ((y-bounds.Min.Y)*bounds.Dx() + (x - bounds.Min.X)) * 4
+				pixels[off] = byte(b >> 8)   // B
+				pixels[off+1] = byte(g >> 8) // G
+				pixels[off+2] = byte(r >> 8) // R
+				pixels[off+3] = 255          // A
+			}
+		}
+		return pixels, nil
+
+	default: // Basic (0x00-0x07)
+		length, err := c.readCompactLen()
+		if err != nil {
+			return nil, fmt.Errorf("read tight basic length: %w", err)
+		}
+		compressed := make([]byte, length)
+		if _, err := io.ReadFull(c.br, compressed); err != nil {
+			return nil, fmt.Errorf("read tight basic data: %w", err)
+		}
+		reader, err := zlib.NewReader(bytes.NewReader(compressed))
+		if err != nil {
+			return nil, fmt.Errorf("zlib reader: %w", err)
+		}
+		rgb, err := io.ReadAll(reader)
+		reader.Close()
+		if err != nil {
+			return nil, fmt.Errorf("decompress tight basic: %w", err)
+		}
+		// Convert RGB to BGRA
+		numPixels := len(rgb) / 3
+		pixels := make([]byte, numPixels*4)
+		for i := 0; i < numPixels; i++ {
+			srcOff := i * 3
+			dstOff := i * 4
+			pixels[dstOff] = rgb[srcOff+2]   // B
+			pixels[dstOff+1] = rgb[srcOff+1] // G
+			pixels[dstOff+2] = rgb[srcOff]   // R
+			pixels[dstOff+3] = 255           // A
+		}
+		return pixels, nil
+	}
+}
+
+func (c *Client) readCompactLen() (int, error) {
+	var b [1]byte
+	if _, err := io.ReadFull(c.br, b[:]); err != nil {
+		return 0, err
+	}
+	n := int(b[0]) & 0x7F
+	if b[0]&0x80 == 0 {
+		return n, nil
+	}
+	if _, err := io.ReadFull(c.br, b[:]); err != nil {
+		return 0, err
+	}
+	n |= (int(b[0]) & 0x7F) << 7
+	if b[0]&0x80 == 0 {
+		return n, nil
+	}
+	if _, err := io.ReadFull(c.br, b[:]); err != nil {
+		return 0, err
+	}
+	n |= int(b[0]) << 14
+	return n, nil
 }
 
 // Close closes the client connection.
