@@ -205,6 +205,51 @@ func TestTightMultiTile(t *testing.T) {
 	}
 }
 
+func TestTightEncodeMultiTileRects(t *testing.T) {
+	enc := NewTight(75)
+	defer enc.Reset()
+
+	// 130x130 at offset (10,20) -> 3x3 = 9 separate rectangles
+	w, h := 130, 130
+	fbW, fbH := 200, 200
+	pixels, stride := makeSolidPixels(fbW, fbH, 0xFF, 0x00, 0x00)
+
+	rects, err := enc.EncodeMulti(10, 20, uint16(w), uint16(h), pixels, stride)
+	if err != nil {
+		t.Fatalf("Tight.EncodeMulti: %v", err)
+	}
+
+	if len(rects) != 9 {
+		t.Fatalf("expected 9 tile rectangles, got %d", len(rects))
+	}
+
+	// Verify tile positions and sizes
+	expectedTiles := []struct {
+		x, y, w, h uint16
+	}{
+		{10, 20, 64, 64}, {74, 20, 64, 64}, {138, 20, 2, 64},
+		{10, 84, 64, 64}, {74, 84, 64, 64}, {138, 84, 2, 64},
+		{10, 148, 64, 2}, {74, 148, 64, 2}, {138, 148, 2, 2},
+	}
+
+	for i, exp := range expectedTiles {
+		r := rects[i]
+		if r.Header.X != exp.x || r.Header.Y != exp.y ||
+			r.Header.Width != exp.w || r.Header.Height != exp.h {
+			t.Errorf("tile %d: expected pos=(%d,%d) size=%dx%d, got pos=(%d,%d) size=%dx%d",
+				i, exp.x, exp.y, exp.w, exp.h,
+				r.Header.X, r.Header.Y, r.Header.Width, r.Header.Height)
+		}
+		if r.Header.Encoding != rfb.EncodingTight {
+			t.Errorf("tile %d: expected encoding Tight, got %d", i, r.Header.Encoding)
+		}
+		// Each solid tile: control 0x08 + RGB
+		if len(r.Data) != 4 || r.Data[0] != 0x08 {
+			t.Errorf("tile %d: expected solid fill data, got %v", i, r.Data)
+		}
+	}
+}
+
 func TestCompactLen(t *testing.T) {
 	tests := []struct {
 		input    int

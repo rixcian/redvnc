@@ -10,21 +10,16 @@ import (
 	"sync"
 )
 
-// Encoder encodes framebuffer pixel data into RFB rectangles.
-type Encoder interface {
-	Encode(x, y, width, height uint16, pixels []byte, stride int) (*Rectangle, error)
+// MultiEncoder encodes framebuffer pixel data into multiple RFB rectangles (e.g. tiles).
+type MultiEncoder interface {
+	EncodeMulti(x, y, width, height uint16, pixels []byte, stride int) ([]Rectangle, error)
 	Type() int32
-}
-
-// EncoderResetter is an Encoder that can release resources.
-type EncoderResetter interface {
-	Encoder
 	Reset()
 }
 
 // TightEncoderFactory creates a new Tight encoder instance.
 // Set this in ServerConfig to enable Tight encoding support.
-type TightEncoderFactory func() EncoderResetter
+type TightEncoderFactory func() MultiEncoder
 
 // ScreenCapturer provides screen framebuffer data to the VNC server.
 type ScreenCapturer interface {
@@ -177,7 +172,7 @@ type ClientConn struct {
 	fbReqCh chan *FramebufferUpdateRequest // async framebuffer updates
 	errCh   chan error                     // errors from the fb writer goroutine
 
-	tightEnc EncoderResetter // lazy-initialized per-connection Tight encoder
+	tightEnc MultiEncoder // lazy-initialized per-connection Tight encoder
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
@@ -327,6 +322,7 @@ func (c *ClientConn) serveMessages() error {
 			c.mu.Lock()
 			c.encodings = encs
 			c.mu.Unlock()
+			log.Printf("client encodings: %v", encs)
 
 		case MsgFramebufferUpdateRequest:
 			req, err := ReadFramebufferUpdateRequest(c.br)
@@ -440,17 +436,18 @@ func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) err
 	defer c.mu.Unlock()
 
 	bestEnc := c.bestEncoding()
+	log.Printf("best encoding: %d (encodings=%v, tightFactory=%v)", bestEnc, c.encodings, c.server.config.NewTightEncoder != nil)
 
 	switch bestEnc {
 	case EncodingTight:
 		if c.tightEnc == nil {
 			c.tightEnc = c.server.config.NewTightEncoder()
 		}
-		rect, err := c.tightEnc.Encode(req.X, req.Y, req.Width, req.Height, pixels, stride)
+		rects, err := c.tightEnc.EncodeMulti(req.X, req.Y, req.Width, req.Height, pixels, stride)
 		if err != nil {
 			return fmt.Errorf("tight encode: %w", err)
 		}
-		if err := WriteFramebufferUpdate(c.bw, []Rectangle{*rect}); err != nil {
+		if err := WriteFramebufferUpdate(c.bw, rects); err != nil {
 			return err
 		}
 		return c.bw.Flush()

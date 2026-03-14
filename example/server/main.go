@@ -125,7 +125,7 @@ func main() {
 		Name:     "redvnc",
 		Capturer: capturer,
 		Input:    inputHandler,
-		NewTightEncoder: func() rfb.EncoderResetter {
+		NewTightEncoder: func() rfb.MultiEncoder {
 			return encodings.NewTight(75)
 		},
 	}
