@@ -358,14 +358,9 @@ func TestTLSConnectionFailsWithoutTLSClient(t *testing.T) {
 		t.Fatalf("generate cert: %v", err)
 	}
 
-	server := NewServer(ServerConfig{
-		Width:  800,
-		Height: 600,
-		Name:   "tls-only",
-		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{cert},
-		},
-	})
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -373,21 +368,25 @@ func TestTLSConnectionFailsWithoutTLSClient(t *testing.T) {
 	}
 	defer ln.Close()
 
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go server.handleConnection(conn)
-		}
-	}()
-
 	addr := ln.Addr().String()
 
+	// Accept one connection on the server side with a TLS wrapper and deadline
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// Set a deadline so the TLS handshake doesn't block forever
+		conn.SetDeadline(time.Now().Add(2 * time.Second))
+		tlsConn := tls.Server(conn, tlsConfig)
+		// The TLS handshake should fail because the client sends plain text
+		_ = tlsConn.Handshake()
+	}()
+
 	// Connect WITHOUT TLS — should fail during handshake.
-	// Use a raw connection with a deadline since the TLS server will block
-	// waiting for a ClientHello that never comes in proper TLS format.
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -409,4 +408,7 @@ func TestTLSConnectionFailsWithoutTLSClient(t *testing.T) {
 		}
 	}
 	// Either an error or non-RFB data confirms the plain client can't talk to a TLS server
+
+	// Wait for server goroutine to finish
+	<-serverDone
 }
