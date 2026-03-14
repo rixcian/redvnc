@@ -47,7 +47,7 @@ For building the C shared library (`capi/`), a C compiler is required:
 
 ```bash
 # Clone the repository
-git clone https://github.com/redamp-io/redvnc.git
+git clone https://github.com/rixcian/redvnc.git
 cd redvnc
 
 # Verify everything compiles
@@ -136,8 +136,8 @@ package main
 import (
     "log"
 
-    "github.com/redamp-io/redvnc/rfb"
-    "github.com/redamp-io/redvnc/rfb/security"
+    "github.com/rixcian/redvnc/rfb"
+    "github.com/rixcian/redvnc/rfb/security"
 )
 
 func main() {
@@ -213,7 +213,7 @@ import (
     "fmt"
     "log"
 
-    "github.com/redamp-io/redvnc/rfb"
+    "github.com/rixcian/redvnc/rfb"
 )
 
 func main() {
@@ -253,6 +253,41 @@ client, err := rfb.Connect("192.168.1.100:5900", rfb.ClientConfig{
     Password:  "secret",
     Shared:    true,
     Encodings: []int32{rfb.EncodingZlib, rfb.EncodingRaw},
+})
+```
+
+### Server with TLS Encryption
+
+```go
+import "crypto/tls"
+
+// Load or generate a TLS certificate
+cert, err := tls.LoadX509KeyPair("server.crt", "server.key")
+if err != nil {
+    log.Fatal(err)
+}
+
+server := rfb.NewServer(rfb.ServerConfig{
+    Width:  1024,
+    Height: 768,
+    Name:   "secure-desktop",
+    TLSConfig: &tls.Config{
+        Certificates: []tls.Certificate{cert},
+    },
+})
+
+log.Fatal(server.ListenAndServe(":5900"))
+```
+
+### Client with TLS Encryption
+
+```go
+import "crypto/tls"
+
+client, err := rfb.Connect("192.168.1.100:5900", rfb.ClientConfig{
+    TLSConfig: &tls.Config{
+        InsecureSkipVerify: true, // or configure proper CA verification
+    },
 })
 ```
 
@@ -367,8 +402,8 @@ To create a platform-specific capturer or injector:
 
 ```go
 import (
-    "github.com/redamp-io/redvnc/capture"
-    "github.com/redamp-io/redvnc/input"
+    "github.com/rixcian/redvnc/capture"
+    "github.com/rixcian/redvnc/input"
 )
 
 cap, err := capture.NewScreenCapture()

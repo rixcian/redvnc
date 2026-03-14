@@ -54,7 +54,10 @@ func (v *VNCAuth) Handshake(rw io.ReadWriter) error {
 	}
 
 	// Verify response
-	expected := vncEncrypt(challenge, v.Password)
+	expected, err := vncEncrypt(challenge, v.Password)
+	if err != nil {
+		return fmt.Errorf("vnc auth encrypt: %w", err)
+	}
 	ok := true
 	for i := range expected {
 		if expected[i] != response[i] {
@@ -84,7 +87,7 @@ func (v *VNCAuth) Handshake(rw io.ReadWriter) error {
 // vncEncrypt encrypts a 16-byte challenge using the VNC DES scheme.
 // The password is truncated/padded to 8 bytes, each byte is bit-reversed,
 // then used as the DES key to encrypt the challenge.
-func vncEncrypt(challenge []byte, password string) []byte {
+func vncEncrypt(challenge []byte, password string) ([]byte, error) {
 	key := make([]byte, 8)
 	copy(key, []byte(password))
 
@@ -95,14 +98,13 @@ func vncEncrypt(challenge []byte, password string) []byte {
 
 	cipher, err := des.NewCipher(key)
 	if err != nil {
-		// Should never happen with an 8-byte key
-		panic(fmt.Sprintf("des.NewCipher: %v", err))
+		return nil, fmt.Errorf("des.NewCipher: %w", err)
 	}
 
 	result := make([]byte, 16)
 	cipher.Encrypt(result[:8], challenge[:8])
 	cipher.Encrypt(result[8:], challenge[8:])
-	return result
+	return result, nil
 }
 
 // reverseBits reverses the bit order of a byte.
@@ -124,7 +126,10 @@ func VNCAuthClient(rw io.ReadWriter, password string) error {
 	}
 
 	// Send encrypted response
-	response := vncEncrypt(challenge, password)
+	response, err := vncEncrypt(challenge, password)
+	if err != nil {
+		return fmt.Errorf("vnc auth encrypt: %w", err)
+	}
 	if _, err := rw.Write(response); err != nil {
 		return fmt.Errorf("send response: %w", err)
 	}

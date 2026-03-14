@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/zlib"
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -71,6 +72,10 @@ type ServerConfig struct {
 	// NewTightEncoder creates a Tight encoder for a client connection.
 	// If nil, Tight encoding is not available.
 	NewTightEncoder TightEncoderFactory
+
+	// TLSConfig enables TLS encryption on the server. If non-nil, the server
+	// wraps each accepted connection in TLS before the RFB handshake.
+	TLSConfig *tls.Config
 }
 
 // Server is an RFB protocol server that accepts VNC client connections.
@@ -180,6 +185,10 @@ type ClientConn struct {
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
+	if s.config.TLSConfig != nil {
+		conn = tls.Server(conn, s.config.TLSConfig)
+	}
+
 	c := &ClientConn{
 		conn:        conn,
 		br:          bufio.NewReader(conn),
