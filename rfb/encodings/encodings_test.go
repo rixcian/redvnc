@@ -121,14 +121,16 @@ func TestZlibEncode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("zlib.NewReader: %v", err)
 	}
-	decompressed, err := io.ReadAll(reader)
-	if err != nil {
-		t.Fatalf("decompress: %v", err)
-	}
+	// The zlib stream is flushed (Z_SYNC_FLUSH) not closed, so ReadAll may
+	// return unexpected EOF. The decompressed data is still valid.
+	decompressed, readErr := io.ReadAll(reader)
 	reader.Close()
 
 	expectedLen := width * height * 4
 	if len(decompressed) != expectedLen {
+		if readErr != nil {
+			t.Fatalf("decompress: %v (got %d bytes, expected %d)", readErr, len(decompressed), expectedLen)
+		}
 		t.Errorf("decompressed length: expected %d, got %d", expectedLen, len(decompressed))
 	}
 	if !bytes.Equal(decompressed, pixels) {
