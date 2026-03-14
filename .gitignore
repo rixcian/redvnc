@@ -11,3 +11,7 @@ redvnc.h
 
 # Test/example output
 *.ppm
+
+# Node.js
+node_modules/
+web/dist/
