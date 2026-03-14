@@ -179,6 +179,92 @@ func TestReadClientCutText(t *testing.T) {
 	}
 }
 
+func TestEncodeCursorRect(t *testing.T) {
+	pf := DefaultPixelFormat()
+	// 2x2 cursor with hotspot at (1,1)
+	cursor := &CursorImage{
+		Width:    2,
+		Height:   2,
+		HotspotX: 1,
+		HotspotY: 1,
+		Pixels:   make([]byte, 2*2*4), // 4 pixels * 4 bpp
+		Mask:     []byte{0xC0, 0xC0},  // 2 rows, ceil(2/8)=1 byte each, top 2 bits set
+	}
+	// Fill first pixel red (BGRA: 0,0,255,255)
+	cursor.Pixels[0] = 0
+	cursor.Pixels[1] = 0
+	cursor.Pixels[2] = 255
+	cursor.Pixels[3] = 255
+
+	rect := EncodeCursorRect(cursor, pf, pf)
+
+	if rect.Header.Encoding != EncodingCursor {
+		t.Errorf("expected encoding %d, got %d", EncodingCursor, rect.Header.Encoding)
+	}
+	if rect.Header.X != 1 || rect.Header.Y != 1 {
+		t.Errorf("expected hotspot (1,1), got (%d,%d)", rect.Header.X, rect.Header.Y)
+	}
+	if rect.Header.Width != 2 || rect.Header.Height != 2 {
+		t.Errorf("expected 2x2, got %dx%d", rect.Header.Width, rect.Header.Height)
+	}
+	expectedDataLen := 2*2*4 + 2 // pixels + mask
+	if len(rect.Data) != expectedDataLen {
+		t.Errorf("expected data len %d, got %d", expectedDataLen, len(rect.Data))
+	}
+}
+
+func TestEncodeDesktopSizeRect(t *testing.T) {
+	rect := EncodeDesktopSizeRect(1920, 1080)
+
+	if rect.Header.Encoding != EncodingDesktopSize {
+		t.Errorf("expected encoding %d, got %d", EncodingDesktopSize, rect.Header.Encoding)
+	}
+	if rect.Header.X != 0 || rect.Header.Y != 0 {
+		t.Errorf("expected (0,0), got (%d,%d)", rect.Header.X, rect.Header.Y)
+	}
+	if rect.Header.Width != 1920 || rect.Header.Height != 1080 {
+		t.Errorf("expected 1920x1080, got %dx%d", rect.Header.Width, rect.Header.Height)
+	}
+	if rect.Data != nil {
+		t.Errorf("expected nil data, got %d bytes", len(rect.Data))
+	}
+}
+
+func TestEncodeCursorRectWireFormat(t *testing.T) {
+	pf := DefaultPixelFormat()
+	cursor := &CursorImage{
+		Width:    1,
+		Height:   1,
+		HotspotX: 0,
+		HotspotY: 0,
+		Pixels:   []byte{0, 0, 255, 255}, // BGRA red pixel
+		Mask:     []byte{0x80},            // one pixel set
+	}
+
+	rect := EncodeCursorRect(cursor, pf, pf)
+
+	// Write to buffer and verify wire format
+	var buf bytes.Buffer
+	err := WriteFramebufferUpdate(&buf, []Rectangle{rect})
+	if err != nil {
+		t.Fatalf("WriteFramebufferUpdate: %v", err)
+	}
+
+	data := buf.Bytes()
+	if data[0] != MsgFramebufferUpdate {
+		t.Errorf("expected msg type %d, got %d", MsgFramebufferUpdate, data[0])
+	}
+	numRects := binary.BigEndian.Uint16(data[2:4])
+	if numRects != 1 {
+		t.Errorf("expected 1 rect, got %d", numRects)
+	}
+	// RectHeader starts at offset 4: X(2) Y(2) W(2) H(2) Enc(4) = 12 bytes
+	encoding := int32(binary.BigEndian.Uint32(data[12:16]))
+	if encoding != EncodingCursor {
+		t.Errorf("expected cursor encoding %d, got %d", EncodingCursor, encoding)
+	}
+}
+
 func TestWriteBell(t *testing.T) {
 	var buf bytes.Buffer
 	err := WriteBell(&buf)

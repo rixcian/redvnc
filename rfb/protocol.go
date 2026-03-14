@@ -262,6 +262,53 @@ func (r *Rectangle) Write(w io.Writer) error {
 	return nil
 }
 
+// CursorImage represents a cursor shape to be sent via the Cursor pseudo-encoding.
+// Pixels are in the server's pixel format (BGRA by default), row-major order.
+// Mask is a 1-bit-per-pixel bitmask, each row padded to a byte boundary (ceil(Width/8) bytes per row).
+// A set bit means the corresponding pixel is opaque.
+type CursorImage struct {
+	Width, Height    uint16
+	HotspotX, HotspotY uint16
+	Pixels           []byte // width * height * bytesPerPixel
+	Mask             []byte // ceil(width/8) * height bytes
+}
+
+// EncodeCursorRect creates a Rectangle for the Cursor pseudo-encoding.
+// The hotspot is encoded in the RectHeader's X/Y fields per RFC 6143.
+func EncodeCursorRect(cursor *CursorImage, pf PixelFormat, serverPf PixelFormat) Rectangle {
+	w := int(cursor.Width)
+	h := int(cursor.Height)
+	pixels := ConvertPixels(pf, serverPf, cursor.Pixels, w, h)
+	data := make([]byte, len(pixels)+len(cursor.Mask))
+	copy(data, pixels)
+	copy(data[len(pixels):], cursor.Mask)
+	return Rectangle{
+		Header: RectHeader{
+			X:        cursor.HotspotX,
+			Y:        cursor.HotspotY,
+			Width:    cursor.Width,
+			Height:   cursor.Height,
+			Encoding: EncodingCursor,
+		},
+		Data: data,
+	}
+}
+
+// EncodeDesktopSizeRect creates a Rectangle for the DesktopSize pseudo-encoding.
+// Per RFC 6143, the rectangle carries no pixel data; width/height convey the new dimensions.
+func EncodeDesktopSizeRect(width, height uint16) Rectangle {
+	return Rectangle{
+		Header: RectHeader{
+			X:        0,
+			Y:        0,
+			Width:    width,
+			Height:   height,
+			Encoding: EncodingDesktopSize,
+		},
+		Data: nil,
+	}
+}
+
 // WriteServerCutText sends clipboard text to the client.
 func WriteServerCutText(w io.Writer, text string) error {
 	if err := binary.Write(w, binary.BigEndian, uint8(MsgServerCutText)); err != nil {

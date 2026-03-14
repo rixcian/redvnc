@@ -11,6 +11,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -251,6 +252,272 @@ func TestServerMultipleClients(t *testing.T) {
 	numClients = len(server.clients)
 	server.mu.Unlock()
 	fmt.Printf("remaining clients after close: %d\n", numClients)
+}
+
+// staticCursor implements CursorProvider with a fixed cursor image.
+type staticCursor struct {
+	cursor *CursorImage
+}
+
+func (s *staticCursor) Cursor() *CursorImage { return s.cursor }
+
+// resizableCapturer implements ScreenCapturer with a changeable size.
+type resizableCapturer struct {
+	mu     sync.Mutex
+	width  uint16
+	height uint16
+}
+
+func (r *resizableCapturer) Bounds() (uint16, uint16) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.width, r.height
+}
+
+func (r *resizableCapturer) Capture() ([]byte, int, error) {
+	r.mu.Lock()
+	w, h := r.width, r.height
+	r.mu.Unlock()
+	stride := int(w) * 4
+	return make([]byte, stride*int(h)), stride, nil
+}
+
+func (r *resizableCapturer) Resize(w, h uint16) {
+	r.mu.Lock()
+	r.width = w
+	r.height = h
+	r.mu.Unlock()
+}
+
+func TestCursorPseudoEncoding(t *testing.T) {
+	cursor := &CursorImage{
+		Width:    2,
+		Height:   2,
+		HotspotX: 1,
+		HotspotY: 1,
+		Pixels:   make([]byte, 2*2*4),
+		Mask:     []byte{0xC0, 0xC0},
+	}
+
+	cap := &resizableCapturer{width: 640, height: 480}
+	server := NewServer(ServerConfig{
+		Capturer:       cap,
+		Name:           "cursor-test",
+		CursorProvider: &staticCursor{cursor: cursor},
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go server.handleConnection(conn)
+		}
+	}()
+
+	client, err := Connect(ln.Addr().String(), ClientConfig{
+		Shared:    true,
+		Encodings: []int32{EncodingRaw, EncodingCursor},
+	})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer client.Close()
+
+	// Request framebuffer update — should include cursor pseudo-rect
+	err = client.RequestFramebufferUpdate(false, 0, 0, 640, 480)
+	if err != nil {
+		t.Fatalf("RequestFramebufferUpdate: %v", err)
+	}
+
+	msgType, msg, err := client.ReadMessage()
+	if err != nil {
+		t.Fatalf("ReadMessage: %v", err)
+	}
+	if msgType != MsgFramebufferUpdate {
+		t.Fatalf("expected FramebufferUpdate, got %d", msgType)
+	}
+
+	update := msg.(*FramebufferUpdate)
+	// Should have cursor rect + framebuffer rect
+	if len(update.Rects) < 2 {
+		t.Fatalf("expected at least 2 rects (cursor + framebuffer), got %d", len(update.Rects))
+	}
+
+	// Find the cursor rect
+	foundCursor := false
+	for _, rect := range update.Rects {
+		if rect.Encoding == EncodingCursor {
+			foundCursor = true
+			if rect.X != 1 || rect.Y != 1 {
+				t.Errorf("cursor hotspot: expected (1,1), got (%d,%d)", rect.X, rect.Y)
+			}
+			if rect.Width != 2 || rect.Height != 2 {
+				t.Errorf("cursor size: expected 2x2, got %dx%d", rect.Width, rect.Height)
+			}
+			// Data should contain pixels (2*2*4=16 bytes) + mask (2 bytes) = 18 bytes
+			expectedLen := 2*2*4 + 2
+			if len(rect.Data) != expectedLen {
+				t.Errorf("cursor data: expected %d bytes, got %d", expectedLen, len(rect.Data))
+			}
+			break
+		}
+	}
+	if !foundCursor {
+		t.Error("no cursor pseudo-encoding rect found in framebuffer update")
+	}
+}
+
+func TestDesktopResizePseudoEncoding(t *testing.T) {
+	cap := &resizableCapturer{width: 640, height: 480}
+	server := NewServer(ServerConfig{
+		Capturer: cap,
+		Name:     "resize-test",
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go server.handleConnection(conn)
+		}
+	}()
+
+	client, err := Connect(ln.Addr().String(), ClientConfig{
+		Shared:    true,
+		Encodings: []int32{EncodingRaw, EncodingDesktopSize},
+	})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer client.Close()
+
+	if client.Width != 640 || client.Height != 480 {
+		t.Fatalf("expected initial 640x480, got %dx%d", client.Width, client.Height)
+	}
+
+	// First request at original size — should be normal
+	err = client.RequestFramebufferUpdate(false, 0, 0, 640, 480)
+	if err != nil {
+		t.Fatalf("RequestFramebufferUpdate: %v", err)
+	}
+	_, _, err = client.ReadMessage()
+	if err != nil {
+		t.Fatalf("ReadMessage (first): %v", err)
+	}
+
+	// Resize the screen
+	cap.Resize(1024, 768)
+
+	// Next request should include a DesktopSize pseudo-rect
+	err = client.RequestFramebufferUpdate(false, 0, 0, 640, 480)
+	if err != nil {
+		t.Fatalf("RequestFramebufferUpdate after resize: %v", err)
+	}
+
+	msgType, msg, err := client.ReadMessage()
+	if err != nil {
+		t.Fatalf("ReadMessage after resize: %v", err)
+	}
+	if msgType != MsgFramebufferUpdate {
+		t.Fatalf("expected FramebufferUpdate, got %d", msgType)
+	}
+
+	update := msg.(*FramebufferUpdate)
+	foundResize := false
+	for _, rect := range update.Rects {
+		if rect.Encoding == EncodingDesktopSize {
+			foundResize = true
+			if rect.Width != 1024 || rect.Height != 768 {
+				t.Errorf("desktop resize: expected 1024x768, got %dx%d", rect.Width, rect.Height)
+			}
+			if client.Width != 1024 || client.Height != 768 {
+				t.Errorf("client should have updated dimensions to 1024x768, got %dx%d", client.Width, client.Height)
+			}
+			break
+		}
+	}
+	if !foundResize {
+		t.Error("no DesktopSize pseudo-encoding rect found after resize")
+	}
+}
+
+func TestNotifyDesktopResize(t *testing.T) {
+	server := NewServer(ServerConfig{
+		Width:  640,
+		Height: 480,
+		Name:   "notify-resize-test",
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go server.handleConnection(conn)
+		}
+	}()
+
+	client, err := Connect(ln.Addr().String(), ClientConfig{
+		Shared:    true,
+		Encodings: []int32{EncodingRaw, EncodingDesktopSize},
+	})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer client.Close()
+
+	// Give the server a moment to register the client
+	time.Sleep(50 * time.Millisecond)
+
+	// Push a desktop resize notification
+	server.NotifyDesktopResize(1920, 1080)
+
+	// Read the notification
+	msgType, msg, err := client.ReadMessage()
+	if err != nil {
+		t.Fatalf("ReadMessage: %v", err)
+	}
+	if msgType != MsgFramebufferUpdate {
+		t.Fatalf("expected FramebufferUpdate, got %d", msgType)
+	}
+
+	update := msg.(*FramebufferUpdate)
+	if len(update.Rects) != 1 {
+		t.Fatalf("expected 1 rect, got %d", len(update.Rects))
+	}
+	rect := update.Rects[0]
+	if rect.Encoding != EncodingDesktopSize {
+		t.Fatalf("expected DesktopSize encoding, got %d", rect.Encoding)
+	}
+	if rect.Width != 1920 || rect.Height != 1080 {
+		t.Errorf("expected 1920x1080, got %dx%d", rect.Width, rect.Height)
+	}
+	if client.Width != 1920 || client.Height != 1080 {
+		t.Errorf("client dimensions should be 1920x1080, got %dx%d", client.Width, client.Height)
+	}
 }
 
 // generateSelfSignedCert creates a self-signed TLS certificate for testing.
