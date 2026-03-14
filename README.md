@@ -37,6 +37,30 @@ redvnc/
 ├── example/                     # Ready-to-run examples
 │   ├── server/main.go           # VNC server with animated gradient
 │   └── client/main.go           # VNC client with PPM screenshot export
+├── web/                         # React/TypeScript browser client
+│   ├── src/
+│   │   ├── index.ts             # VncClient class and public API
+│   │   ├── connection.ts        # WebSocket connection manager
+│   │   ├── rfb-parser.ts        # Binary RFB message parser (server→client)
+│   │   ├── rfb-writer.ts        # Binary RFB message builder (client→server)
+│   │   ├── framebuffer.ts       # Framebuffer state, pixel decoding, dirty tracking
+│   │   ├── renderer.ts          # Canvas 2D rendering from framebuffer
+│   │   ├── input.ts             # Keyboard/mouse/touch → RFB event translation
+│   │   ├── clipboard.ts         # Browser Clipboard API ↔ extension messages
+│   │   ├── file-upload.ts       # File upload via extension messages
+│   │   ├── types.ts             # Shared TypeScript type definitions
+│   │   ├── encodings/           # Framebuffer encoding decoders
+│   │   │   ├── raw.ts           # Raw encoding decoder
+│   │   │   ├── copyrect.ts      # CopyRect decoder
+│   │   │   ├── zlib.ts          # Zlib encoding decoder
+│   │   │   └── tight.ts         # Tight encoding decoder (zlib + JPEG)
+│   │   └── components/          # React components
+│   │       ├── VncViewer.tsx     # Main VNC viewer component
+│   │       ├── FileUpload.tsx    # Drag-and-drop file upload UI
+│   │       └── Toolbar.tsx       # Clipboard, upload, fullscreen toolbar
+│   └── demo/                    # Minimal demo app
+│       ├── index.html
+│       └── main.tsx
 └── capi/                        # C shared library exports
     └── exports.go               # //export functions for P/Invoke
 ```
@@ -44,7 +68,8 @@ redvnc/
 ## Requirements
 
 - Go 1.24 or later
-- External dependencies: `nhooyr.io/websocket` (WebSocket proxy), `github.com/google/uuid` (session IDs)
+- Node.js 18+ and npm (for the browser client in `web/`)
+- External Go dependencies: `nhooyr.io/websocket` (WebSocket proxy), `github.com/google/uuid` (session IDs)
 
 For building the C shared library (`capi/`), a C compiler is required:
 - **Linux:** GCC
@@ -433,6 +458,134 @@ func main() {
 - **Upload safety**: Filename sanitization (strips path separators, `..`, null bytes), directory authorization (resolved absolute path must be within allowed dirs), size limits, CRC-32 verification, max 4 concurrent uploads per session.
 - **Graceful shutdown**: On SIGTERM/SIGINT, sends WebSocket close frames and waits up to 10 seconds for sessions to drain.
 
+## Browser Client (`web`)
+
+The `web/` package is a React/TypeScript library that renders VNC desktops in the browser. It connects to a VNC server through the `wsproxy` WebSocket proxy, decodes framebuffer updates onto a `<canvas>`, and translates browser input events to the RFB protocol.
+
+### Features
+
+- **Framebuffer rendering** — Decodes Raw, CopyRect, Zlib, and Tight (JPEG) encodings into an off-screen `ImageData` buffer with dirty-rect tracking for efficient canvas updates
+- **Input handling** — Keyboard events mapped to X11 keysyms, mouse events with button tracking, scroll wheel, and single-touch support
+- **Clipboard sync** — Bidirectional clipboard via extension messages and the browser Clipboard API
+- **File upload** — Chunked file transfer with CRC-32 verification, progress reporting, and drag-and-drop UI
+- **Cursor rendering** — Server-side cursor pseudo-encoding decoded into CSS custom cursors
+- **Desktop resize** — Handles dynamic resolution changes via the DesktopSize pseudo-encoding
+- **Scale to fit** — Optional scaling of the framebuffer to the canvas size with coordinate translation for input
+
+### Running the Demo
+
+The demo app provides a connection form where you enter the proxy URL, VNC target address, and optional password.
+
+```bash
+# 1. Start a VNC server (e.g. the example server)
+go run ./example/server
+
+# 2. Start the WebSocket proxy pointing at the VNC server
+cd wsproxy && go build -o redvnc-wsproxy ./cmd
+./redvnc-wsproxy --listen :8080 --allowed-vnc-target 127.0.0.1:5900
+
+# 3. Start the browser client dev server
+cd web
+npm install
+npm run dev
+```
+
+Open the URL printed by Vite (typically `http://localhost:5173`). Enter:
+
+- **WebSocket URL**: `ws://localhost:8080/ws`
+- **VNC Target**: `127.0.0.1:5900`
+- **Password**: *(leave blank if the server has no auth)*
+
+Click **Connect** to view the remote desktop in your browser.
+
+### Using as a Library
+
+Install the package and use either the framework-agnostic `VncClient` class or the `VncViewer` React component:
+
+```bash
+npm install @redvnc/web
+```
+
+#### React Component
+
+```tsx
+import { VncViewer } from '@redvnc/web';
+
+function App() {
+  return (
+    <VncViewer
+      url="ws://localhost:8080/ws"
+      target="192.168.1.50:5900"
+      password="secret"
+      scaleToFit
+      onConnect={() => console.log('Connected')}
+      onDisconnect={(reason) => console.log('Disconnected:', reason)}
+      onBell={() => console.log('Bell')}
+      style={{ width: '100%', height: '100vh' }}
+    />
+  );
+}
+```
+
+#### VncClient API
+
+```typescript
+import { VncClient } from '@redvnc/web';
+
+const client = new VncClient({
+  url: 'ws://localhost:8080/ws',
+  target: '192.168.1.50:5900',
+  password: 'secret',
+  scaleToFit: true,
+});
+
+await client.connect();
+
+// Attach to a canvas element
+client.attachCanvas(document.getElementById('vnc-canvas') as HTMLCanvasElement);
+
+// Clipboard
+client.sendClipboard('Hello from the browser');
+client.onClipboard((text) => console.log('Server clipboard:', text));
+
+// File upload
+const result = await client.uploadFile(someFile, { dir: '/tmp/uploads' });
+client.onUploadProgress((p) => console.log(`${p.percent.toFixed(1)}%`));
+
+// Events
+client.on('bell', () => console.log('Bell'));
+client.on('resize', (w, h) => console.log(`Resized to ${w}x${h}`));
+
+// Disconnect
+client.disconnect();
+```
+
+#### VncViewer Props
+
+| Prop | Type | Default | Description |
+|------|------|---------|-------------|
+| `url` | `string` | — | WebSocket proxy URL (`ws://host:port/ws`) |
+| `target` | `string` | — | VNC server address (`host:port`) |
+| `password` | `string` | — | VNC authentication password |
+| `viewOnly` | `boolean` | `false` | Disable keyboard/mouse input |
+| `scaleToFit` | `boolean` | `false` | Scale framebuffer to canvas size |
+| `clipboardSync` | `boolean` | `true` | Auto-sync browser clipboard |
+| `uploadDir` | `string` | — | Default remote upload directory |
+| `onConnect` | `() => void` | — | Called when VNC session is established |
+| `onDisconnect` | `(reason: string) => void` | — | Called on disconnect |
+| `onBell` | `() => void` | — | Called when server sends a bell |
+| `className` | `string` | — | CSS class for the container div |
+| `style` | `CSSProperties` | — | Inline styles for the container div |
+
+### Building the Library
+
+```bash
+cd web
+npm install
+npm run build      # Produces dist/index.js, dist/index.cjs, dist/index.d.ts
+npm run typecheck   # Type-check without emitting
+```
+
 ## Building the C Shared Library
 
 The `capi/` package exports functions for use from C, C#, or any language supporting C FFI.
@@ -589,10 +742,12 @@ go test -race ./...
 ┌──────────────┐    WebSocket     ┌──────────────┐       TCP        ┌──────────────┐
 │  Browser     │◄────────────────►│   wsproxy    │◄────────────────►│  VNC Server  │
 │  Client      │  Extension msgs  │  (Go proxy)  │   RFB Protocol   │              │
-└──────────────┘  + RFB relay     └──────────────┘                  └──────────────┘
+│  (web/)      │  + RFB relay     └──────────────┘                  └──────────────┘
+│  React/TS    │
+└──────────────┘
 ```
 
-The `rfb/` package is pure Go with zero platform dependencies. All platform-specific code is isolated in `capture/` and `input/` behind interfaces, making the protocol layer fully unit-testable on any OS. The `wsproxy/` package reuses `rfb/` types and the `security` package for VNC handshake delegation.
+The `rfb/` package is pure Go with zero platform dependencies. All platform-specific code is isolated in `capture/` and `input/` behind interfaces, making the protocol layer fully unit-testable on any OS. The `wsproxy/` package reuses `rfb/` types and the `security` package for VNC handshake delegation. The `web/` package is a standalone TypeScript/React library that communicates with `wsproxy` over WebSocket.
 
 ## License
 
