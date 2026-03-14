@@ -16,6 +16,14 @@ redvnc/
 │   │   └── encodings.go         # Raw, CopyRect, Zlib
 │   └── security/                # Authentication handlers
 │       └── security.go          # None, VNC Authentication (DES)
+├── wsproxy/                     # WebSocket-to-TCP VNC proxy
+│   ├── server.go                # HTTP server, WebSocket upgrade, config
+│   ├── session.go               # Session lifecycle, connection manager
+│   ├── proxy.go                 # RFB handshake delegation, bidirectional relay
+│   ├── clipboard.go             # Clipboard extension messages (types 129-130)
+│   ├── fileupload.go            # File upload protocol (types 131-135)
+│   ├── wsproxy_test.go          # Tests
+│   └── cmd/main.go              # CLI entry point (redvnc-wsproxy)
 ├── capture/                     # Screen capture abstraction
 │   ├── capture.go               # ScreenCapture interface
 │   ├── capture_linux.go         # X11/XShm (stub)
@@ -36,7 +44,7 @@ redvnc/
 ## Requirements
 
 - Go 1.24 or later
-- No external dependencies — uses only the Go standard library
+- External dependencies: `nhooyr.io/websocket` (WebSocket proxy), `github.com/google/uuid` (session IDs)
 
 For building the C shared library (`capi/`), a C compiler is required:
 - **Linux:** GCC
@@ -304,6 +312,127 @@ client.SendPointerEvent(1, 500, 300) // left button down
 client.SendPointerEvent(0, 500, 300) // left button up
 ```
 
+## WebSocket VNC Proxy (`wsproxy`)
+
+The `wsproxy` package provides a WebSocket-to-TCP proxy that bridges browser clients to VNC servers. The proxy performs the full RFB handshake with the VNC server on behalf of the browser, then enters a bidirectional byte relay. Extension messages (clipboard, file upload) are intercepted and handled by the proxy.
+
+```
+┌──────────────┐                          ┌──────────────┐                    ┌──────────────┐
+│  Browser     │── WebSocket (wss://) ───►│              │── TCP ────────────►│ VNC Server A │
+│  Client      │   target=10.0.0.1:5900   │              │                    └──────────────┘
+└──────────────┘                          │   wsproxy    │
+                                          │   (Go)       │                    ┌──────────────┐
+┌──────────────┐                          │              │── TCP ────────────►│ VNC Server B │
+│  Browser     │── WebSocket (wss://) ───►│              │                    └──────────────┘
+│  Client      │   target=10.0.0.2:5901   │              │
+└──────────────┘                          └──────────────┘
+```
+
+Each client WebSocket connection creates an independent TCP connection to the target VNC server. Multiple clients can connect to the same or different VNC servers simultaneously.
+
+### Building and Running
+
+```bash
+# Build
+cd wsproxy && go build -o redvnc-wsproxy ./cmd
+
+# Run as open relay (any VNC target allowed — use only in trusted networks)
+./redvnc-wsproxy --listen :8080
+
+# Restrict to specific VNC targets
+./redvnc-wsproxy --listen :8080 \
+  --allowed-vnc-target 10.0.0.5:5900 \
+  --allowed-vnc-target 10.0.0.6:5900
+
+# With TLS
+./redvnc-wsproxy --listen :8443 --tls-cert cert.pem --tls-key key.pem \
+  --allowed-vnc-target 10.0.0.5:5900
+
+# With connection limits
+./redvnc-wsproxy --listen :8080 \
+  --max-connections 200 \
+  --max-connections-per-target 20
+
+# Custom upload directories
+./redvnc-wsproxy --listen :8080 \
+  --default-upload-dir /tmp/uploads \
+  --allowed-upload-dir /tmp/uploads \
+  --allowed-upload-dir /home/user/Documents
+```
+
+### CLI Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--listen` | `:8080` | HTTP/WebSocket listen address |
+| `--allowed-vnc-target` | *(none)* | Allowed VNC target `host:port` (repeatable; empty = open relay) |
+| `--vnc-password` | *(none)* | Default VNC password for all sessions |
+| `--max-connections` | `100` | Maximum simultaneous client sessions |
+| `--max-connections-per-target` | `10` | Maximum sessions per VNC target |
+| `--default-upload-dir` | OS Downloads folder | Default file upload directory |
+| `--allowed-upload-dir` | *(none)* | Allowed upload directory (repeatable) |
+| `--max-upload-size` | `104857600` (100MB) | Maximum upload file size in bytes |
+| `--tls-cert` | *(none)* | TLS certificate file |
+| `--tls-key` | *(none)* | TLS key file |
+| `--allowed-origin` | *(none)* | Allowed WebSocket Origin header (repeatable) |
+
+### Connection Lifecycle
+
+1. Browser opens `ws(s)://host:port/ws?target=<ip:port>&password=<optional>`
+2. Proxy validates the target against the allowlist and checks connection limits
+3. Proxy opens a TCP connection to the VNC server and performs the full RFB handshake (version, security, ClientInit/ServerInit)
+4. Proxy sends a **SessionInit** extension message (type 128) to the browser with framebuffer dimensions, pixel format, and server name
+5. Proxy enters relay mode: standard RFB messages (types 0-6) are forwarded as-is; extension messages (types 128+) are intercepted
+
+### Extension Protocol
+
+Extension messages use types 128-255 and are only exchanged between the browser and the proxy (never forwarded to the VNC server). All messages are binary, big-endian, with a 5-byte envelope: `type(1) + length(4) + payload(length)`.
+
+| Type | Direction | Name | Description |
+|------|-----------|------|-------------|
+| 128 | Proxy -> Browser | SessionInit | Framebuffer dimensions, pixel format, server name |
+| 129 | Browser -> Proxy | ClipboardSet | Set server clipboard (converted to RFB ClientCutText) |
+| 130 | Proxy -> Browser | ClipboardUpdate | Server clipboard changed (from RFB ServerCutText) |
+| 131 | Browser -> Proxy | UploadBegin | Start chunked file upload |
+| 132 | Browser -> Proxy | UploadChunk | File data chunk (max 64KB, with offset) |
+| 133 | Browser -> Proxy | UploadEnd | Complete upload with CRC-32 checksum |
+| 134 | Proxy -> Browser | UploadStatus | Progress/completion/error response |
+| 135 | Browser -> Proxy | UploadCancel | Cancel in-progress upload |
+
+### Programmatic Usage
+
+```go
+package main
+
+import (
+    "log"
+
+    "github.com/rixcian/redvnc/wsproxy"
+)
+
+func main() {
+    server := wsproxy.NewServer(wsproxy.Config{
+        ListenAddr:              ":8080",
+        AllowedVNCTargets:       []string{"10.0.0.5:5900"},
+        MaxConnections:          100,
+        MaxConnectionsPerTarget: 10,
+        DefaultUploadDir:        "/tmp/uploads",
+        AllowedUploadDirs:       []string{"/tmp/uploads"},
+        MaxUploadSize:           100 * 1024 * 1024,
+    })
+
+    log.Fatal(server.ListenAndServe())
+}
+```
+
+### Security
+
+- **Target allowlisting**: When `AllowedVNCTargets` is set, only listed `host:port` pairs are permitted (HTTP 403 otherwise). Empty = open relay.
+- **Connection limits**: `MaxConnections` / `MaxConnectionsPerTarget` prevent resource exhaustion.
+- **Origin checking**: `AllowedOrigins` validates the WebSocket `Origin` header.
+- **Upload safety**: Filename sanitization (strips path separators, `..`, null bytes), directory authorization (resolved absolute path must be within allowed dirs), size limits, CRC-32 verification, max 4 concurrent uploads per session.
+- **Graceful shutdown**: On SIGTERM/SIGINT, sends WebSocket close frames and waits up to 10 seconds for sessions to drain.
+
 ## Building the C Shared Library
 
 The `capi/` package exports functions for use from C, C#, or any language supporting C FFI.
@@ -439,6 +568,7 @@ go test -race ./...
 - **`rfb/`** — Protocol message encoding/decoding, server handshake, client-server integration, multi-client connections
 - **`rfb/security/`** — Bit reversal, DES encryption consistency, None/VNCAuth handshakes, password truncation
 - **`rfb/encodings/`** — Raw encoding (full frame + subrectangles), CopyRect, Zlib compression/decompression, encoder reuse
+- **`wsproxy/`** — Connection manager limits, filename sanitization, unique file paths, upload directory authorization, session lifecycle, end-to-end WebSocket proxy with fake VNC server, target allowlist rejection, missing target validation
 
 ## Architecture
 
@@ -455,9 +585,14 @@ go test -race ./...
                         │ Handler  │ │(DXGI/ │ │(SendIn/│
                         │(None/VNC)│ │ CG/X11)│ │CG/XTest│
                         └──────────┘ └───────┘ └────────┘
+
+┌──────────────┐    WebSocket     ┌──────────────┐       TCP        ┌──────────────┐
+│  Browser     │◄────────────────►│   wsproxy    │◄────────────────►│  VNC Server  │
+│  Client      │  Extension msgs  │  (Go proxy)  │   RFB Protocol   │              │
+└──────────────┘  + RFB relay     └──────────────┘                  └──────────────┘
 ```
 
-The `rfb/` package is pure Go with zero platform dependencies. All platform-specific code is isolated in `capture/` and `input/` behind interfaces, making the protocol layer fully unit-testable on any OS.
+The `rfb/` package is pure Go with zero platform dependencies. All platform-specific code is isolated in `capture/` and `input/` behind interfaces, making the protocol layer fully unit-testable on any OS. The `wsproxy/` package reuses `rfb/` types and the `security` package for VNC handshake delegation.
 
 ## License
 
