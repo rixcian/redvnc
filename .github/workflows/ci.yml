@@ -22,6 +22,10 @@ jobs:
         with:
           go-version: "1.24"
 
+      - name: Install X11 headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxtst-dev
+
       - name: Build
         run: go build ./...
 
