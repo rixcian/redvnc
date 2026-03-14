@@ -5,7 +5,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/redamp-io/redvnc/rfb"
+	"github.com/rixcian/redvnc/rfb"
 )
 
 func setupPlatformCaptureAndInput() (rfb.ScreenCapturer, rfb.InputHandler, error) {

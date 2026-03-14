@@ -28,8 +28,14 @@ func TestVNCEncryptDecryptConsistency(t *testing.T) {
 	challenge := []byte("0123456789abcdef")
 	password := "secret"
 
-	result1 := vncEncrypt(challenge, password)
-	result2 := vncEncrypt(challenge, password)
+	result1, err := vncEncrypt(challenge, password)
+	if err != nil {
+		t.Fatalf("vncEncrypt: %v", err)
+	}
+	result2, err := vncEncrypt(challenge, password)
+	if err != nil {
+		t.Fatalf("vncEncrypt: %v", err)
+	}
 
 	if !bytes.Equal(result1, result2) {
 		t.Error("vncEncrypt is not deterministic")
@@ -104,7 +110,10 @@ func (a *authSimulator) Read(p []byte) (int, error) {
 		return 0, nil
 	}
 	// Return the encrypted response
-	response := vncEncrypt(a.challenge, a.password)
+	response, err := vncEncrypt(a.challenge, a.password)
+	if err != nil {
+		return 0, err
+	}
 	return copy(p, response), nil
 }
 
@@ -123,8 +132,14 @@ func TestVNCAuthPasswordTruncation(t *testing.T) {
 	// VNC passwords are truncated to 8 characters
 	challenge := []byte("0123456789abcdef")
 
-	result1 := vncEncrypt(challenge, "longpassword")
-	result2 := vncEncrypt(challenge, "longpass")
+	result1, err := vncEncrypt(challenge, "longpassword")
+	if err != nil {
+		t.Fatalf("vncEncrypt: %v", err)
+	}
+	result2, err := vncEncrypt(challenge, "longpass")
+	if err != nil {
+		t.Fatalf("vncEncrypt: %v", err)
+	}
 
 	if !bytes.Equal(result1, result2) {
 		t.Error("passwords longer than 8 chars should produce same result when truncated")

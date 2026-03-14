@@ -47,7 +47,7 @@ For building the C shared library (`capi/`), a C compiler is required:
 
 ```bash
 # Clone the repository
-git clone https://github.com/redamp-io/redvnc.git
+git clone https://github.com/rixcian/redvnc.git
 cd redvnc
 
 # Verify everything compiles
@@ -136,8 +136,8 @@ package main
 import (
     "log"
 
-    "github.com/redamp-io/redvnc/rfb"
-    "github.com/redamp-io/redvnc/rfb/security"
+    "github.com/rixcian/redvnc/rfb"
+    "github.com/rixcian/redvnc/rfb/security"
 )
 
 func main() {
@@ -213,7 +213,7 @@ import (
     "fmt"
     "log"
 
-    "github.com/redamp-io/redvnc/rfb"
+    "github.com/rixcian/redvnc/rfb"
 )
 
 func main() {
@@ -367,8 +367,8 @@ To create a platform-specific capturer or injector:
 
 ```go
 import (
-    "github.com/redamp-io/redvnc/capture"
-    "github.com/redamp-io/redvnc/input"
+    "github.com/rixcian/redvnc/capture"
+    "github.com/rixcian/redvnc/input"
 )
 
 cap, err := capture.NewScreenCapture()
