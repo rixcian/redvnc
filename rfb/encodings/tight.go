@@ -54,10 +54,37 @@ func (t *Tight) Type() int32 { return rfb.EncodingTight }
 // Encode encodes pixel data for the given region into an RFB rectangle using Tight encoding.
 // pixels is raw BGRA pixel data, stride is the number of bytes per row of the full framebuffer.
 func (t *Tight) Encode(x, y, width, height uint16, pixels []byte, stride int) (*rfb.Rectangle, error) {
+	rects, err := t.EncodeMulti(x, y, width, height, pixels, stride)
+	if err != nil {
+		return nil, err
+	}
+	// For single-tile rectangles, return directly; otherwise merge (for test compat)
+	if len(rects) == 1 {
+		return &rects[0], nil
+	}
 	var buf bytes.Buffer
+	for _, r := range rects {
+		buf.Write(r.Data)
+	}
+	return &rfb.Rectangle{
+		Header: rfb.RectHeader{
+			X:        x,
+			Y:        y,
+			Width:    width,
+			Height:   height,
+			Encoding: rfb.EncodingTight,
+		},
+		Data: buf.Bytes(),
+	}, nil
+}
 
+// EncodeMulti encodes pixel data into multiple Tight rectangles (one per tile).
+// Each rectangle has its own rect header with correct tile position and size.
+// pixels is raw BGRA pixel data, stride is the number of bytes per row of the full framebuffer.
+func (t *Tight) EncodeMulti(x, y, width, height uint16, pixels []byte, stride int) ([]rfb.Rectangle, error) {
 	w := int(width)
 	h := int(height)
+	var rects []rfb.Rectangle
 
 	for tileY := 0; tileY < h; tileY += tileSize {
 		tileH := tileSize
@@ -87,20 +114,21 @@ func (t *Tight) Encode(x, y, width, height uint16, pixels []byte, stride int) (*
 			if err != nil {
 				return nil, fmt.Errorf("tight encode tile (%d,%d): %w", tileX, tileY, err)
 			}
-			buf.Write(tileData)
+
+			rects = append(rects, rfb.Rectangle{
+				Header: rfb.RectHeader{
+					X:        x + uint16(tileX),
+					Y:        y + uint16(tileY),
+					Width:    uint16(tileW),
+					Height:   uint16(tileH),
+					Encoding: rfb.EncodingTight,
+				},
+				Data: tileData,
+			})
 		}
 	}
 
-	return &rfb.Rectangle{
-		Header: rfb.RectHeader{
-			X:        x,
-			Y:        y,
-			Width:    width,
-			Height:   height,
-			Encoding: rfb.EncodingTight,
-		},
-		Data: buf.Bytes(),
-	}, nil
+	return rects, nil
 }
 
 // Reset releases all zlib stream resources.
