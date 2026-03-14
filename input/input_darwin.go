@@ -3,8 +3,13 @@
 package input
 
 /*
-#cgo LDFLAGS: -framework CoreGraphics -framework CoreFoundation
+#cgo LDFLAGS: -framework CoreGraphics -framework CoreFoundation -framework ApplicationServices
 #include <CoreGraphics/CoreGraphics.h>
+#include <ApplicationServices/ApplicationServices.h>
+
+static int isAccessibilityTrusted(void) {
+    return AXIsProcessTrusted();
+}
 
 static void moveMouse(int x, int y) {
     CGEventRef event = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved, CGPointMake(x, y), kCGMouseButtonLeft);
@@ -73,6 +78,8 @@ static void keyEventWithChar(int keycode, int down, unsigned short ch) {
 */
 import "C"
 
+import "log"
+
 // DarwinInput injects input using macOS CGEvent API.
 type DarwinInput struct {
 	lastButtonMask uint8
@@ -83,6 +90,12 @@ func NewInputInjector() (InputInjector, error) {
 }
 
 func (d *DarwinInput) Init() error {
+	if C.isAccessibilityTrusted() == 0 {
+		log.Println("WARNING: Accessibility permission NOT granted. Input injection will not work.")
+		log.Println("Go to System Settings > Privacy & Security > Accessibility and add this application.")
+	} else {
+		log.Println("Accessibility permission granted — input injection enabled")
+	}
 	return nil
 }
 
