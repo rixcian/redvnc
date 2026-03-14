@@ -50,9 +50,17 @@ type Config struct {
     // VNCPassword is the VNC authentication password. Empty means no auth.
     VNCPassword string
 
-    // UploadDir is the directory where uploaded files are saved.
-    // Defaults to the OS-specific Downloads folder.
-    UploadDir string
+    // DefaultUploadDir is the fallback directory used when the client does not
+    // specify a destination in UploadBegin. Defaults to the OS-specific
+    // Downloads folder (see §4).
+    DefaultUploadDir string
+
+    // AllowedUploadDirs is a whitelist of directories the client is permitted
+    // to upload into. If empty, only DefaultUploadDir is allowed. Each entry
+    // is resolved to an absolute path at startup. The proxy rejects any
+    // client-requested directory that is not a subdirectory of (or equal to)
+    // one of these entries.
+    AllowedUploadDirs []string
 
     // MaxUploadSize is the maximum file upload size in bytes. Default: 100MB.
     MaxUploadSize int64
@@ -157,6 +165,9 @@ export class VncClient {
   uploadFile(file: File, options?: UploadOptions): Promise<UploadResult>;
   onUploadProgress(callback: (progress: UploadProgress) => void): void;
 
+  // Configure the remote upload directory (sent in UploadBegin)
+  setUploadDir(path: string): void;
+
   // Events
   on(event: 'connect', cb: () => void): void;
   on(event: 'disconnect', cb: (reason: string) => void): void;
@@ -172,10 +183,15 @@ interface VncClientOptions {
   scaleToFit?: boolean;  // Scale framebuffer to canvas size
   clipboardSync?: boolean; // Auto-sync browser clipboard (default: true)
   encodings?: number[];  // Preferred encodings (default: [7, 6, 1, 0])
+  uploadDir?: string;    // Remote directory for file uploads (default: server's DefaultUploadDir)
 }
 
 // React component
 export const VncViewer: React.FC<VncViewerProps>;
+
+interface UploadOptions {
+  dir?: string;          // Override upload directory for this file
+}
 
 interface VncViewerProps {
   url: string;
@@ -183,6 +199,7 @@ interface VncViewerProps {
   viewOnly?: boolean;
   scaleToFit?: boolean;
   clipboardSync?: boolean;
+  uploadDir?: string;
   onConnect?: () => void;
   onDisconnect?: (reason: string) => void;
   onBell?: () => void;
@@ -288,14 +305,20 @@ File uploads use a chunked transfer protocol to support large files and progress
 | length | uint32 | Payload length |
 | uploadId | uint32 | Client-assigned upload ID |
 | fileSize | uint64 | Total file size in bytes |
+| dirLength | uint16 | Upload directory path byte length (0 = use server default) |
+| dir | bytes | UTF-8 absolute directory path on the remote machine |
 | nameLength | uint16 | Filename byte length |
 | fileName | bytes | UTF-8 filename (basename only, no path separators) |
 
+The **client** specifies the destination directory. If `dirLength` is 0, the proxy uses its `DefaultUploadDir`.
+
 The proxy validates:
+- **Directory authorization**: The resolved absolute path of `dir` must be equal to or a subdirectory of one of the `AllowedUploadDirs` entries (or `DefaultUploadDir` if `AllowedUploadDirs` is empty). If the check fails, the proxy responds with UploadStatus status=1 and error "directory not allowed".
+- **Directory existence**: The proxy creates the directory (and parents) if it doesn't exist, provided it passes the authorization check.
 - Filename does not contain path separators or `..`
 - File size does not exceed `MaxUploadSize`
 - Sanitizes the filename (removes special characters, preserves extension)
-- Creates the destination file at `{UploadDir}/{sanitized_filename}`
+- Creates the destination file at `{dir}/{sanitized_filename}`
 - If a file with the same name exists, appends a numeric suffix: `file(1).txt`, `file(2).txt`, etc.
 
 #### 3.3.2 Upload Chunk (Browser → Proxy)
@@ -360,9 +383,22 @@ Cancels an in-progress upload. The proxy deletes the partial file and sends an U
 
 ---
 
-## 4. Upload Directory Defaults
+## 4. Upload Directory
 
-The `UploadDir` config option defaults to the OS-specific Downloads folder:
+The upload destination is **specified by the browser client** in each UploadBegin message. This allows different clients or upload operations to target different directories on the remote machine.
+
+### 4.1 Client-Side Configuration
+
+The client sets the upload directory via:
+- `VncClientOptions.uploadDir` at construction time (applies to all uploads)
+- `client.setUploadDir(path)` to change it at runtime
+- `UploadOptions.dir` per individual `uploadFile()` call to override
+
+If the client does not specify a directory (empty string or omitted), the proxy falls back to `DefaultUploadDir`.
+
+### 4.2 Proxy-Side Defaults and Authorization
+
+The proxy's `DefaultUploadDir` defaults to the OS-specific Downloads folder:
 
 | OS | Default Path |
 |----|-------------|
@@ -370,9 +406,12 @@ The `UploadDir` config option defaults to the OS-specific Downloads folder:
 | macOS | `$HOME/Downloads` |
 | Windows | `%USERPROFILE%\Downloads` |
 
-The directory is created if it doesn't exist. The user can override it via:
-- CLI flag: `--upload-dir /path/to/dir`
-- Config struct: `Config.UploadDir`
+The proxy's `AllowedUploadDirs` restricts which directories clients may write to. If the list is empty, only `DefaultUploadDir` is permitted. The proxy operator configures this via:
+- CLI flag: `--default-upload-dir /path/to/dir`
+- CLI flag: `--allowed-upload-dir /path/a --allowed-upload-dir /path/b` (repeatable)
+- Config struct: `Config.DefaultUploadDir`, `Config.AllowedUploadDirs`
+
+The directory is created if it doesn't exist (provided it passes the authorization check).
 
 ---
 
@@ -381,7 +420,7 @@ The directory is created if it doesn't exist. The user can override it via:
 1. **Origin checking**: The proxy validates the `Origin` header against `AllowedOrigins` to prevent unauthorized cross-origin connections.
 2. **Filename sanitization**: Uploaded filenames are stripped of path separators, `..`, null bytes, and control characters. Only the basename is used.
 3. **Upload size limits**: Enforced at both UploadBegin (reject immediately) and UploadChunk (track running total).
-4. **No directory traversal**: The proxy writes exclusively within `UploadDir`. Symlinks in the upload path are resolved and verified.
+4. **Upload directory authorization**: The proxy resolves the client-requested directory to an absolute path, follows symlinks, and verifies it falls within `AllowedUploadDirs` (or `DefaultUploadDir`). Path traversal via `..` or symlinks outside allowed directories is rejected.
 5. **WebSocket binary mode**: All frames use binary mode (opcode 0x02). Text frames are rejected.
 6. **Password handling**: VNC passwords are sent to the proxy via query parameter over WSS (TLS), or via the SessionInit handshake. They are never logged.
 7. **Rate limiting**: The proxy limits concurrent uploads per connection (max 4) and rejects new upload requests beyond the limit.
@@ -457,14 +496,31 @@ Byte offset   Value    Field
 
 ### 6.3 Extension Message Example: UploadBegin
 
+With a client-specified upload directory `/home/user/Documents`:
+
 ```
-Byte offset   Value         Field
-0             0x83 (131)    type
-1-4           0x00000016    length (22 bytes)
-5-8           0x00000001    uploadId (1)
-9-16          0x0000000000100000  fileSize (1MB)
-17-18         0x0008        nameLength (8)
-19-26         "test.txt"    fileName
+Byte offset   Value                       Field
+0             0x83 (131)                   type
+1-4           0x0000002E                   length (46 bytes)
+5-8           0x00000001                   uploadId (1)
+9-16          0x0000000000100000           fileSize (1MB)
+17-18         0x0014                       dirLength (20)
+19-38         "/home/user/Documents"       dir
+39-40         0x0008                       nameLength (8)
+41-48         "test.txt"                   fileName
+```
+
+With no directory (use server default):
+
+```
+Byte offset   Value                       Field
+0             0x83 (131)                   type
+1-4           0x00000016                   length (22 bytes)
+5-8           0x00000001                   uploadId (1)
+9-16          0x0000000000100000           fileSize (1MB)
+17-18         0x0000                       dirLength (0 = use default)
+19-20         0x0008                       nameLength (8)
+21-28         "test.txt"                   fileName
 ```
 
 ---
@@ -483,8 +539,11 @@ cd wsproxy && go build -o redvnc-wsproxy ./cmd
 # With TLS
 ./redvnc-wsproxy --listen :8443 --vnc localhost:5900 --tls-cert cert.pem --tls-key key.pem
 
-# Custom upload directory
-./redvnc-wsproxy --listen :8080 --vnc localhost:5900 --upload-dir /tmp/uploads
+# Custom default upload directory and allowed directories
+./redvnc-wsproxy --listen :8080 --vnc localhost:5900 \
+  --default-upload-dir /tmp/uploads \
+  --allowed-upload-dir /tmp/uploads \
+  --allowed-upload-dir /home/user/Documents
 ```
 
 ### 7.2 Browser Client
