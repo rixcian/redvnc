@@ -4,16 +4,53 @@ import { readCompactLength } from '../rfb-parser';
 
 /**
  * Decode Tight encoding. Handles solid fill, JPEG, and basic (zlib) sub-types.
- * Tight processes the rectangle as 64x64 tiles.
+ * Tight uses 4 persistent zlib streams (selected by control byte bits 0-1).
+ * The zlib dictionary is preserved across tiles and rectangles within a
+ * connection, as required by the Tight encoding specification.
  */
 export class TightDecoder {
   private pako: typeof import('pako') | null = null;
+  private streams: (import('pako').Inflate | null)[] = [null, null, null, null];
 
   async init(): Promise<void> {
     this.pako = await import('pako');
+    for (let i = 0; i < 4; i++) {
+      this.streams[i] = new this.pako.Inflate();
+    }
+  }
+
+  /** Decompress data using a persistent zlib stream. */
+  private decompressStream(streamIdx: number, compressed: Uint8Array): Uint8Array {
+    const inflater = this.streams[streamIdx];
+    if (!inflater) throw new Error('TightDecoder not initialized');
+
+    // Collect output chunks for this push only
+    const chunks: Uint8Array[] = [];
+    const origOnData = inflater.onData;
+    inflater.onData = (chunk: Uint8Array) => { chunks.push(chunk.slice()); };
+
+    inflater.push(compressed, 2 /* Z_SYNC_FLUSH */);
+
+    inflater.onData = origOnData;
+
+    if (inflater.err) {
+      throw new Error(`Tight inflate error (stream ${streamIdx}): ${inflater.msg}`);
+    }
+
+    if (chunks.length === 1) return chunks[0];
+    const total = chunks.reduce((s, c) => s + c.length, 0);
+    const result = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) {
+      result.set(c, off);
+      off += c.length;
+    }
+    return result;
   }
 
   async decode(fb: Framebuffer, header: RectHeader, data: DataView): Promise<void> {
+    if (!this.pako) return;
+
     const { x, y, width, height } = header;
     let offset = 0;
 
@@ -24,10 +61,18 @@ export class TightDecoder {
         const control = data.getUint8(offset);
         offset += 1;
 
+        // Handle reset stream bits (bits 4-7). When set, the corresponding
+        // zlib stream must be reset (new Inflate instance with fresh state).
+        for (let s = 0; s < 4; s++) {
+          if (control & (1 << (s + 4))) {
+            this.streams[s] = new this.pako.Inflate();
+          }
+        }
+
         const subType = control & 0x0f;
 
         if (subType === 0x08) {
-          // Solid fill: 3 bytes RGB (Tight always uses 3-byte pixels for 32bpp truecolor)
+          // Solid fill: 3 bytes RGB
           const r = data.getUint8(offset);
           const g = data.getUint8(offset + 1);
           const b = data.getUint8(offset + 2);
@@ -54,25 +99,25 @@ export class TightDecoder {
           fb.drawBitmap(bitmap, x + tx, y + ty, tileW, tileH);
           bitmap.close();
         } else {
-          // Basic (zlib compressed)
+          // Basic compression (bits 0-1 = stream index)
+          const streamIdx = subType & 0x03;
           const { length, bytesRead } = readCompactLength(data, offset);
           offset += bytesRead;
 
           const compressed = new Uint8Array(data.buffer, data.byteOffset + offset, length);
           offset += length;
 
-          if (this.pako) {
-            const decompressed = this.pako.inflate(compressed);
-            // Tight basic uses 3-byte RGB pixels
-            const rgbaData = new Uint8Array(tileW * tileH * 4);
-            for (let i = 0; i < tileW * tileH; i++) {
-              rgbaData[i * 4] = decompressed[i * 3];
-              rgbaData[i * 4 + 1] = decompressed[i * 3 + 1];
-              rgbaData[i * 4 + 2] = decompressed[i * 3 + 2];
-              rgbaData[i * 4 + 3] = 255;
-            }
-            fb.writeRect(x + tx, y + ty, tileW, tileH, rgbaData);
+          const decompressed = this.decompressStream(streamIdx, compressed);
+
+          // Tight basic uses 3-byte RGB pixels (CPIXEL for 32bpp/24depth)
+          const rgbaData = new Uint8Array(tileW * tileH * 4);
+          for (let i = 0; i < tileW * tileH; i++) {
+            rgbaData[i * 4] = decompressed[i * 3];
+            rgbaData[i * 4 + 1] = decompressed[i * 3 + 1];
+            rgbaData[i * 4 + 2] = decompressed[i * 3 + 2];
+            rgbaData[i * 4 + 3] = 255;
           }
+          fb.writeRect(x + tx, y + ty, tileW, tileH, rgbaData);
         }
       }
     }
