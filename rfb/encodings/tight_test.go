@@ -110,15 +110,15 @@ func TestTightBasicEncoding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("zlib.NewReader: %v", err)
 	}
-	decompressed, err := io.ReadAll(reader)
-	reader.Close()
-	if err != nil {
-		t.Fatalf("decompress: %v", err)
-	}
+	defer reader.Close()
 
+	// Read exactly the expected number of bytes. The zlib stream is persistent
+	// (flushed, not closed), so io.ReadAll would fail with unexpected EOF.
+	// Real VNC clients read exactly w*h*3 decompressed bytes.
 	expectedLen := w * h * 3 // RGB, not BGRA
-	if len(decompressed) != expectedLen {
-		t.Errorf("decompressed length: expected %d, got %d", expectedLen, len(decompressed))
+	decompressed := make([]byte, expectedLen)
+	if _, err := io.ReadFull(reader, decompressed); err != nil {
+		t.Fatalf("decompress: %v", err)
 	}
 
 	// Verify pixel values: BGRA -> RGB conversion

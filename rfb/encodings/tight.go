@@ -239,6 +239,8 @@ func (t *Tight) encodeJPEG(pixels []byte, w, h int) ([]byte, error) {
 }
 
 // encodeBasic encodes the tile using zlib compression on RGB data.
+// The zlib stream is persistent per stream index across tiles and frames,
+// as required by the Tight encoding specification (RFC 6143 §7.7.7).
 func (t *Tight) encodeBasic(pixels []byte, w, h, streamIdx int) ([]byte, error) {
 	stream := t.streams[streamIdx]
 
@@ -253,22 +255,26 @@ func (t *Tight) encodeBasic(pixels []byte, w, h, streamIdx int) ([]byte, error) 
 		rgb[dstOff+2] = pixels[srcOff]   // B
 	}
 
-	// Compress with zlib; each tile produces a complete zlib stream
+	// Compress with persistent zlib stream. The client maintains one
+	// decompressor per stream index; we must keep using the same writer
+	// so the dictionary is preserved. Flush (Z_SYNC_FLUSH) after each
+	// tile so the client can decompress immediately.
 	stream.buf.Reset()
-	stream.writer = zlib.NewWriter(&stream.buf)
+	if stream.writer == nil {
+		stream.writer = zlib.NewWriter(&stream.buf)
+	}
 
 	if _, err := stream.writer.Write(rgb); err != nil {
 		return nil, fmt.Errorf("tight basic zlib write: %w", err)
 	}
-	if err := stream.writer.Close(); err != nil {
-		return nil, fmt.Errorf("tight basic zlib close: %w", err)
+	if err := stream.writer.Flush(); err != nil {
+		return nil, fmt.Errorf("tight basic zlib flush: %w", err)
 	}
-	stream.writer = nil
 
 	compressed := stream.buf.Bytes()
 	cl := compactLen(len(compressed))
 
-	// Control byte: bits 0-1 = stream index, bits 3-0 sub-encoding = Basic
+	// Control byte: bits 1-0 = stream index, bits 3-2 = 00 (Basic sub-encoding)
 	controlByte := byte(streamIdx & 0x03)
 
 	result := make([]byte, 0, 1+len(cl)+len(compressed))

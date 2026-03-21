@@ -214,8 +214,9 @@ type ClientConn struct {
 
 	tightEnc   MultiEncoder // lazy-initialized per-connection Tight encoder
 	zlibBuf    bytes.Buffer // persistent zlib buffer for Zlib encoding
-	zlibWriter *zlib.Writer // persistent zlib writer
-	zrleBuf    bytes.Buffer // buffer for one ZRLE rectangle's zlib stream
+	zlibWriter  *zlib.Writer // persistent zlib writer for Zlib encoding
+	zrleBuf     bytes.Buffer // buffer for one ZRLE rectangle's zlib stream
+	zrleWriter  *zlib.Writer // persistent zlib writer for ZRLE encoding
 
 	lastCursor    *CursorImage // last cursor sent to this client
 	lastFrameTime time.Time   // last framebuffer update time for FPS limiting
@@ -564,54 +565,66 @@ func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) err
 		return c.bw.Flush()
 
 	case EncodingZRLE:
-		// ZRLE uses CPIXEL (3-byte BGR), so we pass raw BGRA pixels and the
-		// encoder handles the conversion internally.
-		// Each framebuffer update must be one complete zlib stream (new writer + Close).
+		// Convert pixels to the client's pixel format first, then extract CPIXELs.
+		clientBpp := int(c.pixelFormat.BitsPerPixel) / 8
+		cpixelSize, cpixelOff := zrleCPixel(c.pixelFormat)
+
+		// Build a tightly-packed pixel buffer in client format for the requested region.
+		clientPixels := make([]byte, w*h*clientBpp)
+		for row := 0; row < h; row++ {
+			srcY := int(req.Y) + row
+			srcOffset := srcY*stride + int(req.X)*4
+			srcEnd := srcOffset + w*4
+			if srcEnd > len(pixels) {
+				break
+			}
+			copy(clientPixels[row*w*4:(row+1)*w*4], pixels[srcOffset:srcEnd])
+		}
+		clientPixels = ConvertPixels(c.pixelFormat, c.server.config.PixelFormat, clientPixels, w, h)
+
+		// ZRLE uses a single persistent zlib stream per connection (RFC 6143 §7.7.6).
 		c.zrleBuf.Reset()
-		zw := zlib.NewWriter(&c.zrleBuf)
+		if c.zrleWriter == nil {
+			c.zrleWriter = zlib.NewWriter(&c.zrleBuf)
+		}
 
-		bpp := 4
 		tileSize := 64
-		for tileY := int(req.Y); tileY < int(req.Y)+h; tileY += tileSize {
-			tileH := min(tileSize, int(req.Y)+h-tileY)
-			for tileX := int(req.X); tileX < int(req.X)+w; tileX += tileSize {
-				tileW := min(tileSize, int(req.X)+w-tileX)
+		for tileY := 0; tileY < h; tileY += tileSize {
+			tileH := min(tileSize, h-tileY)
+			for tileX := 0; tileX < w; tileX += tileSize {
+				tileW := min(tileSize, w-tileX)
 
-				// Extract tile pixels as CPIXEL (3 bytes)
-				tilePixels := make([]byte, tileW*tileH*3)
+				// Extract tile CPIXELs from the converted pixel buffer.
+				tilePixels := make([]byte, tileW*tileH*cpixelSize)
 				for row := 0; row < tileH; row++ {
-					srcY := tileY + row
 					for col := 0; col < tileW; col++ {
-						srcX := tileX + col
-						srcOff := srcY*stride + srcX*bpp
-						dstOff := (row*tileW + col) * 3
-						tilePixels[dstOff] = pixels[srcOff]     // B
-						tilePixels[dstOff+1] = pixels[srcOff+1] // G
-						tilePixels[dstOff+2] = pixels[srcOff+2] // R
+						srcOff := ((tileY+row)*w + (tileX + col)) * clientBpp
+						dstOff := (row*tileW + col) * cpixelSize
+						copy(tilePixels[dstOff:dstOff+cpixelSize], clientPixels[srcOff+cpixelOff:srcOff+cpixelOff+cpixelSize])
 					}
 				}
 
 				// Check if solid tile
 				solid := true
-				for i := 3; i < len(tilePixels); i += 3 {
-					if tilePixels[i] != tilePixels[0] || tilePixels[i+1] != tilePixels[1] || tilePixels[i+2] != tilePixels[2] {
+				for i := cpixelSize; i < len(tilePixels); i += cpixelSize {
+					if !bytesEqual(tilePixels[i:i+cpixelSize], tilePixels[0:cpixelSize]) {
 						solid = false
 						break
 					}
 				}
 
 				if solid {
-					zw.Write([]byte{1}) // solid subtype
-					zw.Write(tilePixels[0:3])
+					c.zrleWriter.Write([]byte{1}) // solid subtype
+					c.zrleWriter.Write(tilePixels[0:cpixelSize])
 				} else {
-					zw.Write([]byte{0}) // raw subtype
-					zw.Write(tilePixels)
+					c.zrleWriter.Write([]byte{0}) // raw subtype
+					c.zrleWriter.Write(tilePixels)
 				}
 			}
 		}
 
-		if err := zw.Close(); err != nil {
-			return fmt.Errorf("zrle zlib close: %w", err)
+		if err := c.zrleWriter.Flush(); err != nil {
+			return fmt.Errorf("zrle zlib flush: %w", err)
 		}
 
 		compressedLen := c.zrleBuf.Len()
@@ -780,6 +793,58 @@ func (c *ClientConn) sendBlankFrame(req *FramebufferUpdateRequest) error {
 		return err
 	}
 	return c.bw.Flush()
+}
+
+// zrleCPixel returns the CPIXEL byte size and the offset within a full pixel
+// from which to copy those bytes, given the client's pixel format.
+// Per RFC 6143 §7.7.6, if bpp=32 and the significant bits fit in the least or
+// most significant 24 bits, CPIXEL is 3 bytes; otherwise it equals bpp/8.
+func zrleCPixel(pf PixelFormat) (size int, offset int) {
+	if pf.BitsPerPixel == 32 && pf.Depth <= 24 {
+		rEnd := uint32(pf.RedShift) + bitLen(pf.RedMax)
+		gEnd := uint32(pf.GreenShift) + bitLen(pf.GreenMax)
+		bEnd := uint32(pf.BlueShift) + bitLen(pf.BlueMax)
+		maxEnd := max(rEnd, gEnd, bEnd)
+		minShift := min(uint32(pf.RedShift), uint32(pf.GreenShift), uint32(pf.BlueShift))
+
+		if maxEnd <= 24 {
+			// Significant bits in least significant 24 bits.
+			if pf.BigEndian != 0 {
+				return 3, 1 // skip MSB
+			}
+			return 3, 0 // take first 3 bytes
+		}
+		if minShift >= 8 {
+			// Significant bits in most significant 24 bits.
+			if pf.BigEndian != 0 {
+				return 3, 0 // take first 3 bytes
+			}
+			return 3, 1 // skip LSB
+		}
+	}
+	return int(pf.BitsPerPixel) / 8, 0
+}
+
+// bitLen returns the number of bits needed to represent v.
+func bitLen(v uint16) uint32 {
+	n := uint32(0)
+	for x := uint32(v); x > 0; x >>= 1 {
+		n++
+	}
+	return n
+}
+
+// bytesEqual returns true if two byte slices are equal.
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // Close closes the client connection.
