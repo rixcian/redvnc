@@ -29,8 +29,9 @@ const (
 
 // Proxy manages the WebSocket ↔ TCP relay for a single session.
 type Proxy struct {
-	session *Session
-	server  *Server
+	session   *Session
+	server    *Server
+	rfbReader *rfbReader
 }
 
 // NewProxy creates a new proxy for the given session.
@@ -53,8 +54,12 @@ func (p *Proxy) Run(ctx context.Context) {
 	p.session.TCPConn = tcpConn
 	defer tcpConn.Close()
 
+	// Create a buffered reader that is shared between handshake and relay
+	// to avoid losing bytes buffered during the handshake.
+	br := bufio.NewReaderSize(tcpConn, 256*1024)
+
 	// Perform RFB handshake with VNC server
-	serverInit, err := p.performHandshake(tcpConn)
+	serverInit, err := p.performHandshake(tcpConn, br)
 	if err != nil {
 		p.server.logger.Warn("handshake failed", "session_id", p.session.ID, "error", err)
 		// Record auth failure for rate limiting
@@ -69,6 +74,11 @@ func (p *Proxy) Run(ctx context.Context) {
 	p.server.rateLimiter.ClearFailures(clientIP)
 
 	p.server.logger.Info("handshake complete", "session_id", p.session.ID, "width", serverInit.Width, "height", serverInit.Height, "name", serverInit.Name)
+
+	// Create RFB message reader using the server's initial pixel format.
+	// This is updated when the client sends SetPixelFormat.
+	pf := serverInit.PixelFormat
+	p.rfbReader = newRFBReader(br, pf.BitsPerPixel, pf.Depth, pf.TrueColour)
 
 	// Send SessionInit extension message to browser
 	if err := p.sendSessionInit(ctx, serverInit); err != nil {
@@ -102,8 +112,7 @@ func (p *Proxy) Run(ctx context.Context) {
 }
 
 // performHandshake performs the RFB handshake with the VNC server.
-func (p *Proxy) performHandshake(conn net.Conn) (*rfb.ServerInit, error) {
-	br := bufio.NewReader(conn)
+func (p *Proxy) performHandshake(conn net.Conn, br *bufio.Reader) (*rfb.ServerInit, error) {
 	bw := bufio.NewWriter(conn)
 
 	// Read server version
@@ -259,25 +268,23 @@ func (p *Proxy) sendSessionInit(ctx context.Context, init *rfb.ServerInit) error
 	return p.session.WSConn.Write(ctx, websocket.MessageBinary, buf)
 }
 
-// relayVNCToBrowser reads from the TCP connection and writes to the WebSocket.
+// relayVNCToBrowser reads complete RFB messages from the TCP connection and
+// writes each as a single WebSocket message. This ensures the browser always
+// receives properly framed RFB messages regardless of TCP chunking.
 func (p *Proxy) relayVNCToBrowser(ctx context.Context) {
-	buf := make([]byte, 64*1024)
 	for {
-		n, err := p.session.TCPConn.Read(buf)
+		msg, err := p.rfbReader.ReadMessage()
 		if err != nil {
 			if ctx.Err() == nil {
 				p.server.logger.Warn("VNC read error", "session_id", p.session.ID, "error", err)
 			}
 			return
 		}
-		if n == 0 {
-			continue
-		}
 
 		p.session.TouchActivity()
-		p.session.BytesToClient.Add(int64(n))
+		p.session.BytesToClient.Add(int64(len(msg)))
 
-		if err := p.session.WSConn.Write(ctx, websocket.MessageBinary, buf[:n]); err != nil {
+		if err := p.session.WSConn.Write(ctx, websocket.MessageBinary, msg); err != nil {
 			if ctx.Err() == nil {
 				p.server.logger.Warn("WS write error", "session_id", p.session.ID, "error", err)
 			}
@@ -317,6 +324,15 @@ func (p *Proxy) relayBrowserToVNC(ctx context.Context) {
 			// Extension message - handle locally
 			p.handleExtensionMessage(ctx, rfbType, data)
 		} else {
+			// Intercept SetPixelFormat (client msg type 0) to track the pixel
+			// format for correct RFB message framing on the VNC→Browser path.
+			if rfbType == 0 && len(data) >= 20 {
+				bpp := data[4]
+				depth := data[5]
+				trueColour := data[7]
+				p.rfbReader.UpdatePixelFormat(bpp, depth, trueColour)
+			}
+
 			// Standard RFB message - relay to VNC server
 			if _, err := p.session.TCPConn.Write(data); err != nil {
 				if ctx.Err() == nil {

@@ -124,6 +124,10 @@ function getEncodingDataLength(header: RectHeader, data: DataView): number {
     case 7: // Tight
       return getTightDataLength(width, height, data);
 
+    case 16: // ZRLE
+      // 4-byte length prefix + compressed data (same framing as Zlib)
+      return 4 + data.getUint32(0);
+
     case -239: // Cursor
       return width * height * 4 + Math.ceil(width / 8) * height;
 
