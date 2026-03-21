@@ -2,283 +2,192 @@
 
 package capture
 
-/*
-#cgo LDFLAGS: -ld3d11 -ldxgi -lole32
-
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-
-// We use raw COM vtable calls to avoid requiring the full DirectX SDK headers.
-// This keeps the CGo build self-contained.
-
-#define COBJMACROS
-#include <windows.h>
-#include <d3d11.h>
-#include <dxgi1_2.h>
-
-typedef struct {
-	ID3D11Device          *device;
-	ID3D11DeviceContext   *context;
-	IDXGIOutputDuplication *duplication;
-	ID3D11Texture2D       *stagingTex;
-	int                    width;
-	int                    height;
-} dxgi_capture_t;
-
-static dxgi_capture_t* dxgi_capture_init(int *out_w, int *out_h) {
-	HRESULT hr;
-
-	// Create D3D11 device
-	ID3D11Device *device = NULL;
-	ID3D11DeviceContext *context = NULL;
-	D3D_FEATURE_LEVEL featureLevel;
-	D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1 };
-
-	hr = D3D11CreateDevice(
-		NULL,                       // default adapter
-		D3D_DRIVER_TYPE_HARDWARE,
-		NULL,                       // no software rasterizer
-		0,                          // flags
-		featureLevels,
-		2,
-		D3D11_SDK_VERSION,
-		&device,
-		&featureLevel,
-		&context
-	);
-	if (FAILED(hr)) return NULL;
-
-	// Get DXGI device
-	IDXGIDevice *dxgiDevice = NULL;
-	hr = ID3D11Device_QueryInterface(device, &IID_IDXGIDevice, (void**)&dxgiDevice);
-	if (FAILED(hr)) {
-		ID3D11Device_Release(device);
-		ID3D11DeviceContext_Release(context);
-		return NULL;
-	}
-
-	// Get DXGI adapter
-	IDXGIAdapter *adapter = NULL;
-	hr = IDXGIDevice_GetAdapter(dxgiDevice, &adapter);
-	IDXGIDevice_Release(dxgiDevice);
-	if (FAILED(hr)) {
-		ID3D11Device_Release(device);
-		ID3D11DeviceContext_Release(context);
-		return NULL;
-	}
-
-	// Get first output
-	IDXGIOutput *output = NULL;
-	hr = IDXGIAdapter_EnumOutputs(adapter, 0, &output);
-	IDXGIAdapter_Release(adapter);
-	if (FAILED(hr)) {
-		ID3D11Device_Release(device);
-		ID3D11DeviceContext_Release(context);
-		return NULL;
-	}
-
-	// Get output description for dimensions
-	DXGI_OUTPUT_DESC outputDesc;
-	IDXGIOutput_GetDesc(output, &outputDesc);
-	int width = outputDesc.DesktopCoordinates.right - outputDesc.DesktopCoordinates.left;
-	int height = outputDesc.DesktopCoordinates.bottom - outputDesc.DesktopCoordinates.top;
-
-	// QI for IDXGIOutput1 to get DuplicateOutput
-	IDXGIOutput1 *output1 = NULL;
-	hr = IDXGIOutput_QueryInterface(output, &IID_IDXGIOutput1, (void**)&output1);
-	IDXGIOutput_Release(output);
-	if (FAILED(hr)) {
-		ID3D11Device_Release(device);
-		ID3D11DeviceContext_Release(context);
-		return NULL;
-	}
-
-	// Create desktop duplication
-	IDXGIOutputDuplication *duplication = NULL;
-	hr = IDXGIOutput1_DuplicateOutput(output1, (IUnknown*)device, &duplication);
-	IDXGIOutput1_Release(output1);
-	if (FAILED(hr)) {
-		ID3D11Device_Release(device);
-		ID3D11DeviceContext_Release(context);
-		return NULL;
-	}
-
-	// Create a CPU-accessible staging texture for reading back pixels
-	D3D11_TEXTURE2D_DESC stagingDesc;
-	memset(&stagingDesc, 0, sizeof(stagingDesc));
-	stagingDesc.Width = width;
-	stagingDesc.Height = height;
-	stagingDesc.MipLevels = 1;
-	stagingDesc.ArraySize = 1;
-	stagingDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-	stagingDesc.SampleDesc.Count = 1;
-	stagingDesc.Usage = D3D11_USAGE_STAGING;
-	stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-
-	ID3D11Texture2D *stagingTex = NULL;
-	hr = ID3D11Device_CreateTexture2D(device, &stagingDesc, NULL, &stagingTex);
-	if (FAILED(hr)) {
-		IDXGIOutputDuplication_Release(duplication);
-		ID3D11Device_Release(device);
-		ID3D11DeviceContext_Release(context);
-		return NULL;
-	}
-
-	dxgi_capture_t *ctx = (dxgi_capture_t*)calloc(1, sizeof(dxgi_capture_t));
-	ctx->device = device;
-	ctx->context = context;
-	ctx->duplication = duplication;
-	ctx->stagingTex = stagingTex;
-	ctx->width = width;
-	ctx->height = height;
-
-	*out_w = width;
-	*out_h = height;
-	return ctx;
-}
-
-static int dxgi_capture_frame(dxgi_capture_t *ctx, unsigned char **out_pixels, int *out_stride) {
-	if (!ctx || !ctx->duplication) return -1;
-
-	HRESULT hr;
-	IDXGIResource *desktopResource = NULL;
-	DXGI_OUTDUPL_FRAME_INFO frameInfo;
-
-	// Acquire the next frame (timeout 500ms)
-	hr = IDXGIOutputDuplication_AcquireNextFrame(ctx->duplication, 500, &frameInfo, &desktopResource);
-	if (FAILED(hr)) {
-		// If access lost, return error so caller can reinit
-		return -1;
-	}
-
-	// Get the ID3D11Texture2D from the desktop resource
-	ID3D11Texture2D *desktopTex = NULL;
-	hr = IDXGIResource_QueryInterface(desktopResource, &IID_ID3D11Texture2D, (void**)&desktopTex);
-	IDXGIResource_Release(desktopResource);
-	if (FAILED(hr)) {
-		IDXGIOutputDuplication_ReleaseFrame(ctx->duplication);
-		return -1;
-	}
-
-	// Copy the desktop texture to our staging texture
-	ID3D11DeviceContext_CopyResource(ctx->context, (ID3D11Resource*)ctx->stagingTex, (ID3D11Resource*)desktopTex);
-	ID3D11Texture2D_Release(desktopTex);
-
-	// Map the staging texture to read pixels
-	D3D11_MAPPED_SUBRESOURCE mapped;
-	hr = ID3D11DeviceContext_Map(ctx->context, (ID3D11Resource*)ctx->stagingTex, 0, D3D11_MAP_READ, 0, &mapped);
-	if (FAILED(hr)) {
-		IDXGIOutputDuplication_ReleaseFrame(ctx->duplication);
-		return -1;
-	}
-
-	int stride = ctx->width * 4;
-	int size = stride * ctx->height;
-	unsigned char *buf = (unsigned char*)malloc(size);
-	if (!buf) {
-		ID3D11DeviceContext_Unmap(ctx->context, (ID3D11Resource*)ctx->stagingTex, 0);
-		IDXGIOutputDuplication_ReleaseFrame(ctx->duplication);
-		return -1;
-	}
-
-	// Copy row-by-row since mapped.RowPitch may differ from our stride
-	unsigned char *src = (unsigned char*)mapped.pData;
-	for (int y = 0; y < ctx->height; y++) {
-		memcpy(buf + y * stride, src + y * mapped.RowPitch, stride);
-	}
-
-	// Ensure alpha is 255 (DXGI gives BGRA with alpha that may not be 0xFF)
-	for (int i = 3; i < size; i += 4) {
-		buf[i] = 255;
-	}
-
-	ID3D11DeviceContext_Unmap(ctx->context, (ID3D11Resource*)ctx->stagingTex, 0);
-	IDXGIOutputDuplication_ReleaseFrame(ctx->duplication);
-
-	*out_pixels = buf;
-	*out_stride = stride;
-	return 0;
-}
-
-static void dxgi_capture_close(dxgi_capture_t *ctx) {
-	if (!ctx) return;
-
-	if (ctx->stagingTex) {
-		ID3D11Texture2D_Release(ctx->stagingTex);
-	}
-	if (ctx->duplication) {
-		IDXGIOutputDuplication_Release(ctx->duplication);
-	}
-	if (ctx->context) {
-		ID3D11DeviceContext_Release(ctx->context);
-	}
-	if (ctx->device) {
-		ID3D11Device_Release(ctx->device);
-	}
-
-	free(ctx);
-}
-*/
-import "C"
-
 import (
 	"fmt"
+	"log"
+	"sync"
+	"syscall"
 	"unsafe"
 )
 
-// DXGICapture captures the screen using the DXGI Desktop Duplication API.
-type DXGICapture struct {
-	ctx    *C.dxgi_capture_t
-	width  uint16
-	height uint16
+var (
+	user32 = syscall.NewLazyDLL("user32.dll")
+	gdi32  = syscall.NewLazyDLL("gdi32.dll")
+
+	procGetDC             = user32.NewProc("GetDC")
+	procReleaseDC         = user32.NewProc("ReleaseDC")
+	procGetSystemMetrics  = user32.NewProc("GetSystemMetrics")
+	procCreateCompatibleDC = gdi32.NewProc("CreateCompatibleDC")
+	procCreateDIBSection  = gdi32.NewProc("CreateDIBSection")
+	procSelectObject      = gdi32.NewProc("SelectObject")
+	procBitBlt            = gdi32.NewProc("BitBlt")
+	procDeleteObject      = gdi32.NewProc("DeleteObject")
+	procDeleteDC          = gdi32.NewProc("DeleteDC")
+)
+
+const (
+	smCXScreen = 0
+	smCYScreen = 1
+	srcCopy    = 0x00CC0020
+	captureBlt = 0x40000000
+	biRGB      = 0
+	dibRGBColors = 0
+)
+
+type bitmapInfoHeader struct {
+	Size          uint32
+	Width         int32
+	Height        int32
+	Planes        uint16
+	BitCount      uint16
+	Compression   uint32
+	SizeImage     uint32
+	XPelsPerMeter int32
+	YPelsPerMeter int32
+	ClrUsed       uint32
+	ClrImportant  uint32
+}
+
+type bitmapInfo struct {
+	Header bitmapInfoHeader
+	Colors [1]uint32
+}
+
+// GDICapture captures the primary screen using GDI BitBlt.
+// Works on Windows 7 and higher.
+type GDICapture struct {
+	mu        sync.Mutex
+	screenDC  syscall.Handle
+	memDC     syscall.Handle
+	hBitmap   syscall.Handle
+	oldBitmap syscall.Handle
+	bits      unsafe.Pointer
+	width     uint16
+	height    uint16
 }
 
 func NewScreenCapture() (ScreenCapture, error) {
-	return &DXGICapture{}, nil
+	return &GDICapture{}, nil
 }
 
-func (d *DXGICapture) Init() error {
-	var w, h C.int
-	ctx := C.dxgi_capture_init(&w, &h)
-	if ctx == nil {
-		return fmt.Errorf("failed to initialize DXGI Desktop Duplication (is a desktop session active?)")
+func (g *GDICapture) Init() error {
+	w, _, _ := procGetSystemMetrics.Call(smCXScreen)
+	h, _, _ := procGetSystemMetrics.Call(smCYScreen)
+	if w == 0 || h == 0 {
+		return fmt.Errorf("GetSystemMetrics returned zero screen size")
 	}
-	d.ctx = ctx
-	d.width = uint16(w)
-	d.height = uint16(h)
+
+	screenDC, _, _ := procGetDC.Call(0)
+	if screenDC == 0 {
+		return fmt.Errorf("GetDC(NULL) failed")
+	}
+
+	memDC, _, _ := procCreateCompatibleDC.Call(screenDC)
+	if memDC == 0 {
+		procReleaseDC.Call(0, screenDC)
+		return fmt.Errorf("CreateCompatibleDC failed")
+	}
+
+	bmi := bitmapInfo{
+		Header: bitmapInfoHeader{
+			Size:        uint32(unsafe.Sizeof(bitmapInfoHeader{})),
+			Width:       int32(w),
+			Height:      -int32(h), // top-down DIB
+			Planes:      1,
+			BitCount:    32,
+			Compression: biRGB,
+		},
+	}
+
+	var bits unsafe.Pointer
+	hBitmap, _, _ := procCreateDIBSection.Call(
+		memDC,
+		uintptr(unsafe.Pointer(&bmi)),
+		dibRGBColors,
+		uintptr(unsafe.Pointer(&bits)),
+		0, 0,
+	)
+	if hBitmap == 0 || bits == nil {
+		procDeleteDC.Call(memDC)
+		procReleaseDC.Call(0, screenDC)
+		return fmt.Errorf("CreateDIBSection failed")
+	}
+
+	oldBitmap, _, _ := procSelectObject.Call(memDC, hBitmap)
+
+	g.screenDC = syscall.Handle(screenDC)
+	g.memDC = syscall.Handle(memDC)
+	g.hBitmap = syscall.Handle(hBitmap)
+	g.oldBitmap = syscall.Handle(oldBitmap)
+	g.bits = bits
+	g.width = uint16(w)
+	g.height = uint16(h)
+
+	log.Println("screen capture: using GDI BitBlt (Windows 7+)")
 	return nil
 }
 
-func (d *DXGICapture) Bounds() (uint16, uint16) {
-	return d.width, d.height
+func (g *GDICapture) Bounds() (uint16, uint16) {
+	return g.width, g.height
 }
 
-func (d *DXGICapture) Capture() ([]byte, int, error) {
-	if d.ctx == nil {
-		return nil, 0, fmt.Errorf("DXGI capture not initialized")
+func (g *GDICapture) Capture() ([]byte, int, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.bits == nil {
+		return nil, 0, fmt.Errorf("GDI capture not initialized")
 	}
 
-	var buf *C.uchar
-	var stride C.int
+	w := int(g.width)
+	h := int(g.height)
 
-	rc := C.dxgi_capture_frame(d.ctx, &buf, &stride)
-	if rc != 0 {
-		return nil, 0, fmt.Errorf("DXGI screen capture failed")
+	ret, _, _ := procBitBlt.Call(
+		uintptr(g.memDC), 0, 0, uintptr(w), uintptr(h),
+		uintptr(g.screenDC), 0, 0,
+		srcCopy|captureBlt,
+	)
+	if ret == 0 {
+		return nil, 0, fmt.Errorf("BitBlt failed")
 	}
-	defer C.free(unsafe.Pointer(buf))
 
-	size := int(stride) * int(d.height)
+	stride := w * 4
+	size := stride * h
+
+	// Copy pixel data from the DIB section.
+	// The DIB section stores pixels as BGRX (32bpp, X = unused alpha).
+	src := unsafe.Slice((*byte)(g.bits), size)
 	pixels := make([]byte, size)
-	copy(pixels, unsafe.Slice((*byte)(unsafe.Pointer(buf)), size))
+	copy(pixels, src)
 
-	return pixels, int(stride), nil
+	// Set alpha channel to 255 (DIB section leaves it as 0).
+	for i := 3; i < size; i += 4 {
+		pixels[i] = 255
+	}
+
+	return pixels, stride, nil
 }
 
-func (d *DXGICapture) Close() error {
-	if d.ctx != nil {
-		C.dxgi_capture_close(d.ctx)
-		d.ctx = nil
+func (g *GDICapture) Close() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.oldBitmap != 0 {
+		procSelectObject.Call(uintptr(g.memDC), uintptr(g.oldBitmap))
+		g.oldBitmap = 0
 	}
+	if g.hBitmap != 0 {
+		procDeleteObject.Call(uintptr(g.hBitmap))
+		g.hBitmap = 0
+	}
+	if g.memDC != 0 {
+		procDeleteDC.Call(uintptr(g.memDC))
+		g.memDC = 0
+	}
+	if g.screenDC != 0 {
+		procReleaseDC.Call(0, uintptr(g.screenDC))
+		g.screenDC = 0
+	}
+	g.bits = nil
 	return nil
 }
