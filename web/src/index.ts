@@ -263,7 +263,14 @@ export class VncClient {
 
   private handleMessage(type: number, view: DataView): void {
     this._bytesReceived += view.byteLength;
-    const msg = parseServerMessage(type, view);
+
+    let msg;
+    try {
+      msg = parseServerMessage(type, view);
+    } catch (err) {
+      console.warn('RFB parse error (msgType=%d, %d bytes):', type, view.byteLength, err);
+      return;
+    }
     if (!msg) return;
 
     switch (msg.type) {

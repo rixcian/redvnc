@@ -4,6 +4,7 @@ import {
   ExtUploadStatus,
   type SessionInitData,
 } from './types';
+import { tryGetMessageLength } from './rfb-parser';
 
 export type MessageHandler = (type: number, data: DataView) => void;
 
@@ -11,6 +12,7 @@ export class VncConnection {
   private ws: WebSocket | null = null;
   private messageHandler: MessageHandler | null = null;
   private _connected = false;
+  private buffer = new Uint8Array(0);
 
   get connected(): boolean {
     return this._connected;
@@ -31,6 +33,7 @@ export class VncConnection {
       const ws = new WebSocket(wsUrl.toString(), 'binary');
       ws.binaryType = 'arraybuffer';
       this.ws = ws;
+      this.buffer = new Uint8Array(0);
 
       let initResolved = false;
 
@@ -42,25 +45,69 @@ export class VncConnection {
         const data = event.data as ArrayBuffer;
         if (data.byteLength < 1) return;
 
-        const view = new DataView(data);
-        const msgType = view.getUint8(0);
+        const chunk = new Uint8Array(data);
 
-        // Before session init is resolved, only handle ExtSessionInit
-        if (!initResolved && msgType === ExtSessionInit) {
-          initResolved = true;
-          const sessionInit = parseSessionInit(view);
-          resolve(sessionInit);
-          return;
+        // Extension messages from the proxy are always sent as complete
+        // WebSocket messages (they bypass the TCP relay). Detect and
+        // dispatch them immediately to avoid mixing them into the
+        // reassembly buffer for RFB stream data.
+        if (this.buffer.length === 0 && chunk[0] >= 128 && chunk.length >= 5) {
+          const peekView = new DataView(data);
+          const payloadLen = peekView.getUint32(1);
+          if (chunk.length === 5 + payloadLen) {
+            // Matches extension message format exactly — dispatch directly
+            if (!initResolved && chunk[0] === ExtSessionInit) {
+              initResolved = true;
+              resolve(parseSessionInit(peekView));
+              return;
+            }
+            this.messageHandler?.(chunk[0], peekView);
+            return;
+          }
         }
 
-        // Extension messages from server
-        if (msgType >= 128) {
+        // Append to reassembly buffer
+        const newBuf = new Uint8Array(this.buffer.length + chunk.length);
+        newBuf.set(this.buffer);
+        newBuf.set(chunk, this.buffer.length);
+        this.buffer = newBuf;
+
+        // Extract and dispatch complete messages
+        while (this.buffer.length > 0) {
+          // Check for extension messages at the head of the buffer
+          // (can happen if an extension message landed in the buffer)
+          if (this.buffer[0] >= 128 && this.buffer.length >= 5) {
+            const extView = new DataView(this.buffer.buffer, this.buffer.byteOffset, this.buffer.byteLength);
+            const payloadLen = extView.getUint32(1);
+            const extMsgLen = 5 + payloadLen;
+            if (this.buffer.length < extMsgLen) break;
+
+            const msgBytes = this.buffer.slice(0, extMsgLen);
+            this.buffer = this.buffer.slice(extMsgLen);
+            const view = new DataView(msgBytes.buffer, msgBytes.byteOffset, msgBytes.byteLength);
+
+            if (!initResolved && msgBytes[0] === ExtSessionInit) {
+              initResolved = true;
+              resolve(parseSessionInit(view));
+              continue;
+            }
+            this.messageHandler?.(msgBytes[0], view);
+            continue;
+          }
+
+          const msgLen = tryGetMessageLength(this.buffer);
+          if (msgLen === -1 || msgLen > this.buffer.length) {
+            break; // Need more data
+          }
+
+          const msgBytes = this.buffer.slice(0, msgLen);
+          this.buffer = this.buffer.slice(msgLen);
+
+          const view = new DataView(msgBytes.buffer, msgBytes.byteOffset, msgBytes.byteLength);
+          const msgType = view.getUint8(0);
+
           this.messageHandler?.(msgType, view);
-          return;
         }
-
-        // Standard RFB server messages
-        this.messageHandler?.(msgType, view);
       };
 
       ws.onerror = () => {
@@ -71,6 +118,7 @@ export class VncConnection {
 
       ws.onclose = (event: CloseEvent) => {
         this._connected = false;
+        this.buffer = new Uint8Array(0);
         if (!initResolved) {
           reject(new Error(`WebSocket closed: ${event.reason || 'unknown'}`));
         }
@@ -91,6 +139,7 @@ export class VncConnection {
       this.ws.close();
       this.ws = null;
       this._connected = false;
+      this.buffer = new Uint8Array(0);
     }
   }
 }
