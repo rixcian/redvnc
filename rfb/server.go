@@ -130,6 +130,9 @@ func NewServer(config ServerConfig) *Server {
 
 // ListenAndServe starts the VNC server on the given address (e.g. ":5900").
 func (s *Server) ListenAndServe(addr string) error {
+	if err := checkPortAvailable(addr); err != nil {
+		return err
+	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
