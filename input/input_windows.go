@@ -40,15 +40,6 @@ const (
 	smCYScreenI = 1
 )
 
-// INPUT structure for SendInput.
-// We use a fixed-size struct large enough for both KEYBDINPUT and MOUSEINPUT.
-type inputStruct struct {
-	Type uint32
-	_    [4]byte // padding on 64-bit
-	// Union: MOUSEINPUT is the largest member (32 bytes on 64-bit)
-	Data [24]byte
-}
-
 type mouseInput struct {
 	Dx        int32
 	Dy        int32
@@ -101,11 +92,11 @@ func (w *WindowsInput) KeyEvent(down bool, key uint32) error {
 		Flags: flags,
 	}
 
-	var inp inputStruct
+	var inp winInput
 	inp.Type = inputKeyboard
-	*(*keybdInput)(unsafe.Pointer(&inp.Data[0])) = ki
+	*(*keybdInput)(unsafe.Pointer(&inp.U[0])) = ki
 
-	procSendInput.Call(1, uintptr(unsafe.Pointer(&inp)), unsafe.Sizeof(inp))
+	procSendInput.Call(1, uintptr(unsafe.Pointer(&inp)), winInputSize)
 	return nil
 }
 
@@ -125,10 +116,10 @@ func (w *WindowsInput) PointerEvent(buttonMask uint8, xPos, yPos uint16) error {
 		Dy:    absY,
 		Flags: mouseeventfAbsolute | mouseeventfMove,
 	}
-	var inp inputStruct
+	var inp winInput
 	inp.Type = inputMouse
-	*(*mouseInput)(unsafe.Pointer(&inp.Data[0])) = mi
-	procSendInput.Call(1, uintptr(unsafe.Pointer(&inp)), unsafe.Sizeof(inp))
+	*(*mouseInput)(unsafe.Pointer(&inp.U[0])) = mi
+	procSendInput.Call(1, uintptr(unsafe.Pointer(&inp)), winInputSize)
 
 	changed := w.lastButtonMask ^ buttonMask
 
@@ -178,10 +169,10 @@ func (w *WindowsInput) sendButton(flags uint32, mouseData uint32) {
 		Flags:     flags,
 		MouseData: mouseData,
 	}
-	var inp inputStruct
+	var inp winInput
 	inp.Type = inputMouse
-	*(*mouseInput)(unsafe.Pointer(&inp.Data[0])) = mi
-	procSendInput.Call(1, uintptr(unsafe.Pointer(&inp)), unsafe.Sizeof(inp))
+	*(*mouseInput)(unsafe.Pointer(&inp.U[0])) = mi
+	procSendInput.Call(1, uintptr(unsafe.Pointer(&inp)), winInputSize)
 }
 
 func (w *WindowsInput) sendWheelRaw(delta int32) {
@@ -189,10 +180,10 @@ func (w *WindowsInput) sendWheelRaw(delta int32) {
 		Flags:     mouseeventfWheel,
 		MouseData: uint32(delta),
 	}
-	var inp inputStruct
+	var inp winInput
 	inp.Type = inputMouse
-	*(*mouseInput)(unsafe.Pointer(&inp.Data[0])) = mi
-	procSendInput.Call(1, uintptr(unsafe.Pointer(&inp)), unsafe.Sizeof(inp))
+	*(*mouseInput)(unsafe.Pointer(&inp.U[0])) = mi
+	procSendInput.Call(1, uintptr(unsafe.Pointer(&inp)), winInputSize)
 }
 
 func (w *WindowsInput) Close() error {
