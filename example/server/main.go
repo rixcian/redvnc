@@ -1,10 +1,10 @@
 // Command server starts a VNC server that shares the screen.
-// On macOS it captures the real screen and injects keyboard/mouse input.
-// Use -demo to show a test gradient pattern instead.
+// On Windows, macOS and Linux it captures the real screen and injects
+// keyboard/mouse input. Use -demo to show a test gradient pattern instead.
 //
 // Usage:
 //
-//	go run ./example/server                        # real screen sharing (macOS)
+//	go run ./example/server                        # real screen sharing
 //	go run ./example/server -demo                  # gradient test pattern
 //	go run ./example/server -port 5901             # custom port
 //	go run ./example/server -password secret       # VNC auth enabled
