@@ -269,28 +269,43 @@ func (s *Server) originPatterns() []string {
 	return patterns
 }
 
+// resolveUploadPathAbs returns an absolute path with symlinks resolved when possible.
+// macOS often gives temp dirs under /var/... while EvalSymlinks yields /private/var/...;
+// resolving both sides of a comparison avoids false rejections.
+func resolveUploadPathAbs(p string) (string, bool) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", false
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		resolved = abs
+	}
+	return filepath.Clean(resolved), true
+}
+
 // IsUploadDirAllowed checks if the given directory is authorized for uploads.
 func (s *Server) IsUploadDirAllowed(dir string) bool {
-	absDir, err := filepath.Abs(dir)
-	if err != nil {
+	resolved, ok := resolveUploadPathAbs(dir)
+	if !ok {
 		return false
-	}
-
-	// Resolve symlinks
-	resolved, err := filepath.EvalSymlinks(absDir)
-	if err != nil {
-		// Directory might not exist yet, check parent
-		resolved = absDir
 	}
 
 	// If no allowed dirs configured, only allow default
 	if len(s.allowedUpDirs) == 0 {
-		defaultAbs, _ := filepath.Abs(s.config.DefaultUploadDir)
-		return isSubdirOf(resolved, defaultAbs)
+		defaultResolved, ok := resolveUploadPathAbs(s.config.DefaultUploadDir)
+		if !ok {
+			return false
+		}
+		return isSubdirOf(resolved, defaultResolved)
 	}
 
 	for _, allowed := range s.allowedUpDirs {
-		if isSubdirOf(resolved, allowed) {
+		allowedResolved, ok := resolveUploadPathAbs(allowed)
+		if !ok {
+			continue
+		}
+		if isSubdirOf(resolved, allowedResolved) {
 			return true
 		}
 	}
