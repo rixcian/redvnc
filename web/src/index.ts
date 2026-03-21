@@ -33,13 +33,30 @@ import {
   DEFAULT_ENCODINGS,
   type VncClientOptions,
   type VncEventMap,
+  type ConnectionStats,
   type UploadOptions,
   type UploadResult,
   type UploadProgress,
 } from './types';
 
-export type { VncClientOptions, UploadOptions, UploadResult, UploadProgress };
+export type { VncClientOptions, UploadOptions, UploadResult, UploadProgress, ConnectionStats };
 export type { VncViewerProps } from './types';
+
+const ENCODING_NAMES: Record<number, string> = {
+  [EncodingRaw]: 'Raw',
+  [EncodingCopyRect]: 'CopyRect',
+  [EncodingZlib]: 'Zlib',
+  [EncodingTight]: 'Tight',
+  [EncodingZRLE]: 'ZRLE',
+  [EncodingCursor]: 'Cursor',
+  [EncodingDesktopSize]: 'DesktopSize',
+};
+
+const AUTH_TYPE_NAMES: Record<number, string> = {
+  0: 'Unknown',
+  1: 'None',
+  2: 'VNC Password',
+};
 
 export class VncClient {
   private options: VncClientOptions;
@@ -57,6 +74,13 @@ export class VncClient {
   private _width = 0;
   private _height = 0;
   private _name = '';
+  private _authType = 0;
+
+  // Stats tracking
+  private _encodingCounts: Record<number, number> = {};
+  private _totalRectangles = 0;
+  private _bytesReceived = 0;
+  private _fbuTimestamps: number[] = []; // timestamps of recent FramebufferUpdate messages
 
   private eventHandlers: { [K in keyof VncEventMap]?: VncEventMap[K][] } = {};
   private rafId: number | null = null;
@@ -95,6 +119,37 @@ export class VncClient {
     return this._name;
   }
 
+  getStats(): ConnectionStats {
+    const now = performance.now();
+    // Count FBU timestamps within the last 1 second
+    const cutoff = now - 1000;
+    this._fbuTimestamps = this._fbuTimestamps.filter(t => t > cutoff);
+    const fps = this._fbuTimestamps.length;
+
+    const encodings: Record<string, number> = {};
+    for (const [enc, count] of Object.entries(this._encodingCounts)) {
+      const name = ENCODING_NAMES[Number(enc)] ?? `Unknown(${enc})`;
+      encodings[name] = count;
+    }
+
+    return {
+      serverName: this._name,
+      resolution: { width: this._width, height: this._height },
+      authType: AUTH_TYPE_NAMES[this._authType] ?? `Type ${this._authType}`,
+      encodings,
+      fps,
+      totalRectangles: this._totalRectangles,
+      bytesReceived: this._bytesReceived,
+    };
+  }
+
+  private resetStats(): void {
+    this._encodingCounts = {};
+    this._totalRectangles = 0;
+    this._bytesReceived = 0;
+    this._fbuTimestamps = [];
+  }
+
   async connect(): Promise<void> {
     // Initialize decoders
     await Promise.all([
@@ -118,7 +173,9 @@ export class VncClient {
     this._width = sessionInit.width;
     this._height = sessionInit.height;
     this._name = sessionInit.name;
+    this._authType = sessionInit.authType;
     this._connected = true;
+    this.resetStats();
 
     // Initialize framebuffer
     this.framebuffer = new Framebuffer(this._width, this._height);
@@ -205,6 +262,7 @@ export class VncClient {
   }
 
   private handleMessage(type: number, view: DataView): void {
+    this._bytesReceived += view.byteLength;
     const msg = parseServerMessage(type, view);
     if (!msg) return;
 
@@ -248,8 +306,12 @@ export class VncClient {
   ): void {
     if (!this.framebuffer) return;
 
+    this._fbuTimestamps.push(performance.now());
+
     for (const rect of msg.rectangles) {
       const { header, data } = rect;
+      this._encodingCounts[header.encoding] = (this._encodingCounts[header.encoding] ?? 0) + 1;
+      this._totalRectangles++;
 
       switch (header.encoding) {
         case EncodingRaw:
@@ -388,7 +450,9 @@ export class VncClient {
     this._width = sessionInit.width;
     this._height = sessionInit.height;
     this._name = sessionInit.name;
+    this._authType = sessionInit.authType;
     this._connected = true;
+    this.resetStats();
 
     this.framebuffer = new Framebuffer(this._width, this._height);
     this.inputHandler.setFramebufferSize(this._width, this._height);
@@ -438,7 +502,8 @@ export class VncClient {
   }
 }
 
-// Re-export React component
+// Re-export React components
 export { VncViewer } from './components/VncViewer';
+export { DebugOverlay } from './components/DebugOverlay';
 export { FileUploadDropZone } from './components/FileUpload';
 export { Toolbar } from './components/Toolbar';

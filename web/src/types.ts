@@ -52,6 +52,17 @@ export interface SessionInitData {
   height: number;
   pixelFormat: PixelFormat;
   name: string;
+  authType: number;
+}
+
+export interface ConnectionStats {
+  serverName: string;
+  resolution: { width: number; height: number };
+  authType: string;
+  encodings: Record<string, number>;
+  fps: number;
+  totalRectangles: number;
+  bytesReceived: number;
 }
 
 export interface RectHeader {

@@ -119,5 +119,9 @@ function parseSessionInit(view: DataView): SessionInitData {
   const nameBytes = new Uint8Array(view.buffer, view.byteOffset + 29, nameLength);
   const name = new TextDecoder().decode(nameBytes);
 
-  return { width, height, pixelFormat: pf, name };
+  // authType is appended after name if available
+  const authTypeOffset = 29 + nameLength;
+  const authType = authTypeOffset < view.byteLength ? view.getUint8(authTypeOffset) : 0;
+
+  return { width, height, pixelFormat: pf, name, authType };
 }

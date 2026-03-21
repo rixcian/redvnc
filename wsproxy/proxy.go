@@ -32,6 +32,7 @@ type Proxy struct {
 	session   *Session
 	server    *Server
 	rfbReader *rfbReader
+	authType  uint8 // RFB security type used (1=None, 2=VNCAuth)
 }
 
 // NewProxy creates a new proxy for the given session.
@@ -156,6 +157,7 @@ func (p *Proxy) performHandshake(conn net.Conn, br *bufio.Reader) (*rfb.ServerIn
 
 	// Choose security type
 	chosenType := chooseSecurityType(secTypes, p.session.Password)
+	p.authType = chosenType
 	if err := binary.Write(bw, binary.BigEndian, chosenType); err != nil {
 		return nil, fmt.Errorf("write security choice: %w", err)
 	}
@@ -236,8 +238,8 @@ func (p *Proxy) performHandshake(conn net.Conn, br *bufio.Reader) (*rfb.ServerIn
 // sendSessionInit sends the session init extension message to the browser.
 func (p *Proxy) sendSessionInit(ctx context.Context, init *rfb.ServerInit) error {
 	nameBytes := []byte(init.Name)
-	// payload: width(2) + height(2) + pixelFormat(16) + nameLength(4) + name(n)
-	payloadLen := 2 + 2 + 16 + 4 + len(nameBytes)
+	// payload: width(2) + height(2) + pixelFormat(16) + nameLength(4) + name(n) + authType(1)
+	payloadLen := 2 + 2 + 16 + 4 + len(nameBytes) + 1
 
 	buf := make([]byte, 5+payloadLen)
 	buf[0] = ExtSessionInit
@@ -264,6 +266,8 @@ func (p *Proxy) sendSessionInit(ctx context.Context, init *rfb.ServerInit) error
 	binary.BigEndian.PutUint32(buf[off:off+4], uint32(len(nameBytes)))
 	off += 4
 	copy(buf[off:], nameBytes)
+	off += len(nameBytes)
+	buf[off] = p.authType
 
 	return p.session.WSConn.Write(ctx, websocket.MessageBinary, buf)
 }
