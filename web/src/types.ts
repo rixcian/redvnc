@@ -18,6 +18,7 @@ export const EncodingCopyRect = 1;
 export const EncodingRRE = 2;
 export const EncodingZlib = 6;
 export const EncodingTight = 7;
+export const EncodingZRLE = 16;
 export const EncodingCursor = -239;
 export const EncodingDesktopSize = -223;
 
@@ -87,6 +88,10 @@ export interface VncClientOptions {
   clipboardSync?: boolean;
   encodings?: number[];
   uploadDir?: string;
+  reconnect?: boolean;              // default: true
+  maxReconnectAttempts?: number;     // default: 10
+  reconnectBaseDelay?: number;       // default: 1000 (ms)
+  reconnectMaxDelay?: number;        // default: 30000 (ms)
 }
 
 export interface VncViewerProps {
@@ -107,6 +112,9 @@ export interface VncViewerProps {
 export type VncEventMap = {
   connect: () => void;
   disconnect: (reason: string) => void;
+  reconnecting: (attempt: number) => void;
+  reconnected: () => void;
+  reconnect_failed: () => void;
   resize: (width: number, height: number) => void;
   bell: () => void;
   clipboard: (text: string) => void;
@@ -129,6 +137,7 @@ export const RGBA_PIXEL_FORMAT: PixelFormat = {
 // Default encoding preference order
 export const DEFAULT_ENCODINGS = [
   EncodingTight,
+  EncodingZRLE,
   EncodingZlib,
   EncodingCopyRect,
   EncodingRaw,

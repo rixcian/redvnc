@@ -15,6 +15,7 @@ import { decodeRaw } from './encodings/raw';
 import { decodeCopyRect } from './encodings/copyrect';
 import { ZlibDecoder } from './encodings/zlib';
 import { TightDecoder } from './encodings/tight';
+import { ZrleDecoder } from './encodings/zrle';
 import {
   MsgFramebufferUpdate,
   MsgBell,
@@ -25,6 +26,7 @@ import {
   EncodingCopyRect,
   EncodingZlib,
   EncodingTight,
+  EncodingZRLE,
   EncodingCursor,
   EncodingDesktopSize,
   RGBA_PIXEL_FORMAT,
@@ -49,6 +51,7 @@ export class VncClient {
   private fileUploadHandler: FileUploadHandler;
   private zlibDecoder: ZlibDecoder;
   private tightDecoder: TightDecoder;
+  private zrleDecoder: ZrleDecoder;
 
   private _connected = false;
   private _width = 0;
@@ -57,6 +60,10 @@ export class VncClient {
 
   private eventHandlers: { [K in keyof VncEventMap]?: VncEventMap[K][] } = {};
   private rafId: number | null = null;
+  private intentionalDisconnect = false;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectAttempt = 0;
+  private canvas: HTMLCanvasElement | null = null;
 
   constructor(options: VncClientOptions) {
     this.options = options;
@@ -64,6 +71,7 @@ export class VncClient {
     this.renderer = new CanvasRenderer(options.scaleToFit ?? false);
     this.zlibDecoder = new ZlibDecoder();
     this.tightDecoder = new TightDecoder();
+    this.zrleDecoder = new ZrleDecoder();
 
     const sendFn = (data: ArrayBuffer | Uint8Array) => this.connection.send(data);
     this.inputHandler = new InputHandler(this.renderer, sendFn, options.viewOnly ?? false);
@@ -92,6 +100,7 @@ export class VncClient {
     await Promise.all([
       this.zlibDecoder.init(),
       this.tightDecoder.init(),
+      this.zrleDecoder.init(),
     ]);
 
     // Set up message handler
@@ -135,6 +144,8 @@ export class VncClient {
   }
 
   disconnect(): void {
+    this.intentionalDisconnect = true;
+    this.cancelReconnect();
     this.stopRenderLoop();
     this.connection.disconnect();
     this.inputHandler.detach();
@@ -144,6 +155,7 @@ export class VncClient {
   }
 
   attachCanvas(canvas: HTMLCanvasElement): void {
+    this.canvas = canvas;
     this.renderer.attach(canvas);
     this.inputHandler.attach(canvas);
     if (this.framebuffer) {
@@ -226,6 +238,7 @@ export class VncClient {
         this.stopRenderLoop();
         this.fileUploadHandler.cleanup();
         this.emit('disconnect', 'connection closed');
+        this.attemptReconnect();
         break;
     }
   }
@@ -251,6 +264,9 @@ export class VncClient {
         case EncodingTight:
           // Tight may be async (JPEG decode). Fire and forget for now.
           this.tightDecoder.decode(this.framebuffer, header, data);
+          break;
+        case EncodingZRLE:
+          this.zrleDecoder.decode(this.framebuffer, header, data);
           break;
         case EncodingCursor:
           this.handleCursor(header, data);
@@ -311,6 +327,97 @@ export class VncClient {
     this.connection.send(
       writeFramebufferUpdateRequest(false, 0, 0, this._width, this._height),
     );
+  }
+
+  private attemptReconnect(): void {
+    if (this.intentionalDisconnect) return;
+    if (this.options.reconnect === false) return;
+
+    const maxAttempts = this.options.maxReconnectAttempts ?? 10;
+    if (this.reconnectAttempt >= maxAttempts) {
+      this.emit('reconnect_failed');
+      return;
+    }
+
+    this.reconnectAttempt++;
+    const baseDelay = this.options.reconnectBaseDelay ?? 1000;
+    const maxDelay = this.options.reconnectMaxDelay ?? 30000;
+    const delay = Math.min(baseDelay * Math.pow(2, this.reconnectAttempt - 1), maxDelay);
+    // Add jitter (+-20%)
+    const jitter = delay * (0.8 + Math.random() * 0.4);
+
+    this.emit('reconnecting', this.reconnectAttempt);
+
+    this.reconnectTimer = setTimeout(async () => {
+      try {
+        // Create fresh connection
+        this.connection = new VncConnection();
+        await this.performReconnect();
+        this.reconnectAttempt = 0;
+        this.emit('reconnected');
+      } catch {
+        this.attemptReconnect();
+      }
+    }, jitter);
+  }
+
+  private async performReconnect(): Promise<void> {
+    // Re-init decoders
+    await Promise.all([
+      this.zlibDecoder.init(),
+      this.tightDecoder.init(),
+      this.zrleDecoder.init(),
+    ]);
+
+    // Re-wire send function for handlers
+    const sendFn = (data: ArrayBuffer | Uint8Array) => this.connection.send(data);
+    this.inputHandler = new InputHandler(this.renderer, sendFn, this.options.viewOnly ?? false);
+    this.clipboardHandler = new ClipboardHandler(sendFn, this.options.clipboardSync ?? true);
+    this.fileUploadHandler = new FileUploadHandler(sendFn, this.options.uploadDir ?? '');
+
+    this.connection.onMessage((type, view) => {
+      this.handleMessage(type, view);
+    });
+
+    const sessionInit = await this.connection.connect(
+      this.options.url,
+      this.options.target,
+      this.options.password,
+    );
+
+    this._width = sessionInit.width;
+    this._height = sessionInit.height;
+    this._name = sessionInit.name;
+    this._connected = true;
+
+    this.framebuffer = new Framebuffer(this._width, this._height);
+    this.inputHandler.setFramebufferSize(this._width, this._height);
+    this.renderer.updateCanvasSize(this.framebuffer);
+
+    // Re-send pixel format and encodings
+    this.connection.send(writeSetPixelFormat(RGBA_PIXEL_FORMAT));
+    const encodings = this.options.encodings ?? DEFAULT_ENCODINGS;
+    this.connection.send(writeSetEncodings(encodings));
+
+    // Request full framebuffer update
+    this.connection.send(
+      writeFramebufferUpdateRequest(false, 0, 0, this._width, this._height),
+    );
+
+    // Re-attach canvas if we had one
+    if (this.canvas) {
+      this.inputHandler.attach(this.canvas);
+    }
+
+    this.startRenderLoop();
+  }
+
+  private cancelReconnect(): void {
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.reconnectAttempt = 0;
   }
 
   private startRenderLoop(): void {

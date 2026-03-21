@@ -8,9 +8,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"sync"
+	"time"
 )
 
 // MultiEncoder encodes framebuffer pixel data into multiple RFB rectangles (e.g. tiles).
@@ -85,15 +86,23 @@ type ServerConfig struct {
 	// If nil, cursor pseudo-encoding is not used.
 	CursorProvider CursorProvider
 
+	// MaxFPS limits the maximum framebuffer update rate per client.
+	// If zero, defaults to 30.
+	MaxFPS int
+
 	// TLSConfig enables TLS encryption on the server. If non-nil, the server
 	// wraps each accepted connection in TLS before the RFB handshake.
 	TLSConfig *tls.Config
+
+	// Logger is the structured logger. If nil, slog.Default() is used.
+	Logger *slog.Logger
 }
 
 // Server is an RFB protocol server that accepts VNC client connections.
 type Server struct {
 	config   ServerConfig
 	listener net.Listener
+	logger   *slog.Logger
 
 	mu      sync.Mutex
 	clients map[*ClientConn]struct{}
@@ -111,6 +120,9 @@ func NewServer(config ServerConfig) *Server {
 	if len(config.Security) == 0 {
 		config.Security = []SecurityHandler{&noneSecurity{}}
 	}
+	if config.MaxFPS <= 0 {
+		config.MaxFPS = 30
+	}
 	if config.Capturer != nil {
 		config.Width, config.Height = config.Capturer.Bounds()
 	}
@@ -121,8 +133,14 @@ func NewServer(config ServerConfig) *Server {
 		config.Height = 768
 	}
 
+	logger := config.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	return &Server{
 		config:  config,
+		logger:  logger,
 		clients: make(map[*ClientConn]struct{}),
 		done:    make(chan struct{}),
 	}
@@ -138,7 +156,7 @@ func (s *Server) ListenAndServe(addr string) error {
 		return fmt.Errorf("listen: %w", err)
 	}
 	s.listener = ln
-	log.Printf("VNC server listening on %s", addr)
+	s.logger.Info("VNC server listening", "addr", addr)
 
 	for {
 		conn, err := ln.Accept()
@@ -147,7 +165,7 @@ func (s *Server) ListenAndServe(addr string) error {
 			case <-s.done:
 				return nil
 			default:
-				log.Printf("accept error: %v", err)
+				s.logger.Error("accept error", "error", err)
 				continue
 			}
 		}
@@ -197,8 +215,11 @@ type ClientConn struct {
 	tightEnc   MultiEncoder // lazy-initialized per-connection Tight encoder
 	zlibBuf    bytes.Buffer // persistent zlib buffer for Zlib encoding
 	zlibWriter *zlib.Writer // persistent zlib writer
+	zrleBuf    bytes.Buffer // persistent zlib buffer for ZRLE encoding
+	zrleWriter *zlib.Writer // persistent zlib writer for ZRLE
 
-	lastCursor *CursorImage // last cursor sent to this client
+	lastCursor    *CursorImage // last cursor sent to this client
+	lastFrameTime time.Time   // last framebuffer update time for FPS limiting
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
@@ -223,13 +244,13 @@ func (s *Server) handleConnection(conn net.Conn) {
 		}
 		s.removeClient(c)
 		conn.Close()
-		log.Printf("client disconnected: %s", conn.RemoteAddr())
+		s.logger.Info("client disconnected", "remote_addr", conn.RemoteAddr())
 	}()
 
-	log.Printf("client connected: %s", conn.RemoteAddr())
+	s.logger.Info("client connected", "remote_addr", conn.RemoteAddr())
 
 	if err := c.handshake(); err != nil {
-		log.Printf("handshake failed for %s: %v", conn.RemoteAddr(), err)
+		s.logger.Warn("handshake failed", "remote_addr", conn.RemoteAddr(), "error", err)
 		return
 	}
 
@@ -239,7 +260,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	go c.framebufferWriter()
 
 	if err := c.serveMessages(); err != nil {
-		log.Printf("client %s error: %v", conn.RemoteAddr(), err)
+		s.logger.Warn("client error", "remote_addr", conn.RemoteAddr(), "error", err)
 	}
 }
 
@@ -257,7 +278,7 @@ func (c *ClientConn) handshake() error {
 	if _, err := io.ReadFull(c.br, clientVersion); err != nil {
 		return fmt.Errorf("read client version: %w", err)
 	}
-	log.Printf("client version: %s", string(clientVersion[:11]))
+	c.server.logger.Debug("client version", "version", string(clientVersion[:11]))
 
 	// Send security types
 	secTypes := c.server.config.Security
@@ -352,7 +373,7 @@ func (c *ClientConn) serveMessages() error {
 			c.mu.Lock()
 			c.encodings = encs
 			c.mu.Unlock()
-			log.Printf("client encodings: %v", encs)
+			c.server.logger.Debug("client encodings", "encodings", encs)
 
 		case MsgFramebufferUpdateRequest:
 			req, err := ReadFramebufferUpdateRequest(c.br)
@@ -371,7 +392,7 @@ func (c *ClientConn) serveMessages() error {
 			if err != nil {
 				return err
 			}
-			log.Printf("[input] key %s keysym=0x%04X", boolToAction(evt.DownFlag != 0), evt.Key)
+			c.server.logger.Debug("key event", "action", boolToAction(evt.DownFlag != 0), "keysym", fmt.Sprintf("0x%04X", evt.Key))
 			if c.server.config.Input != nil {
 				c.server.config.Input.KeyEvent(evt.DownFlag != 0, evt.Key)
 			}
@@ -381,7 +402,7 @@ func (c *ClientConn) serveMessages() error {
 			if err != nil {
 				return err
 			}
-			log.Printf("[input] pointer x=%d y=%d buttons=0b%08b", evt.X, evt.Y, evt.ButtonMask)
+			c.server.logger.Debug("pointer event", "x", evt.X, "y", evt.Y, "buttons", fmt.Sprintf("0b%08b", evt.ButtonMask))
 			if c.server.config.Input != nil {
 				c.server.config.Input.PointerEvent(evt.ButtonMask, evt.X, evt.Y)
 			}
@@ -403,11 +424,22 @@ func (c *ClientConn) serveMessages() error {
 // update requests. This prevents slow screen captures from blocking the
 // message reading loop where input events are processed.
 func (c *ClientConn) framebufferWriter() {
+	minInterval := time.Second / time.Duration(c.server.config.MaxFPS)
+
 	for req := range c.fbReqCh {
+		// Enforce MaxFPS: sleep if the last frame was sent too recently
+		if !c.lastFrameTime.IsZero() {
+			elapsed := time.Since(c.lastFrameTime)
+			if elapsed < minInterval {
+				time.Sleep(minInterval - elapsed)
+			}
+		}
+
 		if err := c.handleFramebufferRequest(req); err != nil {
 			c.errCh <- err
 			return
 		}
+		c.lastFrameTime = time.Now()
 	}
 }
 
@@ -419,9 +451,9 @@ func boolToAction(down bool) string {
 }
 
 // bestEncoding returns the best encoding supported by the client, in preference
-// order: Tight > Zlib > Raw. Must be called with c.mu held.
+// order: Tight > ZRLE > Zlib > Raw. Must be called with c.mu held.
 func (c *ClientConn) bestEncoding() int32 {
-	preference := []int32{EncodingTight, EncodingZlib, EncodingRaw}
+	preference := []int32{EncodingTight, EncodingZRLE, EncodingZlib, EncodingRaw}
 	for _, pref := range preference {
 		if pref == EncodingTight && c.server.config.NewTightEncoder == nil {
 			continue
@@ -498,7 +530,7 @@ func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) err
 			c.server.config.Width = capW
 			c.server.config.Height = capH
 			pseudoRects = append(pseudoRects, EncodeDesktopSizeRect(capW, capH))
-			log.Printf("sending desktop resize: %dx%d", capW, capH)
+			c.server.logger.Info("sending desktop resize", "width", capW, "height", capH)
 		}
 	}
 
@@ -508,12 +540,12 @@ func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) err
 		if cursor != nil && cursor != c.lastCursor {
 			pseudoRects = append(pseudoRects, EncodeCursorRect(cursor, c.pixelFormat, c.server.config.PixelFormat))
 			c.lastCursor = cursor
-			log.Printf("sending cursor update: %dx%d hotspot=(%d,%d)", cursor.Width, cursor.Height, cursor.HotspotX, cursor.HotspotY)
+			c.server.logger.Debug("sending cursor update", "width", cursor.Width, "height", cursor.Height, "hotspot_x", cursor.HotspotX, "hotspot_y", cursor.HotspotY)
 		}
 	}
 
 	bestEnc := c.bestEncoding()
-	log.Printf("best encoding: %d (encodings=%v, tightFactory=%v)", bestEnc, c.encodings, c.server.config.NewTightEncoder != nil)
+	c.server.logger.Debug("best encoding", "encoding", bestEnc, "encodings", c.encodings, "tight_available", c.server.config.NewTightEncoder != nil)
 
 	switch bestEnc {
 	case EncodingTight:
@@ -526,6 +558,79 @@ func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) err
 		}
 		rects = append(pseudoRects, rects...)
 		if err := WriteFramebufferUpdate(c.bw, rects); err != nil {
+			return err
+		}
+		return c.bw.Flush()
+
+	case EncodingZRLE:
+		// ZRLE uses CPIXEL (3-byte BGR), so we pass raw BGRA pixels and the
+		// encoder handles the conversion internally.
+		c.zrleBuf.Reset()
+		if c.zrleWriter == nil {
+			c.zrleWriter = zlib.NewWriter(&c.zrleBuf)
+		}
+
+		bpp := 4
+		tileSize := 64
+		for tileY := int(req.Y); tileY < int(req.Y)+h; tileY += tileSize {
+			tileH := min(tileSize, int(req.Y)+h-tileY)
+			for tileX := int(req.X); tileX < int(req.X)+w; tileX += tileSize {
+				tileW := min(tileSize, int(req.X)+w-tileX)
+
+				// Extract tile pixels as CPIXEL (3 bytes)
+				tilePixels := make([]byte, tileW*tileH*3)
+				for row := 0; row < tileH; row++ {
+					srcY := tileY + row
+					for col := 0; col < tileW; col++ {
+						srcX := tileX + col
+						srcOff := srcY*stride + srcX*bpp
+						dstOff := (row*tileW + col) * 3
+						tilePixels[dstOff] = pixels[srcOff]     // B
+						tilePixels[dstOff+1] = pixels[srcOff+1] // G
+						tilePixels[dstOff+2] = pixels[srcOff+2] // R
+					}
+				}
+
+				// Check if solid tile
+				solid := true
+				for i := 3; i < len(tilePixels); i += 3 {
+					if tilePixels[i] != tilePixels[0] || tilePixels[i+1] != tilePixels[1] || tilePixels[i+2] != tilePixels[2] {
+						solid = false
+						break
+					}
+				}
+
+				if solid {
+					c.zrleWriter.Write([]byte{1}) // solid subtype
+					c.zrleWriter.Write(tilePixels[0:3])
+				} else {
+					c.zrleWriter.Write([]byte{0}) // raw subtype
+					c.zrleWriter.Write(tilePixels)
+				}
+			}
+		}
+
+		if err := c.zrleWriter.Flush(); err != nil {
+			return fmt.Errorf("zrle flush: %w", err)
+		}
+
+		compressedLen := c.zrleBuf.Len()
+		data := make([]byte, 4+compressedLen)
+		binary.BigEndian.PutUint32(data[0:4], uint32(compressedLen))
+		copy(data[4:], c.zrleBuf.Bytes())
+
+		rect := Rectangle{
+			Header: RectHeader{
+				X:        req.X,
+				Y:        req.Y,
+				Width:    req.Width,
+				Height:   req.Height,
+				Encoding: EncodingZRLE,
+			},
+			Data: data,
+		}
+		allRects := append(pseudoRects, rect)
+		if err := WriteFramebufferUpdate(c.bw, allRects); err != nil {
 			return err
 		}
 		return c.bw.Flush()
@@ -609,15 +714,15 @@ func (s *Server) NotifyDesktopResize(width, height uint16) {
 			rect := EncodeDesktopSizeRect(width, height)
 			if err := WriteFramebufferUpdate(c.bw, []Rectangle{rect}); err != nil {
 				c.mu.Unlock()
-				log.Printf("desktop resize notify error for %s: %v", c.conn.RemoteAddr(), err)
+				s.logger.Warn("desktop resize notify error", "remote_addr", c.conn.RemoteAddr(), "error", err)
 				continue
 			}
 			if err := c.bw.Flush(); err != nil {
 				c.mu.Unlock()
-				log.Printf("desktop resize flush error for %s: %v", c.conn.RemoteAddr(), err)
+				s.logger.Warn("desktop resize flush error", "remote_addr", c.conn.RemoteAddr(), "error", err)
 				continue
 			}
-			log.Printf("notified %s of desktop resize: %dx%d", c.conn.RemoteAddr(), width, height)
+			s.logger.Info("notified desktop resize", "remote_addr", c.conn.RemoteAddr(), "width", width, "height", height)
 		}
 		c.mu.Unlock()
 	}
@@ -639,12 +744,12 @@ func (s *Server) SendCursorUpdate(cursor *CursorImage) {
 			rect := EncodeCursorRect(cursor, c.pixelFormat, s.config.PixelFormat)
 			if err := WriteFramebufferUpdate(c.bw, []Rectangle{rect}); err != nil {
 				c.mu.Unlock()
-				log.Printf("cursor update error for %s: %v", c.conn.RemoteAddr(), err)
+				s.logger.Warn("cursor update error", "remote_addr", c.conn.RemoteAddr(), "error", err)
 				continue
 			}
 			if err := c.bw.Flush(); err != nil {
 				c.mu.Unlock()
-				log.Printf("cursor flush error for %s: %v", c.conn.RemoteAddr(), err)
+				s.logger.Warn("cursor flush error", "remote_addr", c.conn.RemoteAddr(), "error", err)
 				continue
 			}
 			c.lastCursor = cursor

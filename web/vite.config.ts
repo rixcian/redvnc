@@ -4,6 +4,9 @@ import dts from 'vite-plugin-dts';
 import { resolve } from 'path';
 
 export default defineConfig({
+  test: {
+    setupFiles: ['./vitest.setup.ts'],
+  },
   plugins: [
     react(),
     dts({ rollupTypes: true }),

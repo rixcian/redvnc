@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,7 +19,7 @@ const maxConcurrentUploads = 4
 func (p *Proxy) handleUploadBegin(ctx context.Context, data []byte) {
 	// Minimum: type(1) + length(4) + uploadId(4) + fileSize(8) + dirLength(2) = 19 bytes
 	if len(data) < 19 {
-		log.Printf("session %s: upload begin too short", p.session.ID)
+		p.server.logger.Warn("upload begin too short", "session_id", p.session.ID)
 		return
 	}
 
@@ -108,7 +107,7 @@ func (p *Proxy) handleUploadBegin(ctx context.Context, data []byte) {
 	}
 	p.session.AddUpload(upload)
 
-	log.Printf("session %s: upload %d started: %s (%d bytes)", p.session.ID, uploadID, filePath, fileSize)
+	p.server.logger.Info("upload started", "session_id", p.session.ID, "upload_id", uploadID, "path", filePath, "size", fileSize)
 
 	// Send success status
 	p.sendUploadStatus(ctx, uploadID, 0, 0, fmt.Sprintf("upload started: %s", upload.FileName))
@@ -118,7 +117,7 @@ func (p *Proxy) handleUploadBegin(ctx context.Context, data []byte) {
 func (p *Proxy) handleUploadChunk(ctx context.Context, data []byte) {
 	// Minimum: type(1) + length(4) + uploadId(4) + offset(8) = 17 bytes
 	if len(data) < 17 {
-		log.Printf("session %s: upload chunk too short", p.session.ID)
+		p.server.logger.Warn("upload chunk too short", "session_id", p.session.ID)
 		return
 	}
 
@@ -161,7 +160,7 @@ func (p *Proxy) handleUploadChunk(ctx context.Context, data []byte) {
 func (p *Proxy) handleUploadEnd(ctx context.Context, data []byte) {
 	// type(1) + length(4) + uploadId(4) + checksum(4) = 13 bytes
 	if len(data) < 13 {
-		log.Printf("session %s: upload end too short", p.session.ID)
+		p.server.logger.Warn("upload end too short", "session_id", p.session.ID)
 		return
 	}
 
@@ -197,7 +196,7 @@ func (p *Proxy) handleUploadEnd(ctx context.Context, data []byte) {
 		return
 	}
 
-	log.Printf("session %s: upload %d completed: %s", p.session.ID, uploadID, upload.FilePath)
+	p.server.logger.Info("upload completed", "session_id", p.session.ID, "upload_id", uploadID, "path", upload.FilePath)
 	p.sendUploadStatus(ctx, uploadID, 0, upload.BytesWritten, "upload complete")
 }
 
@@ -205,7 +204,7 @@ func (p *Proxy) handleUploadEnd(ctx context.Context, data []byte) {
 func (p *Proxy) handleUploadCancel(ctx context.Context, data []byte) {
 	// type(1) + length(4) + uploadId(4) = 9 bytes
 	if len(data) < 9 {
-		log.Printf("session %s: upload cancel too short", p.session.ID)
+		p.server.logger.Warn("upload cancel too short", "session_id", p.session.ID)
 		return
 	}
 
@@ -219,7 +218,7 @@ func (p *Proxy) handleUploadCancel(ctx context.Context, data []byte) {
 	upload.Closer.Close()
 	os.Remove(upload.FilePath)
 
-	log.Printf("session %s: upload %d cancelled", p.session.ID, uploadID)
+	p.server.logger.Info("upload cancelled", "session_id", p.session.ID, "upload_id", uploadID)
 	p.sendUploadError(ctx, uploadID, upload.BytesWritten, "cancelled")
 }
 
@@ -239,7 +238,7 @@ func (p *Proxy) sendUploadStatus(ctx context.Context, uploadID uint32, status ui
 	copy(buf[20:], msgBytes)
 
 	if err := p.session.WSConn.Write(ctx, websocket.MessageBinary, buf); err != nil {
-		log.Printf("session %s: failed to send upload status: %v", p.session.ID, err)
+		p.server.logger.Warn("failed to send upload status", "session_id", p.session.ID, "error", err)
 	}
 }
 

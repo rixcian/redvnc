@@ -18,8 +18,9 @@ export const VncViewer: React.FC<VncViewerProps> = ({
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const clientRef = useRef<VncClient | null>(null);
-  const [status, setStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
+  const [status, setStatus] = useState<'disconnected' | 'connecting' | 'connected' | 'reconnecting'>('disconnected');
   const [error, setError] = useState<string | null>(null);
+  const [reconnectAttempt, setReconnectAttempt] = useState(0);
 
   const connect = useCallback(async () => {
     // Clean up any existing client
@@ -49,6 +50,22 @@ export const VncViewer: React.FC<VncViewerProps> = ({
     client.on('disconnect', (reason) => {
       setStatus('disconnected');
       onDisconnect?.(reason);
+    });
+
+    client.on('reconnecting', (attempt) => {
+      setStatus('reconnecting');
+      setReconnectAttempt(attempt);
+    });
+
+    client.on('reconnected', () => {
+      setStatus('connected');
+      setReconnectAttempt(0);
+      setError(null);
+    });
+
+    client.on('reconnect_failed', () => {
+      setStatus('disconnected');
+      setError('Failed to reconnect after multiple attempts');
     });
 
     if (onBell) {
@@ -96,6 +113,22 @@ export const VncViewer: React.FC<VncViewerProps> = ({
           zIndex: 10,
         }}>
           {error}
+        </div>
+      )}
+      {status === 'reconnecting' && (
+        <div style={{
+          position: 'absolute',
+          top: '50%',
+          left: '50%',
+          transform: 'translate(-50%, -50%)',
+          color: '#ffaa00',
+          background: 'rgba(0,0,0,0.8)',
+          padding: '16px 24px',
+          borderRadius: '8px',
+          zIndex: 10,
+          textAlign: 'center',
+        }}>
+          Reconnecting... (attempt {reconnectAttempt})
         </div>
       )}
       {status === 'connecting' && (
