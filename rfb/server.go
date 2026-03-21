@@ -215,8 +215,7 @@ type ClientConn struct {
 	tightEnc   MultiEncoder // lazy-initialized per-connection Tight encoder
 	zlibBuf    bytes.Buffer // persistent zlib buffer for Zlib encoding
 	zlibWriter *zlib.Writer // persistent zlib writer
-	zrleBuf    bytes.Buffer // persistent zlib buffer for ZRLE encoding
-	zrleWriter *zlib.Writer // persistent zlib writer for ZRLE
+	zrleBuf    bytes.Buffer // buffer for one ZRLE rectangle's zlib stream
 
 	lastCursor    *CursorImage // last cursor sent to this client
 	lastFrameTime time.Time   // last framebuffer update time for FPS limiting
@@ -451,9 +450,11 @@ func boolToAction(down bool) string {
 }
 
 // bestEncoding returns the best encoding supported by the client, in preference
-// order: Tight > ZRLE > Zlib > Raw. Must be called with c.mu held.
+// order: Tight > Zlib > ZRLE > Raw. Zlib is preferred over ZRLE for compatibility
+// with clients that advertise both but only decode ZRLE correctly when it matches
+// their exact pixel layout (ZRLE CPIXEL must follow the client's SetPixelFormat).
 func (c *ClientConn) bestEncoding() int32 {
-	preference := []int32{EncodingTight, EncodingZRLE, EncodingZlib, EncodingRaw}
+	preference := []int32{EncodingTight, EncodingZlib, EncodingZRLE, EncodingRaw}
 	for _, pref := range preference {
 		if pref == EncodingTight && c.server.config.NewTightEncoder == nil {
 			continue
@@ -565,10 +566,9 @@ func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) err
 	case EncodingZRLE:
 		// ZRLE uses CPIXEL (3-byte BGR), so we pass raw BGRA pixels and the
 		// encoder handles the conversion internally.
+		// Each framebuffer update must be one complete zlib stream (new writer + Close).
 		c.zrleBuf.Reset()
-		if c.zrleWriter == nil {
-			c.zrleWriter = zlib.NewWriter(&c.zrleBuf)
-		}
+		zw := zlib.NewWriter(&c.zrleBuf)
 
 		bpp := 4
 		tileSize := 64
@@ -601,17 +601,17 @@ func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) err
 				}
 
 				if solid {
-					c.zrleWriter.Write([]byte{1}) // solid subtype
-					c.zrleWriter.Write(tilePixels[0:3])
+					zw.Write([]byte{1}) // solid subtype
+					zw.Write(tilePixels[0:3])
 				} else {
-					c.zrleWriter.Write([]byte{0}) // raw subtype
-					c.zrleWriter.Write(tilePixels)
+					zw.Write([]byte{0}) // raw subtype
+					zw.Write(tilePixels)
 				}
 			}
 		}
 
-		if err := c.zrleWriter.Flush(); err != nil {
-			return fmt.Errorf("zrle flush: %w", err)
+		if err := zw.Close(); err != nil {
+			return fmt.Errorf("zrle zlib close: %w", err)
 		}
 
 		compressedLen := c.zrleBuf.Len()

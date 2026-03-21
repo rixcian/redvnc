@@ -343,6 +343,18 @@ Set up Vitest (`npm install -D vitest`) and create tests for:
 
 ZRLE (Zlib Run-Length Encoding, type 16) is the most bandwidth-efficient standard VNC encoding.
 
+**Encoding preference (server) — target state**
+
+We want **`bestEncoding` to prefer ZRLE over Zlib** (e.g. `Tight > ZRLE > Zlib > Raw`) for bandwidth on clients that advertise both. That order is **not enabled until ZRLE is fixed** for real-world interoperability.
+
+Before raising ZRLE above Zlib, the server must:
+
+- **Respect the client pixel format** — ZRLE **CPIXEL** bytes must follow the client’s current format (after `SetPixelFormat`), the same way Raw/Zlib use `ConvertPixels`. Encoding only the server’s native BGRA layout breaks clients that negotiate a different format (e.g. RVNC Viewer on iOS).
+- **Match the full ZRLE spec in production** — either route framebuffer updates through `rfb/encodings/zrle.go` (packed palette, RLE, etc.) or bring the inlined path in `rfb/server.go` to parity; the minimal solid/raw tile path is not enough for all decoders.
+- **One complete zlib stream per ZRLE rectangle** — `zlib.NewWriter` → write tiles → `Close()` for each update; do not reuse a single writer across framebuffer updates.
+
+After the above, restore preference order to **ZRLE before Zlib** and regression-test with third-party clients (mobile VNC viewers, TigerVNC, RealVNC, etc.).
+
 **Server-side (Go):**
 - Divide the framebuffer update rectangle into 64×64 pixel tiles.
 - For each tile, analyze the pixel data and choose the most efficient sub-encoding:
@@ -351,7 +363,7 @@ ZRLE (Zlib Run-Length Encoding, type 16) is the most bandwidth-efficient standar
   - Packed palette (subtypes 2–16): tiles with ≤16 distinct colors — encode as palette + packed indices.
   - RLE (subtype 128): run-length encode pixel values.
   - Palette RLE (subtypes 130–255): combine palette with RLE for tiles with few colors and runs.
-- Compress the tile data stream with zlib (reuse the zlib writer across frames for dictionary sharing).
+- Compress the tile data stream with zlib — **one writer + `Close()` per framebuffer rectangle** (each ZRLE blob is a standalone zlib stream; dictionary reuse across rectangles is not part of the RFB ZRLE framing).
 - Prefix with a 4-byte length (compressed size).
 
 **Client-side (TypeScript):**
@@ -380,7 +392,7 @@ ZRLE (Zlib Run-Length Encoding, type 16) is the most bandwidth-efficient standar
   - If the capturer produces frames faster than `MaxFPS`, drop intermediate frames.
   - On low bandwidth, dynamically reduce to 10–15 FPS.
 - **Encoding negotiation hints:**
-  - If the client supports both Tight and ZRLE, prefer ZRLE for static content and Tight (JPEG) for rapidly changing regions.
+  - If the client supports both Tight and ZRLE, prefer ZRLE for static content and Tight (JPEG) for rapidly changing regions. (Depends on ZRLE correctness and **ZRLE-before-Zlib** preference as described in §3.1.)
 
 ---
 
