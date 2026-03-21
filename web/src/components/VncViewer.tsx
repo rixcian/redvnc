@@ -1,6 +1,7 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
 import { VncClient } from '../index';
 import type { VncViewerProps } from '../types';
+import { DebugOverlay } from './DebugOverlay';
 
 export const VncViewer: React.FC<VncViewerProps> = ({
   url,
@@ -21,6 +22,7 @@ export const VncViewer: React.FC<VncViewerProps> = ({
   const [status, setStatus] = useState<'disconnected' | 'connecting' | 'connected' | 'reconnecting'>('disconnected');
   const [error, setError] = useState<string | null>(null);
   const [reconnectAttempt, setReconnectAttempt] = useState(0);
+  const [showDebug, setShowDebug] = useState(false);
 
   const connect = useCallback(async () => {
     // Clean up any existing client
@@ -146,6 +148,34 @@ export const VncViewer: React.FC<VncViewerProps> = ({
           Connecting...
         </div>
       )}
+      {status === 'connected' && (
+        <button
+          onClick={() => setShowDebug(v => !v)}
+          title="Toggle debug info"
+          style={{
+            position: 'absolute',
+            top: 8,
+            right: 8,
+            zIndex: 20,
+            width: 28,
+            height: 28,
+            borderRadius: 4,
+            border: '1px solid rgba(255,255,255,0.2)',
+            background: showDebug ? 'rgba(0,120,255,0.6)' : 'rgba(0,0,0,0.5)',
+            color: '#fff',
+            cursor: 'pointer',
+            fontSize: 14,
+            fontFamily: 'monospace',
+            fontWeight: 'bold',
+            lineHeight: '26px',
+            padding: 0,
+            backdropFilter: 'blur(4px)',
+          }}
+        >
+          i
+        </button>
+      )}
+      <DebugOverlay client={clientRef.current} visible={showDebug && status === 'connected'} />
       <canvas
         ref={canvasRef}
         style={{
