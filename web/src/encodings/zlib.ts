@@ -6,17 +6,15 @@ import type { RectHeader } from '../types';
  * across multiple rectangles within a connection.
  */
 export class ZlibDecoder {
-  private inflateBuffer: Uint8Array[] = [];
-  private pako: typeof import('pako') | null = null;
   private inflate: import('pako').Inflate | null = null;
 
   async init(): Promise<void> {
-    this.pako = await import('pako');
-    this.inflate = new this.pako.Inflate();
+    const pako = await import('pako');
+    this.inflate = new pako.Inflate();
   }
 
   decode(fb: Framebuffer, header: RectHeader, data: DataView): void {
-    if (!this.inflate || !this.pako) {
+    if (!this.inflate) {
       throw new Error('ZlibDecoder not initialized. Call init() first.');
     }
 
@@ -24,10 +22,31 @@ export class ZlibDecoder {
     const compressedLen = data.getUint32(0);
     const compressed = new Uint8Array(data.buffer, data.byteOffset + 4, compressedLen);
 
-    // Use pako.inflate for individual chunks since persistent stream
-    // handling with pako.Inflate is complex. For simplicity, decompress
-    // each rectangle independently.
-    const decompressed = this.pako.inflate(compressed);
+    const chunks: Uint8Array[] = [];
+    const origOnData = this.inflate.onData;
+    this.inflate.onData = (chunk: Uint8Array) => { chunks.push(chunk.slice()); };
+
+    this.inflate.push(compressed, 2 /* Z_SYNC_FLUSH */);
+
+    this.inflate.onData = origOnData;
+
+    if (this.inflate.err) {
+      throw new Error(`Zlib inflate error: ${this.inflate.msg}`);
+    }
+
+    let decompressed: Uint8Array;
+    if (chunks.length === 1) {
+      decompressed = chunks[0];
+    } else {
+      const total = chunks.reduce((s, c) => s + c.length, 0);
+      decompressed = new Uint8Array(total);
+      let off = 0;
+      for (const c of chunks) {
+        decompressed.set(c, off);
+        off += c.length;
+      }
+    }
+
     fb.writeRect(x, y, width, height, decompressed);
   }
 }
