@@ -5,7 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/rixcian/redvnc/rfb"
 	"nhooyr.io/websocket"
 )
 
@@ -76,6 +77,17 @@ type Config struct {
 
 	// AllowedOrigins restricts WebSocket connections by Origin header.
 	AllowedOrigins []string
+
+	// RateLimit configures authentication rate limiting.
+	// If zero value, DefaultRateLimitConfig() is used.
+	RateLimit RateLimitConfig
+
+	// ShutdownTimeout is the maximum time to wait for sessions to drain during shutdown.
+	// Default: 30s.
+	ShutdownTimeout time.Duration
+
+	// Logger is the structured logger. If nil, slog.Default() is used.
+	Logger *slog.Logger
 }
 
 // Server is the WebSocket VNC proxy server.
@@ -87,7 +99,11 @@ type Server struct {
 	allowedTargets map[string]bool
 	allowedOrigins map[string]bool
 	allowedUpDirs  []string
+	rateLimiter    *RateLimiter
+	logger         *slog.Logger
 
+	draining     bool
+	drainingMu   sync.RWMutex
 	shutdownOnce sync.Once
 }
 
@@ -105,6 +121,9 @@ func NewServer(config Config) *Server {
 	if config.DefaultUploadDir == "" {
 		config.DefaultUploadDir = defaultDownloadsDir()
 	}
+	if config.ShutdownTimeout <= 0 {
+		config.ShutdownTimeout = 30 * time.Second
+	}
 
 	// Build allowed targets map
 	allowedTargets := make(map[string]bool)
@@ -118,6 +137,11 @@ func NewServer(config Config) *Server {
 		allowedOrigins[o] = true
 	}
 
+	// Initialize rate limit config
+	if config.RateLimit.MaxAttempts == 0 {
+		config.RateLimit = DefaultRateLimitConfig()
+	}
+
 	// Resolve allowed upload directories
 	allowedUpDirs := make([]string, 0, len(config.AllowedUploadDirs))
 	for _, d := range config.AllowedUploadDirs {
@@ -128,16 +152,25 @@ func NewServer(config Config) *Server {
 		allowedUpDirs = append(allowedUpDirs, abs)
 	}
 
+	logger := config.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	s := &Server{
 		config:         config,
 		connMgr:        NewConnectionManager(config.MaxConnections, config.MaxConnectionsPerTarget),
 		allowedTargets: allowedTargets,
 		allowedOrigins: allowedOrigins,
 		allowedUpDirs:  allowedUpDirs,
+		rateLimiter:    NewRateLimiter(config.RateLimit),
+		logger:         logger,
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", s.handleWebSocket)
+	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/ready", s.handleReady)
 
 	s.httpSrv = &http.Server{
 		Addr:    config.ListenAddr,
@@ -154,7 +187,7 @@ func (s *Server) ListenAndServe() error {
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-sigCh
-		log.Println("shutting down...")
+		s.logger.Info("shutting down")
 		s.Shutdown()
 	}()
 
@@ -162,7 +195,7 @@ func (s *Server) ListenAndServe() error {
 		return err
 	}
 
-	log.Printf("wsproxy listening on %s", s.config.ListenAddr)
+	s.logger.Info("wsproxy listening", "addr", s.config.ListenAddr)
 
 	if s.config.TLSCertFile != "" && s.config.TLSKeyFile != "" {
 		s.httpSrv.TLSConfig = &tls.Config{
@@ -176,20 +209,106 @@ func (s *Server) ListenAndServe() error {
 // Shutdown gracefully shuts down the server, draining active sessions.
 func (s *Server) Shutdown() {
 	s.shutdownOnce.Do(func() {
-		// Close all active sessions
+		s.logger.Info("shutdown: setting server to draining state")
+
+		// 1. Mark as draining — health returns 503, new WS connections rejected
+		s.drainingMu.Lock()
+		s.draining = true
+		s.drainingMu.Unlock()
+
+		// 2. Stop the rate limiter background goroutine
+		s.rateLimiter.Stop()
+
+		// 3. Send close frame to all active WebSocket sessions
 		sessions := s.connMgr.All()
+		s.logger.Info("shutdown: closing active sessions", "count", len(sessions))
 		for _, sess := range sessions {
 			sess.WSConn.Close(websocket.StatusGoingAway, "server shutting down")
 		}
 
-		// Give sessions up to 10 seconds to drain
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		// 4. Wait for sessions to drain within the shutdown timeout
+		s.logger.Info("shutdown: waiting for sessions to drain", "timeout", s.config.ShutdownTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), s.config.ShutdownTimeout)
 		defer cancel()
-		s.httpSrv.Shutdown(ctx)
+
+		// 5. Shut down the HTTP server (force-closes remaining connections after timeout)
+		if err := s.httpSrv.Shutdown(ctx); err != nil {
+			s.logger.Warn("shutdown: HTTP server shutdown error", "error", err)
+		}
+
+		s.logger.Info("shutdown: complete")
 	})
 }
 
+// isDraining returns true if the server is shutting down.
+func (s *Server) isDraining() bool {
+	s.drainingMu.RLock()
+	defer s.drainingMu.RUnlock()
+	return s.draining
+}
+
+// handleHealth returns HTTP 200 if the server is running.
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": rfb.Version})
+}
+
+// handleReady returns HTTP 200 if the server is accepting connections, 503 if draining or at capacity.
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if s.isDraining() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":          "not ready",
+			"reason":          "shutting down",
+			"active_sessions": s.connMgr.Count(),
+		})
+		return
+	}
+
+	if s.connMgr.Count() >= s.config.MaxConnections {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":          "not ready",
+			"reason":          "at capacity",
+			"active_sessions": s.connMgr.Count(),
+		})
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":          "ready",
+		"active_sessions": s.connMgr.Count(),
+	})
+}
+
+// extractIP extracts the IP address from a remote address string (host:port).
+func extractIP(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
+	}
+	return host
+}
+
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	// Reject new connections if draining
+	if s.isDraining() {
+		http.Error(w, `{"error": "server is shutting down"}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	// Check rate limiter
+	clientIP := extractIP(r.RemoteAddr)
+	if !s.rateLimiter.IsAllowed(clientIP) {
+		w.Header().Set("Retry-After", "30")
+		http.Error(w, `{"error": "too many failed attempts, try again later"}`, http.StatusTooManyRequests)
+		return
+	}
+
 	// Validate origin
 	if len(s.allowedOrigins) > 0 {
 		origin := r.Header.Get("Origin")
@@ -233,7 +352,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		OriginPatterns: s.originPatterns(),
 	})
 	if err != nil {
-		log.Printf("websocket accept error: %v", err)
+		s.logger.Error("websocket accept error", "error", err)
 		return
 	}
 
@@ -246,7 +365,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("session %s: client %s connecting to %s", sess.ID, sess.ClientAddr, sess.Target)
+	s.logger.Info("session started", "session_id", sess.ID, "remote_addr", sess.ClientAddr, "target", sess.Target, "user_agent", r.UserAgent())
 
 	// Run the proxy relay (blocks until session ends)
 	proxy := NewProxy(sess, s)
@@ -255,7 +374,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Cleanup
 	sess.CleanupUploads()
 	s.connMgr.Remove(sess)
-	log.Printf("session %s: ended", sess.ID)
+	s.logger.Info("session ended", "session_id", sess.ID)
 }
 
 func (s *Server) originPatterns() []string {

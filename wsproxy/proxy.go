@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
 	"time"
@@ -47,7 +46,7 @@ func (p *Proxy) Run(ctx context.Context) {
 	// Connect to VNC server
 	tcpConn, err := net.DialTimeout("tcp", p.session.Target, 10*time.Second)
 	if err != nil {
-		log.Printf("session %s: failed to connect to VNC server %s: %v", p.session.ID, p.session.Target, err)
+		p.server.logger.Error("failed to connect to VNC server", "session_id", p.session.ID, "target", p.session.Target, "error", err)
 		p.session.WSConn.Close(websocket.StatusInternalError, "failed to connect to VNC server")
 		return
 	}
@@ -57,17 +56,23 @@ func (p *Proxy) Run(ctx context.Context) {
 	// Perform RFB handshake with VNC server
 	serverInit, err := p.performHandshake(tcpConn)
 	if err != nil {
-		log.Printf("session %s: handshake failed: %v", p.session.ID, err)
+		p.server.logger.Warn("handshake failed", "session_id", p.session.ID, "error", err)
+		// Record auth failure for rate limiting
+		clientIP := extractIP(p.session.ClientAddr)
+		p.server.rateLimiter.RecordFailure(clientIP)
 		p.session.WSConn.Close(websocket.StatusInternalError, "VNC handshake failed")
 		return
 	}
 
-	log.Printf("session %s: handshake complete, %dx%d \"%s\"",
-		p.session.ID, serverInit.Width, serverInit.Height, serverInit.Name)
+	// Handshake succeeded — clear any rate limit failures
+	clientIP := extractIP(p.session.ClientAddr)
+	p.server.rateLimiter.ClearFailures(clientIP)
+
+	p.server.logger.Info("handshake complete", "session_id", p.session.ID, "width", serverInit.Width, "height", serverInit.Height, "name", serverInit.Name)
 
 	// Send SessionInit extension message to browser
 	if err := p.sendSessionInit(ctx, serverInit); err != nil {
-		log.Printf("session %s: failed to send session init: %v", p.session.ID, err)
+		p.server.logger.Error("failed to send session init", "session_id", p.session.ID, "error", err)
 		p.session.WSConn.Close(websocket.StatusInternalError, "failed to send session init")
 		return
 	}
@@ -261,7 +266,7 @@ func (p *Proxy) relayVNCToBrowser(ctx context.Context) {
 		n, err := p.session.TCPConn.Read(buf)
 		if err != nil {
 			if ctx.Err() == nil {
-				log.Printf("session %s: VNC read error: %v", p.session.ID, err)
+				p.server.logger.Warn("VNC read error", "session_id", p.session.ID, "error", err)
 			}
 			return
 		}
@@ -270,10 +275,11 @@ func (p *Proxy) relayVNCToBrowser(ctx context.Context) {
 		}
 
 		p.session.TouchActivity()
+		p.session.BytesToClient.Add(int64(n))
 
 		if err := p.session.WSConn.Write(ctx, websocket.MessageBinary, buf[:n]); err != nil {
 			if ctx.Err() == nil {
-				log.Printf("session %s: WS write error: %v", p.session.ID, err)
+				p.server.logger.Warn("WS write error", "session_id", p.session.ID, "error", err)
 			}
 			return
 		}
@@ -286,14 +292,14 @@ func (p *Proxy) relayBrowserToVNC(ctx context.Context) {
 		msgType, data, err := p.session.WSConn.Read(ctx)
 		if err != nil {
 			if ctx.Err() == nil {
-				log.Printf("session %s: WS read error: %v", p.session.ID, err)
+				p.server.logger.Warn("WS read error", "session_id", p.session.ID, "error", err)
 			}
 			return
 		}
 
 		// Only accept binary messages
 		if msgType != websocket.MessageBinary {
-			log.Printf("session %s: rejecting non-binary message", p.session.ID)
+			p.server.logger.Warn("rejecting non-binary message", "session_id", p.session.ID)
 			continue
 		}
 
@@ -302,6 +308,7 @@ func (p *Proxy) relayBrowserToVNC(ctx context.Context) {
 		}
 
 		p.session.TouchActivity()
+		p.session.BytesFromClient.Add(int64(len(data)))
 
 		// Check message type byte
 		rfbType := data[0]
@@ -313,7 +320,7 @@ func (p *Proxy) relayBrowserToVNC(ctx context.Context) {
 			// Standard RFB message - relay to VNC server
 			if _, err := p.session.TCPConn.Write(data); err != nil {
 				if ctx.Err() == nil {
-					log.Printf("session %s: TCP write error: %v", p.session.ID, err)
+					p.server.logger.Warn("TCP write error", "session_id", p.session.ID, "error", err)
 				}
 				return
 			}
@@ -335,7 +342,7 @@ func (p *Proxy) handleExtensionMessage(ctx context.Context, msgType uint8, data 
 	case ExtUploadCancel:
 		p.handleUploadCancel(ctx, data)
 	default:
-		log.Printf("session %s: unknown extension message type: %d", p.session.ID, msgType)
+		p.server.logger.Warn("unknown extension message type", "session_id", p.session.ID, "type", msgType)
 	}
 }
 

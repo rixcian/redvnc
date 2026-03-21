@@ -4,6 +4,7 @@ package wsproxy
 import (
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,6 +21,10 @@ type Session struct {
 	CreatedAt     time.Time
 	LastActivity  time.Time
 	Password      string
+
+	// Bandwidth tracking (bytes transferred, updated atomically)
+	BytesToClient   atomic.Int64
+	BytesFromClient atomic.Int64
 
 	// Upload state
 	mu      sync.Mutex

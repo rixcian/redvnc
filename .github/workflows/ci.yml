@@ -33,4 +33,34 @@ jobs:
         run: go vet ./...
 
       - name: Test
-        run: go test -race ./rfb/...
+        if: runner.os == 'Linux'
+        run: go test -race -coverprofile=coverage.out ./...
+
+      - name: Test (no race - CGO unavailable)
+        if: runner.os != 'Linux'
+        run: go test ./...
+
+      - name: Upload coverage
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: npm test

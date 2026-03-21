@@ -45,6 +45,7 @@ const (
 	EncodingRRE     int32 = 2
 	EncodingZlib    int32 = 6
 	EncodingTight   int32 = 7
+	EncodingZRLE    int32 = 16
 	EncodingCursor  int32 = -239
 	EncodingDesktopSize int32 = -223
 )

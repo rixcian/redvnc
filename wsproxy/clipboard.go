@@ -3,7 +3,6 @@ package wsproxy
 import (
 	"context"
 	"encoding/binary"
-	"log"
 
 	"nhooyr.io/websocket"
 )
@@ -13,19 +12,19 @@ import (
 func (p *Proxy) handleClipboardSet(ctx context.Context, data []byte) {
 	// Minimum: type(1) + length(4) + textLength(4) = 9 bytes
 	if len(data) < 9 {
-		log.Printf("session %s: clipboard set message too short", p.session.ID)
+		p.server.logger.Warn("clipboard set message too short", "session_id", p.session.ID)
 		return
 	}
 
 	payloadLen := binary.BigEndian.Uint32(data[1:5])
 	if len(data) < int(5+payloadLen) {
-		log.Printf("session %s: clipboard set message truncated", p.session.ID)
+		p.server.logger.Warn("clipboard set message truncated", "session_id", p.session.ID)
 		return
 	}
 
 	textLen := binary.BigEndian.Uint32(data[5:9])
 	if len(data) < int(9+textLen) {
-		log.Printf("session %s: clipboard set text truncated", p.session.ID)
+		p.server.logger.Warn("clipboard set text truncated", "session_id", p.session.ID)
 		return
 	}
 
@@ -40,7 +39,7 @@ func (p *Proxy) handleClipboardSet(ctx context.Context, data []byte) {
 	copy(rfbMsg[8:], text)
 
 	if _, err := p.session.TCPConn.Write(rfbMsg); err != nil {
-		log.Printf("session %s: failed to send clipboard to VNC: %v", p.session.ID, err)
+		p.server.logger.Warn("failed to send clipboard to VNC", "session_id", p.session.ID, "error", err)
 	}
 }
 

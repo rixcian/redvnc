@@ -1,0 +1,19 @@
+services:
+  proxy:
+    build: .
+    ports:
+      - "8080:8080"
+    command:
+      - "--listen=:8080"
+      - "--allowed-vnc-target=vnc-server:5900"
+    depends_on:
+      - vnc-server
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+  vnc-server:
+    image: redvnc-example-server
+    expose:
+      - "5900"
