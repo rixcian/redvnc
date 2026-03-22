@@ -12,15 +12,6 @@ export class TightDecoder {
   private pako: typeof import('pako') | null = null;
   private streams: (import('pako').Inflate | null)[] = [null, null, null, null];
 
-  // Diagnostics: track tile decode stats
-  private _diagTotal = 0;
-  private _diagSolid = 0;
-  private _diagJpeg = 0;
-  private _diagBasic = 0;
-  private _diagBlack = 0;    // tiles where decoded data is all-zero RGB
-  private _diagShort = 0;    // tiles where decompressed data was shorter than expected
-  private _diagLastLog = 0;
-
   async init(): Promise<void> {
     this.pako = await import('pako');
     for (let i = 0; i < 4; i++) {
@@ -28,12 +19,19 @@ export class TightDecoder {
     }
   }
 
-  /** Decompress data using a persistent zlib stream. */
+  /**
+   * Decompress data using a persistent zlib stream.
+   *
+   * pako 2.x only calls onData when the internal output buffer is completely
+   * full (avail_out === 0) or on Z_STREAM_END.  With Z_SYNC_FLUSH on small
+   * tiles (e.g. 12 KB << 64 KB default buffer), onData is never called and the
+   * decompressed data stays in strm.output.  We extract it directly after push.
+   */
   private decompressStream(streamIdx: number, compressed: Uint8Array): Uint8Array {
     const inflater = this.streams[streamIdx];
     if (!inflater) throw new Error('TightDecoder not initialized');
 
-    // Collect output chunks for this push only
+    // Collect output chunks produced by onData (called when internal buffer fills)
     const chunks: Uint8Array[] = [];
     const origOnData = inflater.onData;
     inflater.onData = (chunk: Uint8Array) => { chunks.push(chunk.slice()); };
@@ -46,6 +44,14 @@ export class TightDecoder {
       throw new Error(`Tight inflate error (stream ${streamIdx}): ${inflater.msg}`);
     }
 
+    // Extract any remaining data from pako's internal output buffer that
+    // wasn't flushed via onData (the common case for small tiles).
+    const strm = (inflater as any).strm;
+    if (strm && strm.next_out > 0) {
+      chunks.push(new Uint8Array(strm.output.buffer, strm.output.byteOffset, strm.next_out).slice());
+    }
+
+    if (chunks.length === 0) return new Uint8Array(0);
     if (chunks.length === 1) return chunks[0];
     const total = chunks.reduce((s, c) => s + c.length, 0);
     const result = new Uint8Array(total);
@@ -79,7 +85,6 @@ export class TightDecoder {
         }
 
         const subType = control & 0x0f;
-        this._diagTotal++;
 
         if (subType === 0x08) {
           // Solid fill: 3 bytes RGB
@@ -87,8 +92,6 @@ export class TightDecoder {
           const g = data.getUint8(offset + 1);
           const b = data.getUint8(offset + 2);
           offset += 3;
-          this._diagSolid++;
-          if (r === 0 && g === 0 && b === 0) this._diagBlack++;
 
           const rgbaData = new Uint8Array(tileW * tileH * 4);
           for (let i = 0; i < tileW * tileH; i++) {
@@ -100,7 +103,6 @@ export class TightDecoder {
           fb.writeRect(x + tx, y + ty, tileW, tileH, rgbaData);
         } else if (subType === 0x09) {
           // JPEG
-          this._diagJpeg++;
           const { length, bytesRead } = readCompactLength(data, offset);
           offset += bytesRead;
 
@@ -116,27 +118,11 @@ export class TightDecoder {
           const streamIdx = subType & 0x03;
           const { length, bytesRead } = readCompactLength(data, offset);
           offset += bytesRead;
-          this._diagBasic++;
 
           const compressed = new Uint8Array(data.buffer, data.byteOffset + offset, length);
           offset += length;
 
           const decompressed = this.decompressStream(streamIdx, compressed);
-          const expectedBytes = tileW * tileH * 3;
-          if (decompressed.length < expectedBytes) {
-            this._diagShort++;
-            console.warn(
-              `Tight: decompressed ${decompressed.length} bytes, expected ${expectedBytes}`,
-              `tile(${x + tx},${y + ty}) ${tileW}x${tileH} stream=${streamIdx}`,
-            );
-          }
-
-          // Check if decoded data is all-zero (would produce black tile)
-          let allZero = true;
-          for (let i = 0; i < Math.min(decompressed.length, 64); i++) {
-            if (decompressed[i] !== 0) { allZero = false; break; }
-          }
-          if (allZero && decompressed.length > 0) this._diagBlack++;
 
           // Tight basic uses 3-byte RGB pixels (CPIXEL for 32bpp/24depth)
           const rgbaData = new Uint8Array(tileW * tileH * 4);
@@ -147,17 +133,6 @@ export class TightDecoder {
             rgbaData[i * 4 + 3] = 255;
           }
           fb.writeRect(x + tx, y + ty, tileW, tileH, rgbaData);
-        }
-
-        // Log periodic diagnostics
-        const now = performance.now();
-        if (now - this._diagLastLog > 5000) {
-          this._diagLastLog = now;
-          console.log(
-            `[Tight diag] total=${this._diagTotal}`,
-            `solid=${this._diagSolid} basic=${this._diagBasic} jpeg=${this._diagJpeg}`,
-            `black=${this._diagBlack} short=${this._diagShort}`,
-          );
         }
       }
     }
