@@ -182,6 +182,7 @@ export const VncViewer: React.FC<VncViewerProps> = ({
           display: 'block',
           width: scaleToFit ? '100%' : undefined,
           height: scaleToFit ? '100%' : undefined,
+          objectFit: scaleToFit ? 'contain' : undefined,
           outline: 'none',
         }}
       />
