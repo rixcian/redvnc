@@ -33,12 +33,10 @@ export class CanvasRenderer {
   updateCanvasSize(fb: Framebuffer): void {
     if (!this.canvas) return;
 
-    if (!this.scaleToFit) {
-      this.canvas.width = fb.width;
-      this.canvas.height = fb.height;
-    }
-    // When scaleToFit is true, canvas keeps its CSS size,
-    // and we scale during render.
+    // Always set canvas internal resolution to match the framebuffer.
+    // When scaleToFit is true, CSS width/height: 100% handles visual scaling.
+    this.canvas.width = fb.width;
+    this.canvas.height = fb.height;
   }
 
   /**
@@ -50,33 +48,13 @@ export class CanvasRenderer {
     const dirtyRects = fb.dirtyRects;
     if (dirtyRects.length === 0) return;
 
-    if (this.scaleToFit) {
-      // When scaling, we need to redraw the entire framebuffer
-      // because putImageData doesn't scale.
-      this.ctx.save();
-      const scaleX = this.canvas.width / fb.width;
-      const scaleY = this.canvas.height / fb.height;
-
-      // Draw dirty rects using an offscreen approach
-      for (const rect of dirtyRects) {
-        this.ctx.putImageData(
-          fb.imageData,
-          0, 0,
-          rect.x, rect.y,
-          rect.w, rect.h,
-        );
-      }
-      this.ctx.restore();
-    } else {
-      // Direct rendering: putImageData for each dirty rect
-      for (const rect of dirtyRects) {
-        this.ctx.putImageData(
-          fb.imageData,
-          0, 0,
-          rect.x, rect.y,
-          rect.w, rect.h,
-        );
-      }
+    for (const rect of dirtyRects) {
+      this.ctx.putImageData(
+        fb.imageData,
+        0, 0,
+        rect.x, rect.y,
+        rect.w, rect.h,
+      );
     }
 
     fb.clearDirty();
