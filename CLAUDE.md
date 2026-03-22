@@ -9,7 +9,7 @@ RedVNC is a cross-platform VNC (Remote Framebuffer / RFC 6143) server and client
 ```
 redvnc/
 ├── rfb/                    # Core RFB protocol (pure Go, zero CGo)
-│   ├── server.go           # Multi-client VNC server
+│   ├── server.go           # Multi-client VNC server + frame timing diagnostics
 │   ├── client.go           # VNC client
 │   ├── protocol.go         # Wire types, constants, message I/O
 │   ├── encodings/          # Framebuffer encoders (Raw, CopyRect, Zlib, Tight, ZRLE)
@@ -17,20 +17,20 @@ redvnc/
 ├── wsproxy/                # WebSocket-to-TCP VNC relay
 │   ├── server.go           # HTTP server, session manager, health endpoints
 │   ├── session.go          # Session lifecycle
-│   ├── proxy.go            # RFB handshake delegation, bidirectional relay
+│   ├── proxy.go            # RFB handshake delegation, raw byte relay
 │   ├── clipboard.go        # Extension messages 129-130 (clipboard sync)
 │   ├── fileupload.go       # Extension messages 131-135 (chunked upload + CRC-32)
 │   ├── ratelimit.go        # IP-based auth rate limiting
 │   ├── config.go           # Config struct + env var overrides
-│   ├── rfbreader.go        # Binary RFB message parsing
+│   ├── rfbreader.go        # Binary RFB message parsing (used by browser→VNC path only)
 │   └── cmd/main.go         # CLI entry point (redvnc-wsproxy)
 ├── web/                    # React/TypeScript browser client library
 │   ├── src/
-│   │   ├── index.ts        # VncClient public API, renderer selection
-│   │   ├── connection.ts   # WebSocket manager with auto-reconnect
+│   │   ├── index.ts        # VncClient public API, renderer selection, FBU pipeline
+│   │   ├── connection.ts   # WebSocket manager with reassembly buffer
 │   │   ├── rfb-parser.ts   # Server→client binary message parsing
 │   │   ├── rfb-writer.ts   # Client→server binary message building
-│   │   ├── framebuffer.ts  # Pixel state, dirty rect tracking
+│   │   ├── framebuffer.ts  # Pixel state, dirty rect tracking, WebGL texture upload
 │   │   ├── renderer.ts     # Canvas 2D renderer
 │   │   ├── renderer-webgl.ts # WebGL 2 renderer with fallback
 │   │   ├── input.ts        # Keyboard/mouse/touch → RFB events
@@ -43,8 +43,12 @@ redvnc/
 │   ├── package.json
 │   ├── vite.config.ts
 │   └── tsconfig.json
-├── capture/                # Screen capture interface + platform stubs (Linux/Windows/macOS)
-├── input/                  # Input injection interface + platform stubs
+├── capture/                # Screen capture interface + platform implementations
+│   ├── capture.go          # ScreenCapturer interface
+│   ├── capture_windows.go  # Windows DXGI capture
+│   ├── capture_darwin.go   # macOS ScreenCaptureKit
+│   └── capture_linux.go    # Linux X11/XShm
+├── input/                  # Input injection interface + platform implementations
 ├── capi/                   # C shared library exports (//export, P/Invoke)
 ├── example/
 │   ├── server/main.go      # Example VNC server (animated gradient test pattern)
@@ -67,7 +71,7 @@ redvnc/
 | WebSocket proxy | Go + `nhooyr.io/websocket v1.8.17` |
 | Session IDs | `github.com/google/uuid v1.6.0` |
 | Browser client | TypeScript 5.3, React 18, Vite 5, Vitest 4 |
-| Compression | `pako 2.1.0` (zlib in browser) |
+| Compression | `fflate` (zlib inflate in browser — replaced pako for ~2x speed) |
 | Container | Docker (Alpine 3.20 runtime) |
 
 ---
@@ -130,23 +134,112 @@ cd web && npm run dev
 
 ## Architecture
 
+### Data Flow
+
 ```
 Browser (React/TS)
     │  WebSocket (ws:// or wss://)
     ▼
-WSProxy (Go)        — session management, extension messages, rate limiting
+WSProxy (Go)        — raw byte relay (VNC→Browser), extension messages, rate limiting
     │  TCP (RFB / RFC 6143)
     ▼
 VNC Server (Go)
     │
-    ├── ScreenCapturer interface  ←  platform implementations (stubs for now)
-    └── InputHandler interface    ←  platform implementations (stubs for now)
+    ├── ScreenCapturer interface  ←  platform implementations
+    └── InputHandler interface    ←  platform implementations
 ```
 
+### Proxy Relay Model
+
+The VNC→Browser direction uses **raw byte relay**: the proxy reads available TCP bytes and forwards them immediately as WebSocket messages without parsing RFB message boundaries. This eliminates proxy-side tile parsing latency. The browser's reassembly buffer (`connection.ts`) handles message framing via `tryGetMessageLength()`.
+
+The Browser→VNC direction is message-aware: it intercepts `SetPixelFormat` to track pixel format, and routes extension messages (type >= 128) to local handlers.
+
 Extension message types (custom, wsproxy-specific, > 128):
-- `129` — Clipboard text server→client
-- `130` — Clipboard text client→server
+- `128` — SessionInit (proxy→browser, sent once after handshake)
+- `129` — ClipboardSet (browser→proxy)
+- `130` — ClipboardUpdate (proxy→browser)
 - `131–135` — Chunked file upload with CRC-32 verification
+
+### Browser Client Pipeline (FBU Processing)
+
+```
+WebSocket onmessage
+  → Reassembly buffer (connection.ts) — accumulates raw bytes, dispatches complete RFB messages
+  → parseServerMessage (rfb-parser.ts) — parses FBU into rectangles
+  → handleFramebufferUpdate (index.ts) — dispatches to encoding decoders
+  → TightDecoder / ZlibDecoder / etc. — decompresses and writes to Framebuffer
+  → Framebuffer dirty tracking → WebGL texSubImage2D upload → render
+```
+
+**Key performance detail:** The FBU request for the next frame is sent **before** decoding the current frame (pipelining). This overlaps server encoding with client decoding.
+
+### Server Frame Pipeline
+
+```
+framebufferWriter (server.go)
+  → MaxFPS rate limiting (default 30 FPS)
+  → capturer.Capture() — platform screen capture
+  → bestEncoding() → Tight/Zlib/ZRLE/Raw encoder
+  → WriteFramebufferUpdate → bw.Flush() → TCP
+```
+
+**Frame timing diagnostics:** The `framebufferWriter` logs every 5 seconds with `avg_capture`, `avg_encode`, `avg_send`, and `fps` — use this to identify server-side bottlenecks.
+
+**FBU request channel** (`fbReqCh`, capacity 1): if the writer is busy encoding, new requests are dropped. This prevents request accumulation when the server is slower than the client's request rate.
+
+---
+
+## Performance Optimizations (Current State)
+
+These are the optimizations currently in place. Understanding them prevents re-doing work and helps identify what's left to optimize.
+
+### Client-side
+
+| Optimization | Location | Impact |
+|---|---|---|
+| **Pipelined FBU requests** | `index.ts` `handleFramebufferUpdate` | Request next frame before decoding current — overlaps server encoding with client decoding. Doubled data rate (1.1→3+ MB/s). |
+| **fflate instead of pako** | `encodings/tight.ts`, `zlib.ts`, `zrle.ts` | ~2x faster zlib inflate, 8KB vs 45KB bundle. Uses raw `Inflate` with manual 2-byte zlib header skip on first push per stream. |
+| **Direct framebuffer writes** | `framebuffer.ts` | `writeRectRGB()` and `fillRect()` write directly to framebuffer, avoiding intermediate buffer allocations. |
+| **Parallel JPEG decode** | `encodings/tight.ts` | JPEG tiles collected into `jpegTasks[]`, resolved via `Promise.allSettled` for parallel `createImageBitmap`. |
+| **Reusable OffscreenCanvas** | `framebuffer.ts` | Single `OffscreenCanvas` instance for JPEG→pixel extraction instead of creating new ones per tile. |
+| **Incremental WebGL upload** | `framebuffer.ts` | `texSubImage2D` for dirty rects < 30% of screen; full `texImage2D` only for large updates. |
+| **Parser skip for last rect** | `rfb-parser.ts` `parseFramebufferUpdate` | Skips `getTightDataLength()` tile scan for the last rectangle in an FBU (no need to compute length when there's no next rect). Most FBUs have a single rect. |
+| **Extension message fast path** | `connection.ts` | Extension messages (type >= 128) dispatched directly without reassembly buffer when buffer is empty. |
+
+### Proxy-side
+
+| Optimization | Location | Impact |
+|---|---|---|
+| **Raw byte relay** | `proxy.go` `relayVNCToBrowser` | Forwards TCP bytes directly as WebSocket messages without parsing RFB message boundaries. Eliminates tile-by-tile Tight parsing in the proxy. |
+| **Reusable scratch buffers** | `rfbreader.go` | `[12]byte` rectHdr and `[16KB]byte` copyBuf avoid per-tile heap allocations (used by browser→VNC path). |
+
+### Server-side
+
+| Optimization | Location | Impact |
+|---|---|---|
+| **MaxFPS rate limiting** | `server.go` `framebufferWriter` | Prevents wasting CPU on faster-than-displayable frame rates. Default: 30 FPS. |
+| **Frame timing diagnostics** | `server.go` `framebufferWriter` | Logs fps/capture/encode/send breakdown every 5s for bottleneck identification. |
+
+### What was tried and didn't help
+
+| Approach | Result | Why |
+|---|---|---|
+| **Web Worker for Tight decode** | FPS regression (11→6), grey tile artifacts | postMessage overhead for ~510 tiles/FBU outweighed off-thread benefit. Tile transfer serialization dominated. |
+| **fflate over pako** | No measurable FPS change | Decompression was not the bottleneck at 9-11 FPS. Kept for smaller bundle and cleaner API. |
+
+### Remaining bottleneck analysis (at ~9-11 FPS, 1920x1080, Tight encoding)
+
+The client-side decode path takes ~35-45ms per frame (could handle ~22-28 FPS). The gap to 9-11 FPS suggests the **server** (screen capture + Tight encoding) is the bottleneck. Use the frame timing logs to confirm:
+
+```
+INFO frame timing fps=9.2 avg_capture=45ms avg_encode=55ms avg_send=2ms avg_frame=102ms
+```
+
+**Next optimization targets (in priority order):**
+1. **Server capture optimization** — if `avg_capture` is high, optimize the platform-specific screen capture (e.g., DXGI on Windows, ScreenCaptureKit on macOS)
+2. **Server Tight encoding optimization** — if `avg_encode` is high, profile the Go Tight encoder (`rfb/encodings/tight.go`)
+3. **Incremental/dirty-rect capture** — only capture and encode changed screen regions instead of full screen every frame
 
 ---
 
@@ -155,8 +248,8 @@ Extension message types (custom, wsproxy-specific, > 128):
 ```go
 // capture/capture.go
 type ScreenCapturer interface {
-    CaptureScreen() (*image.RGBA, error)
-    Close() error
+    Bounds() (width, height uint16)
+    Capture() (pixels []byte, stride int, err error)
 }
 
 // input/input.go
@@ -165,10 +258,10 @@ type InputHandler interface {
     PointerEvent(buttonMask uint8, x, y uint16) error
 }
 
-// rfb/encodings/encodings.go
-type Encoder interface {
-    Encode(rect rfb.Rectangle, fb *rfb.Framebuffer) ([]byte, error)
-    Type() rfb.EncodingType
+// rfb/server.go
+type MultiEncoder interface {
+    EncodeMulti(x, y, width, height uint16, pixels []byte, stride int) ([]Rectangle, error)
+    Type() int32
 }
 
 // rfb/security/security.go
@@ -210,11 +303,9 @@ type SecurityHandler interface {
 
 | Platform | Screen Capture | Input Injection |
 |---|---|---|
-| Linux (X11/XShm + XTest) | stub | stub |
-| Windows (DXGI + SendInput) | stub | stub |
-| macOS (ScreenCaptureKit + CGEvent) | stub | stub |
-
-Stubs compile and satisfy the interfaces but return `errors.New("not implemented")`. Implement them in the appropriate `capture/capture_<os>.go` and `input/input_<os>.go` files.
+| Linux (X11/XShm + XTest) | implemented | implemented |
+| Windows (DXGI + SendInput) | implemented | implemented |
+| macOS (ScreenCaptureKit + CGEvent) | implemented | implemented |
 
 ---
 
@@ -252,12 +343,12 @@ Readiness check: `GET /ready`.
 
 ## Encoding Pipeline (Server → Client)
 
-This section is here to save re-investigation time. Every encoding has a Go encoder in `rfb/encodings/` and a matching TypeScript decoder in `web/src/encodings/`. The pixel format negotiated during handshake is **32-bit BGRA** (4 bytes/pixel). The server always stores and sends pixels in BGRA order; the browser client reads them accordingly.
+Every encoding has a Go encoder in `rfb/encodings/` and a matching TypeScript decoder in `web/src/encodings/`. The pixel format negotiated during handshake is **32-bit BGRA** (4 bytes/pixel). The server always stores and sends pixels in BGRA order; the browser client reads them accordingly.
 
 ### Pixel Format
 
 - **Server internal framebuffer:** BGRA, 4 bytes/pixel, row-major, stride = `width * 4`.
-- **Wire format after SetPixelFormat:** same BGRA unless the client requests otherwise.
+- **Wire format after SetPixelFormat:** client requests RGBA 32bpp, but Tight always uses 3-byte CPIXEL (RGB).
 - **Browser framebuffer (`Framebuffer` class):** `Uint8ClampedArray` in RGBA order (canvas native). The decoders convert B↔R when writing.
 
 ### Raw (type 0)
@@ -287,10 +378,10 @@ This section is here to save re-investigation time. Every encoding has a Go enco
 - Wire format: **4-byte big-endian length** prefix + zlib-compressed BGRA pixel rows.
 
 **Browser** (`web/src/encodings/zlib.ts` — `ZlibDecoder`):
-- Maintains a single persistent `pako.Inflate` instance (must call `init()` first).
-- Reads the 4-byte length prefix, passes compressed bytes to `inflate.push(..., Z_SYNC_FLUSH)`.
-- Collects output chunks, concatenates, then calls `fb.writeRect` (BGRA → RGBA conversion inside).
-- **Critical:** uses `Z_SYNC_FLUSH` (mode `2`) to match server's flush boundary.
+- Maintains a single persistent `fflate.Inflate` instance (must call `init()` first).
+- Skips the 2-byte zlib header on the first push, then pushes raw DEFLATE data.
+- Collects output chunks via callback, concatenates, then calls `fb.writeRect`.
+- **Critical:** The zlib stream state persists across rectangles — never create a new `Inflate` between rects.
 
 ### Tight (type 7)
 
@@ -314,14 +405,14 @@ Each tile goes through a decision tree in `encodeTile`:
 
 **Browser** (`web/src/encodings/tight.ts` — `TightDecoder`):
 
-- Maintains 4 `pako.Inflate` streams (indices 0–3), must call `init()`.
-- Control byte high nibble (bits 7–4): if bit `s+4` is set, stream `s` is reset (new `pako.Inflate`).
+- Maintains 4 `fflate.Inflate` streams wrapped in `ZlibStream` class (handles zlib header stripping).
+- Control byte high nibble (bits 7–4): if bit `s+4` is set, stream `s` is reset (new `ZlibStream`).
 - Control byte low nibble (`subType`):
   - `0x08` → Solid: read 3 bytes (R, G, B), call `fb.fillRect`.
   - `0x09` → JPEG: read compact-length, slice bytes, decode via `createImageBitmap(Blob)`, deferred.
   - `0x00–0x03` → Basic: `streamIdx = subType & 0x03`, read compact-length, decompress with that stream, call `fb.writeRectRGB` (RGB → RGBA conversion inside).
 - JPEG decodes are **batched** and resolved with `Promise.allSettled` for parallelism. `TightDecoder.decode` is `async`.
-- The internal `decompressStream` resets `strm.next_out = 0` before each push — this is a **pako 2.x workaround** to avoid stale output data.
+- The `ZlibStream` wrapper skips the 2-byte zlib header on first push and collects output via fflate's callback.
 
 ### ZRLE (type 16)
 
@@ -340,7 +431,8 @@ Each tile goes through a decision tree in `encodeTile`:
 Palette selection: if 1 unique color → Solid; 2–16 → PackedPalette; otherwise → Raw. (Server does not implement plain/palette RLE — only the decoder handles those.)
 
 **Browser** (`web/src/encodings/zrle.ts` — `ZrleDecoder`):
-- Uses `pako.inflate` (one-shot, not streaming) on the full compressed payload per rectangle.
+- Uses `fflate.Inflate` with streaming push (not one-shot) per rectangle.
+- Skips 2-byte zlib header on first push, maintains persistent stream state.
 - Handles all ZRLE subtypes including Plain RLE (`128`) and Palette RLE (`130–255`) that the server doesn't currently emit.
 - CPIXEL byte order on the wire: B, G, R. `decodeSolidTile` and `decodeRawTile` read in that order and call `fb.setPixel(x, y, r, g, b, 255)`.
 
@@ -359,11 +451,24 @@ The browser `Framebuffer` class (`web/src/framebuffer.ts`) exposes several write
 
 ### Key Invariants to Preserve
 
-1. **Zlib streams must not be closed between rectangles** for Zlib and Tight Basic encodings — the decoder maintains decompressor state that depends on the continuous dictionary. Calling `Reset()` on the encoder or creating a new `pako.Inflate` on the decoder will desync the stream.
+1. **Zlib streams must not be closed between rectangles** for Zlib and Tight Basic encodings — the decoder maintains decompressor state that depends on the continuous dictionary. Creating a new `fflate.Inflate` (or `ZlibStream` in Tight) resets the dictionary and will desync the stream.
 2. **Tight tile coordinates are absolute** (relative to the full framebuffer), not relative to the rectangle. Both `EncodeMulti` and the browser decoder use absolute `x+tx, y+ty`.
 3. **ZRLE CPIXEL is 3 bytes** (B, G, R), not 4. Do not confuse with the Raw encoding's 4-byte BGRA pixels.
 4. **Compact length** in Tight is little-endian variable-length: `readCompactLength` in `rfb-parser.ts` and `compactLen` in `tight.go` must stay in sync.
 5. **CopyRect has no `Encode` method** — always call `EncodeCopyRect(x, y, w, h, srcX, srcY)` directly.
+6. **fflate zlib header handling:** fflate's `Inflate` handles raw DEFLATE only. VNC sends zlib-wrapped data (2-byte header on first chunk per stream). The `ZlibStream` wrapper in `tight.ts` and decoders in `zlib.ts`/`zrle.ts` skip these 2 bytes on `firstPush` then push raw DEFLATE thereafter.
+7. **Proxy sends raw bytes:** The VNC→Browser relay does NOT guarantee complete RFB messages per WebSocket frame. The client's reassembly buffer in `connection.ts` must handle message framing.
+
+---
+
+## Connection & Reassembly Buffer (Browser)
+
+`connection.ts` manages the WebSocket connection and RFB message reassembly:
+
+- **Fast path:** Extension messages (type >= 128) are sent as complete WebSocket frames by the proxy and dispatched directly without buffering.
+- **Slow path:** Standard RFB messages (types 0-3) go through the reassembly buffer since the proxy uses raw byte relay and may fragment them. `tryGetMessageLength()` scans the buffer to detect complete messages.
+- **Tight tile scanning in `tryGetMessageLength`:** For Tight encoding, this scans all tiles (~510 for 1920x1080) to determine message boundaries. This is unavoidable when using raw relay but only runs once per complete message.
+- **Buffer management:** Grows by 2x when needed, compacts consumed data via `copyWithin`.
 
 ---
 
@@ -386,8 +491,8 @@ The browser `Framebuffer` class (`web/src/framebuffer.ts`) exposes several write
 
 ### Implement a Platform Screen Capture / Input
 
-1. Open the stub file: `capture/capture_<os>.go` or `input/input_<os>.go`.
-2. Replace the stub body with the real implementation using build-tag-appropriate imports.
+1. Open the implementation file: `capture/capture_<os>.go` or `input/input_<os>.go`.
+2. Replace or update the implementation using build-tag-appropriate imports.
 3. Add integration tests gated on the platform build tag.
 
 ---
@@ -396,15 +501,19 @@ The browser `Framebuffer` class (`web/src/framebuffer.ts`) exposes several write
 
 | File | Purpose |
 |---|---|
-| `rfb/server.go` | VNC server: `ServerConfig`, `Server`, client connection loop |
+| `rfb/server.go` | VNC server: `ServerConfig`, `Server`, frame timing, `framebufferWriter` loop |
 | `rfb/client.go` | VNC client: `ClientConfig`, `Client`, handshake |
 | `rfb/protocol.go` | All protocol constants, wire structs, binary I/O helpers |
 | `wsproxy/server.go` | Proxy HTTP server, `/health`, `/ready`, session manager |
-| `wsproxy/proxy.go` | RFB relay loop, extension message routing |
+| `wsproxy/proxy.go` | Raw byte relay loop, extension message routing |
+| `wsproxy/rfbreader.go` | RFB message parser (browser→VNC path + scratch buffers) |
 | `wsproxy/config.go` | `Config` struct, env var overrides |
-| `web/src/index.ts` | `VncClient` public API |
-| `web/src/rfb-parser.ts` | Server→client message parsing |
+| `web/src/index.ts` | `VncClient` public API, FBU pipeline, pipelined requests |
+| `web/src/connection.ts` | WebSocket manager, reassembly buffer, fast/slow path dispatch |
+| `web/src/rfb-parser.ts` | Server→client message parsing, `tryGetMessageLength`, Tight tile scanning |
 | `web/src/rfb-writer.ts` | Client→server message serialization |
+| `web/src/framebuffer.ts` | Pixel buffer, dirty tracking, WebGL texture upload |
+| `web/src/encodings/tight.ts` | Tight decoder with fflate `ZlibStream`, parallel JPEG |
 | `web/src/components/VncViewer.tsx` | Main React component |
 | `capi/exports.go` | C FFI exports for P/Invoke |
 | `PLAN.md` | Phased implementation roadmap |
