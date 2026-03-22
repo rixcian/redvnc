@@ -99,6 +99,7 @@ func main() {
 
 	var capturer rfb.ScreenCapturer
 	var inputHandler rfb.InputHandler
+	var cursorProvider rfb.CursorProvider
 
 	if *demo {
 		log.Println("using demo gradient capturer")
@@ -109,7 +110,7 @@ func main() {
 		inputHandler = &inputLogger{}
 	} else {
 		var err error
-		capturer, inputHandler, err = setupPlatformCaptureAndInput()
+		capturer, inputHandler, cursorProvider, err = setupPlatformCaptureAndInput()
 		if err != nil {
 			log.Printf("platform capture/input unavailable: %v", err)
 			log.Println("falling back to demo gradient capturer")
@@ -122,9 +123,10 @@ func main() {
 	}
 
 	config := rfb.ServerConfig{
-		Name:     "redvnc",
-		Capturer: capturer,
-		Input:    inputHandler,
+		Name:           "redvnc",
+		Capturer:       capturer,
+		Input:          inputHandler,
+		CursorProvider: cursorProvider,
 		NewTightEncoder: func() rfb.MultiEncoder {
 			return encodings.NewTight(75)
 		},
