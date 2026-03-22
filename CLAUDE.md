@@ -250,6 +250,123 @@ Readiness check: `GET /ready`.
 
 ---
 
+## Encoding Pipeline (Server → Client)
+
+This section is here to save re-investigation time. Every encoding has a Go encoder in `rfb/encodings/` and a matching TypeScript decoder in `web/src/encodings/`. The pixel format negotiated during handshake is **32-bit BGRA** (4 bytes/pixel). The server always stores and sends pixels in BGRA order; the browser client reads them accordingly.
+
+### Pixel Format
+
+- **Server internal framebuffer:** BGRA, 4 bytes/pixel, row-major, stride = `width * 4`.
+- **Wire format after SetPixelFormat:** same BGRA unless the client requests otherwise.
+- **Browser framebuffer (`Framebuffer` class):** `Uint8ClampedArray` in RGBA order (canvas native). The decoders convert B↔R when writing.
+
+### Raw (type 0)
+
+**Server** (`rfb/encodings/encodings.go` — `Raw.Encode`):
+- Copies rows of BGRA pixels straight out of the framebuffer slice into `Rectangle.Data`.
+- No length prefix. Payload size = `width * height * 4`.
+
+**Browser** (`web/src/encodings/raw.ts` — `decodeRaw`):
+- Reads `width * height * 4` bytes from the `DataView` and calls `fb.writeRect`.
+- `writeRect` expects BGRA and swaps B↔R before writing to the RGBA canvas buffer.
+
+### CopyRect (type 1)
+
+**Server** (`rfb/encodings/encodings.go` — `CopyRect.EncodeCopyRect`):
+- Payload is 4 bytes: `srcX` (uint16 BE) + `srcY` (uint16 BE). No pixel data.
+- Note: `CopyRect.Encode` returns an error — always use `EncodeCopyRect`.
+
+**Browser** (`web/src/encodings/copyrect.ts` — `decodeCopyRect`):
+- Reads `srcX`/`srcY` from the DataView, then calls `fb.copyRect(srcX, srcY, dstX, dstY, w, h)`.
+
+### Zlib (type 6)
+
+**Server** (`rfb/encodings/encodings.go` — `Zlib.Encode`):
+- The `zlib.Writer` is **persistent across calls** (reuses dictionary). Only `buf` is reset per frame.
+- Uses `Flush()` (Z_SYNC_FLUSH), never `Close()`, so the stream continues.
+- Wire format: **4-byte big-endian length** prefix + zlib-compressed BGRA pixel rows.
+
+**Browser** (`web/src/encodings/zlib.ts` — `ZlibDecoder`):
+- Maintains a single persistent `pako.Inflate` instance (must call `init()` first).
+- Reads the 4-byte length prefix, passes compressed bytes to `inflate.push(..., Z_SYNC_FLUSH)`.
+- Collects output chunks, concatenates, then calls `fb.writeRect` (BGRA → RGBA conversion inside).
+- **Critical:** uses `Z_SYNC_FLUSH` (mode `2`) to match server's flush boundary.
+
+### Tight (type 7)
+
+The most complex encoding. Operates on 64×64 pixel tiles.
+
+**Server** (`rfb/encodings/tight.go` — `Tight`):
+
+Each tile goes through a decision tree in `encodeTile`:
+
+| Condition | Sub-encoding | Control byte | Payload |
+|---|---|---|---|
+| All pixels same color | Solid fill | `0x08` | 3 bytes: R, G, B |
+| `tileW*tileH >= 4096` and `colorVariance > 512` | JPEG | `0x09` | compact-length + JPEG data |
+| Otherwise | Basic (zlib stream 0) | `streamIdx & 0x03` | compact-length + zlib(RGB) |
+
+- **4 independent zlib streams** (indices 0–3) per `Tight` instance, each persistent.
+- Basic sub-encoding strips alpha and sends **RGB** (3 bytes/pixel), not BGRA.
+- JPEG path converts BGRA → `image.RGBA`, encodes at configurable quality (default 75).
+- **Compact length** encoding (1–3 bytes): values < 128 fit in 1 byte; each byte uses 7 bits + continuation bit.
+- `EncodeMulti` returns one `rfb.Rectangle` per tile with correct tile coordinates; `Encode` merges them into a single rectangle for callers that expect one rect per call.
+
+**Browser** (`web/src/encodings/tight.ts` — `TightDecoder`):
+
+- Maintains 4 `pako.Inflate` streams (indices 0–3), must call `init()`.
+- Control byte high nibble (bits 7–4): if bit `s+4` is set, stream `s` is reset (new `pako.Inflate`).
+- Control byte low nibble (`subType`):
+  - `0x08` → Solid: read 3 bytes (R, G, B), call `fb.fillRect`.
+  - `0x09` → JPEG: read compact-length, slice bytes, decode via `createImageBitmap(Blob)`, deferred.
+  - `0x00–0x03` → Basic: `streamIdx = subType & 0x03`, read compact-length, decompress with that stream, call `fb.writeRectRGB` (RGB → RGBA conversion inside).
+- JPEG decodes are **batched** and resolved with `Promise.allSettled` for parallelism. `TightDecoder.decode` is `async`.
+- The internal `decompressStream` resets `strm.next_out = 0` before each push — this is a **pako 2.x workaround** to avoid stale output data.
+
+### ZRLE (type 16)
+
+**Server** (`rfb/encodings/zrle.go` — `ZRLE`):
+- Persistent zlib stream, flushed (not closed) per rectangle.
+- Wire format: **4-byte big-endian length** prefix + zlib-compressed tile stream.
+- Pixels are **CPIXEL** (3 bytes: B, G, R — alpha dropped), not BGRA.
+- Per-tile sub-encodings written into the zlib stream:
+
+| Subtype | Meaning | Data |
+|---|---|---|
+| `0` | Raw | 3 bytes × numPixels (CPIXEL) |
+| `1` | Solid | 3 bytes (single CPIXEL) |
+| `2–16` | Packed palette | palette (3×N bytes) + packed indices (1/2/4 bits per pixel, row-padded to byte) |
+
+Palette selection: if 1 unique color → Solid; 2–16 → PackedPalette; otherwise → Raw. (Server does not implement plain/palette RLE — only the decoder handles those.)
+
+**Browser** (`web/src/encodings/zrle.ts` — `ZrleDecoder`):
+- Uses `pako.inflate` (one-shot, not streaming) on the full compressed payload per rectangle.
+- Handles all ZRLE subtypes including Plain RLE (`128`) and Palette RLE (`130–255`) that the server doesn't currently emit.
+- CPIXEL byte order on the wire: B, G, R. `decodeSolidTile` and `decodeRawTile` read in that order and call `fb.setPixel(x, y, r, g, b, 255)`.
+
+### Framebuffer Write Methods (Browser)
+
+The browser `Framebuffer` class (`web/src/framebuffer.ts`) exposes several write helpers used by decoders:
+
+| Method | Input format | Use case |
+|---|---|---|
+| `writeRect(x, y, w, h, data)` | BGRA Uint8Array | Raw, Zlib |
+| `writeRectRGB(x, y, w, h, data)` | RGB Uint8Array | Tight Basic |
+| `fillRect(x, y, w, h, r, g, b)` | individual R/G/B bytes | Tight Solid |
+| `setPixel(x, y, r, g, b, a)` | individual bytes | ZRLE per-pixel |
+| `drawBitmap(bitmap, x, y, w, h)` | `ImageBitmap` | Tight JPEG |
+| `copyRect(srcX, srcY, dstX, dstY, w, h)` | — | CopyRect |
+
+### Key Invariants to Preserve
+
+1. **Zlib streams must not be closed between rectangles** for Zlib and Tight Basic encodings — the decoder maintains decompressor state that depends on the continuous dictionary. Calling `Reset()` on the encoder or creating a new `pako.Inflate` on the decoder will desync the stream.
+2. **Tight tile coordinates are absolute** (relative to the full framebuffer), not relative to the rectangle. Both `EncodeMulti` and the browser decoder use absolute `x+tx, y+ty`.
+3. **ZRLE CPIXEL is 3 bytes** (B, G, R), not 4. Do not confuse with the Raw encoding's 4-byte BGRA pixels.
+4. **Compact length** in Tight is little-endian variable-length: `readCompactLength` in `rfb-parser.ts` and `compactLen` in `tight.go` must stay in sync.
+5. **CopyRect has no `Encode` method** — always call `EncodeCopyRect(x, y, w, h, srcX, srcY)` directly.
+
+---
+
 ## Common Tasks
 
 ### Add a New RFB Encoding
