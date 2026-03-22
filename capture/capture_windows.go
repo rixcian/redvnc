@@ -11,19 +11,34 @@ import (
 )
 
 var (
-	user32 = syscall.NewLazyDLL("user32.dll")
-	gdi32  = syscall.NewLazyDLL("gdi32.dll")
+	user32  = syscall.NewLazyDLL("user32.dll")
+	gdi32   = syscall.NewLazyDLL("gdi32.dll")
+	shcore  = syscall.NewLazyDLL("shcore.dll")
 
-	procGetDC             = user32.NewProc("GetDC")
-	procReleaseDC         = user32.NewProc("ReleaseDC")
-	procGetSystemMetrics  = user32.NewProc("GetSystemMetrics")
+	procGetDC              = user32.NewProc("GetDC")
+	procReleaseDC          = user32.NewProc("ReleaseDC")
+	procGetSystemMetrics   = user32.NewProc("GetSystemMetrics")
 	procCreateCompatibleDC = gdi32.NewProc("CreateCompatibleDC")
-	procCreateDIBSection  = gdi32.NewProc("CreateDIBSection")
-	procSelectObject      = gdi32.NewProc("SelectObject")
-	procBitBlt            = gdi32.NewProc("BitBlt")
-	procDeleteObject      = gdi32.NewProc("DeleteObject")
-	procDeleteDC          = gdi32.NewProc("DeleteDC")
+	procCreateDIBSection   = gdi32.NewProc("CreateDIBSection")
+	procSelectObject       = gdi32.NewProc("SelectObject")
+	procBitBlt             = gdi32.NewProc("BitBlt")
+	procDeleteObject       = gdi32.NewProc("DeleteObject")
+	procDeleteDC           = gdi32.NewProc("DeleteDC")
+
+	procSetProcessDpiAwareness = shcore.NewProc("SetProcessDpiAwareness")
+	procSetProcessDPIAware     = user32.NewProc("SetProcessDPIAware")
 )
+
+func init() {
+	// Enable DPI awareness so GetSystemMetrics returns physical pixels.
+	// Try SetProcessDpiAwareness (Win 8.1+) first, fall back to SetProcessDPIAware (Vista+).
+	if err := procSetProcessDpiAwareness.Find(); err == nil {
+		// PROCESS_PER_MONITOR_DPI_AWARE = 2
+		procSetProcessDpiAwareness.Call(2)
+	} else {
+		procSetProcessDPIAware.Call()
+	}
+}
 
 const (
 	smCXScreen = 0

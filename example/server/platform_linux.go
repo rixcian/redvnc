@@ -27,28 +27,28 @@ func (a *inputInjectorAdapter) PointerEvent(buttonMask uint8, x, y uint16) {
 	}
 }
 
-func setupPlatformCaptureAndInput() (rfb.ScreenCapturer, rfb.InputHandler, error) {
+func setupPlatformCaptureAndInput() (rfb.ScreenCapturer, rfb.InputHandler, rfb.CursorProvider, error) {
 	cap, err := capture.NewScreenCapture()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if err := cap.Init(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	inj, err := input.NewInputInjector()
 	if err != nil {
 		cap.Close()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if err := inj.Init(); err != nil {
 		cap.Close()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	log.Println("using X11 screen capture and input injection")
 	w, h := cap.Bounds()
 	log.Printf("display resolution: %dx%d", w, h)
 
-	return cap, &inputInjectorAdapter{injector: inj}, nil
+	return cap, &inputInjectorAdapter{injector: inj}, nil, nil
 }
