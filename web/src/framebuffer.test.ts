@@ -36,17 +36,19 @@ describe('Framebuffer', () => {
     expect(fb.pixels[offset]).toBe(255);
     expect(fb.pixels[offset + 1]).toBe(0);
 
-    // Check pixel at (0, 0) — should be unchanged (black/transparent)
-    expect(fb.pixels[0]).toBe(0);
+    // Pixel at (0, 0) was never written — stays magenta (undecoded sentinel)
+    expect(fb.pixels[0]).toBe(255);
+    expect(fb.pixels[2]).toBe(255);
   });
 
   it('tracks dirty rectangles', () => {
     const fb = new Framebuffer(100, 100);
-    expect(fb.dirtyRects.length).toBe(0);
+    expect(fb.dirtyRects.length).toBe(1);
+    expect(fb.dirtyRects[0]).toEqual({ x: 0, y: 0, w: 100, h: 100 });
 
     fb.markDirty(10, 20, 30, 40);
-    expect(fb.dirtyRects.length).toBe(1);
-    expect(fb.dirtyRects[0]).toEqual({ x: 10, y: 20, w: 30, h: 40 });
+    expect(fb.dirtyRects.length).toBe(2);
+    expect(fb.dirtyRects[1]).toEqual({ x: 10, y: 20, w: 30, h: 40 });
 
     fb.clearDirty();
     expect(fb.dirtyRects.length).toBe(0);
@@ -62,8 +64,9 @@ describe('Framebuffer', () => {
     expect(fb.height).toBe(150);
     expect(fb.pixels.length).toBe(200 * 150 * 4);
     expect(fb.dirtyRects.length).toBe(0);
-    // Pixel data should be zeroed after resize
-    expect(fb.pixels[0]).toBe(0);
+    // Resize clears to magenta fill (same undecoded sentinel as constructor)
+    expect(fb.pixels[0]).toBe(255);
+    expect(fb.pixels[2]).toBe(255);
   });
 
   it('copies a region within the framebuffer', () => {

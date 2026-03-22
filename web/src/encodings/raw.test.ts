@@ -18,6 +18,7 @@ describe('decodeRaw', () => {
       u8[i + 3] = 255;  // A
     }
 
+    fb.clearDirty();
     decodeRaw(fb, header, new DataView(pixels));
 
     // Check pixel at (2, 3) in framebuffer
