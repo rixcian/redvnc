@@ -518,10 +518,10 @@ export class VncClient {
   }
 
   private async performReconnect(): Promise<void> {
-    // Re-init decoders (reset tight worker streams instead of recreating)
-    this.tightDecoder.reset();
+    // Re-init decoders
     await Promise.all([
       this.zlibDecoder.init(),
+      this.tightDecoder.init(),
       this.zrleDecoder.init(),
     ]);
 

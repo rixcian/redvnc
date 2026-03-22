@@ -2,156 +2,24 @@ import type { Framebuffer } from '../framebuffer';
 import type { RectHeader } from '../types';
 import { readCompactLength } from '../rfb-parser';
 
-interface TileUpdate {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  pixels: ArrayBuffer;
-}
-
 /**
- * Decode Tight encoding using a Web Worker.
+ * Decode Tight encoding on the main thread with minimal allocations.
  *
- * All pako zlib decompression and RGB→RGBA conversion runs off the main
- * thread, freeing it to process incoming WebSocket messages without blocking.
- * The worker maintains the 4 persistent zlib streams required by the Tight
- * encoding specification.
- *
- * Falls back to synchronous main-thread decoding if the worker fails to
- * initialize (e.g. in environments without Worker support).
+ * Key optimizations:
+ * - Direct framebuffer writes (writeRectRGB/fillRect) avoid intermediate buffers
+ * - JPEG decodes collected and resolved in parallel via Promise.allSettled
+ * - Zlib stream output position reset avoids stale data (pako 2.x workaround)
  */
 export class TightDecoder {
-  private worker: Worker | null = null;
-  private pending = new Map<number, { resolve: () => void; reject: (err: Error) => void }>();
-  private nextId = 0;
-  private fb: Framebuffer | null = null;
-  private workerReady = false;
-
-  // Fallback: main-thread decoder (used if worker unavailable)
   private pako: typeof import('pako') | null = null;
   private streams: (import('pako').Inflate | null)[] = [null, null, null, null];
 
   async init(): Promise<void> {
-    try {
-      this.worker = new Worker(
-        new URL('./tight-worker.ts', import.meta.url),
-        { type: 'module' },
-      );
-
-      // Set up message handler
-      this.worker.onmessage = (e: MessageEvent) => {
-        const msg = e.data;
-
-        if (msg.type === 'ready') {
-          this.workerReady = true;
-          return;
-        }
-
-        if (msg.type === 'decoded') {
-          const { id, tiles } = msg as { id: number; tiles: TileUpdate[] };
-          if (this.fb) {
-            for (const tile of tiles) {
-              this.fb.writeRect(tile.x, tile.y, tile.w, tile.h, new Uint8Array(tile.pixels));
-            }
-          }
-          this.pending.get(id)?.resolve();
-          this.pending.delete(id);
-          return;
-        }
-
-        if (msg.type === 'error') {
-          const { id, error } = msg;
-          console.warn('Tight worker decode error:', error);
-          this.pending.get(id)?.resolve(); // resolve, not reject — don't break FBU chain
-          this.pending.delete(id);
-        }
-      };
-
-      this.worker.onerror = (err) => {
-        console.warn('Tight worker error, falling back to main thread:', err);
-        this.workerReady = false;
-        this.worker = null;
-        // Resolve all pending requests so the FBU pipeline doesn't stall
-        for (const [, p] of this.pending) p.resolve();
-        this.pending.clear();
-      };
-
-      // Initialize pako in the worker
-      this.worker.postMessage({ type: 'init' });
-
-      // Wait for worker to be ready (with timeout)
-      await new Promise<void>((resolve) => {
-        const check = () => {
-          if (this.workerReady) { resolve(); return; }
-          setTimeout(check, 5);
-        };
-        check();
-        // Timeout after 3 seconds — fall back to main thread
-        setTimeout(() => { resolve(); }, 3000);
-      });
-    } catch {
-      console.warn('Failed to create Tight worker, using main thread fallback');
-      this.worker = null;
-    }
-
-    // Always init fallback decoder (used if worker fails mid-session)
     this.pako = await import('pako');
     for (let i = 0; i < 4; i++) {
       this.streams[i] = new this.pako.Inflate();
     }
   }
-
-  /**
-   * Reset decoder state (e.g. on reconnect).
-   */
-  reset(): void {
-    if (this.worker && this.workerReady) {
-      this.worker.postMessage({ type: 'reset' });
-    }
-    if (this.pako) {
-      for (let i = 0; i < 4; i++) {
-        this.streams[i] = new this.pako.Inflate();
-      }
-    }
-  }
-
-  async decode(fb: Framebuffer, header: RectHeader, data: DataView): Promise<void> {
-    this.fb = fb;
-
-    if (this.worker && this.workerReady) {
-      return this.decodeInWorker(header, data);
-    }
-
-    // Fallback: main-thread decode
-    return this.decodeMainThread(fb, header, data);
-  }
-
-  private decodeInWorker(header: RectHeader, data: DataView): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      const id = this.nextId++;
-
-      // Copy the rect data into a transferable ArrayBuffer
-      const buf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-
-      this.pending.set(id, { resolve, reject });
-
-      this.worker!.postMessage(
-        {
-          type: 'decode',
-          id,
-          x: header.x,
-          y: header.y,
-          width: header.width,
-          height: header.height,
-          data: buf,
-        },
-        [buf],
-      );
-    });
-  }
-
-  // ── Main-thread fallback (same logic as before worker migration) ──
 
   private decompressStream(streamIdx: number, compressed: Uint8Array): Uint8Array {
     const inflater = this.streams[streamIdx];
@@ -192,7 +60,7 @@ export class TightDecoder {
     return result;
   }
 
-  private async decodeMainThread(fb: Framebuffer, header: RectHeader, data: DataView): Promise<void> {
+  async decode(fb: Framebuffer, header: RectHeader, data: DataView): Promise<void> {
     if (!this.pako) return;
 
     const { x, y, width, height } = header;
@@ -216,12 +84,14 @@ export class TightDecoder {
         const subType = control & 0x0f;
 
         if (subType === 0x08) {
+          // Solid fill — direct to framebuffer, zero allocation
           const r = data.getUint8(offset);
           const g = data.getUint8(offset + 1);
           const b = data.getUint8(offset + 2);
           offset += 3;
           fb.fillRect(x + tx, y + ty, tileW, tileH, r, g, b);
         } else if (subType === 0x09) {
+          // JPEG — defer to parallel batch
           const { length, bytesRead } = readCompactLength(data, offset);
           offset += bytesRead;
 
@@ -234,6 +104,7 @@ export class TightDecoder {
             dx: x + tx, dy: y + ty, w: tileW, h: tileH,
           });
         } else {
+          // Basic zlib — decompress and write RGB directly to framebuffer
           const streamIdx = subType & 0x03;
           const { length, bytesRead } = readCompactLength(data, offset);
           offset += bytesRead;

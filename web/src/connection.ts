@@ -50,28 +50,44 @@ export class VncConnection {
 
         const chunk = new Uint8Array(data);
 
-        // Extension messages from the proxy are always sent as complete
-        // WebSocket messages (they bypass the TCP relay). Detect and
-        // dispatch them immediately to avoid mixing them into the
-        // reassembly buffer for RFB stream data.
-        if (this.bufferUsed === 0 && chunk[0] >= 128 && chunk.length >= 5) {
+        // FAST PATH: When the reassembly buffer is empty, the proxy has sent
+        // a complete RFB message as a single WebSocket frame. Dispatch it
+        // directly without buffering or scanning for message boundaries.
+        // This eliminates expensive tryGetMessageLength() calls that scan
+        // through all Tight tiles (~510 per full-screen FBU) just to find
+        // the message length — work that's unnecessary when the proxy already
+        // guarantees complete messages.
+        if (this.bufferUsed === 0) {
           const peekView = new DataView(data);
-          const payloadLen = peekView.getUint32(1);
-          if (chunk.length === 5 + payloadLen) {
-            if (!initResolved && chunk[0] === ExtSessionInit) {
-              initResolved = true;
-              resolve(parseSessionInit(peekView));
+          const msgType = chunk[0];
+
+          // Extension messages
+          if (msgType >= 128 && chunk.length >= 5) {
+            const payloadLen = peekView.getUint32(1);
+            if (chunk.length === 5 + payloadLen) {
+              if (!initResolved && msgType === ExtSessionInit) {
+                initResolved = true;
+                resolve(parseSessionInit(peekView));
+                return;
+              }
+              this.messageHandler?.(msgType, peekView);
               return;
             }
-            this.messageHandler?.(chunk[0], peekView);
+          } else if (msgType <= 3) {
+            // Standard RFB message types (0=FBUpdate, 1=ColourMap, 2=Bell, 3=CutText).
+            // The proxy sends each as a complete WebSocket frame, so we can
+            // dispatch directly without scanning for message boundaries.
+            // This skips the expensive tryGetMessageLength() which would scan
+            // through all ~510 Tight tiles per FBU.
+            this.messageHandler?.(msgType, peekView);
             return;
           }
         }
 
-        // Append to reassembly buffer, growing capacity as needed
+        // SLOW PATH: Buffer incomplete data for reassembly.
+        // This handles edge cases where messages span WebSocket frames.
         const needed = this.bufferUsed + chunk.length;
         if (needed > this.buffer.length) {
-          // Grow by 2x or to needed size, whichever is larger
           const newSize = Math.max(this.buffer.length * 2, needed);
           const newBuf = new Uint8Array(newSize);
           if (this.bufferUsed > 0) {
@@ -88,7 +104,6 @@ export class VncConnection {
           const remaining = this.bufferUsed - consumed;
           const bufView = this.buffer.subarray(consumed, this.bufferUsed);
 
-          // Check for extension messages at the head of the buffer
           if (bufView[0] >= 128 && remaining >= 5) {
             const extView = new DataView(this.buffer.buffer, this.buffer.byteOffset + consumed, remaining);
             const payloadLen = extView.getUint32(1);
@@ -110,7 +125,7 @@ export class VncConnection {
 
           const msgLen = tryGetMessageLength(bufView);
           if (msgLen === -1 || msgLen > remaining) {
-            break; // Need more data
+            break;
           }
 
           const msgBytes = this.buffer.slice(consumed, consumed + msgLen);
@@ -122,7 +137,6 @@ export class VncConnection {
           this.messageHandler?.(msgType, view);
         }
 
-        // Compact: shift unconsumed data to the front
         if (consumed > 0) {
           if (consumed < this.bufferUsed) {
             this.buffer.copyWithin(0, consumed, this.bufferUsed);

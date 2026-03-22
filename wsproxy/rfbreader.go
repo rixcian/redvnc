@@ -18,6 +18,11 @@ type rfbReader struct {
 	mu          sync.Mutex
 	bpp         int // bytes per pixel (e.g. 4 for 32bpp)
 	tightCPixel int // CPIXEL size for Tight encoding (3 for 32bpp/24depth/truecolour)
+
+	// Reusable scratch buffers to avoid per-tile allocations.
+	// At 510 tiles per 1920x1080 FBU, this eliminates ~510 allocs/frame.
+	rectHdr  [12]byte
+	copyBuf  [64 * 64 * 4]byte // max tile size: 64x64 * 4bpp
 }
 
 func newRFBReader(br *bufio.Reader, bitsPerPixel, depth, trueColour uint8) *rfbReader {
@@ -95,15 +100,14 @@ func (r *rfbReader) readFramebufferUpdate(bpp, cpixel int) ([]byte, error) {
 
 	for i := 0; i < numRects; i++ {
 		// rect header: x(2)+y(2)+w(2)+h(2)+encoding(4) = 12 bytes
-		rectHdr := make([]byte, 12)
-		if _, err := io.ReadFull(r.br, rectHdr); err != nil {
+		if _, err := io.ReadFull(r.br, r.rectHdr[:]); err != nil {
 			return nil, fmt.Errorf("rect header %d/%d: %w", i, numRects, err)
 		}
-		buf.Write(rectHdr)
+		buf.Write(r.rectHdr[:])
 
-		w := int(binary.BigEndian.Uint16(rectHdr[4:6]))
-		h := int(binary.BigEndian.Uint16(rectHdr[6:8]))
-		enc := int32(binary.BigEndian.Uint32(rectHdr[8:12]))
+		w := int(binary.BigEndian.Uint16(r.rectHdr[4:6]))
+		h := int(binary.BigEndian.Uint16(r.rectHdr[6:8]))
+		enc := int32(binary.BigEndian.Uint32(r.rectHdr[8:12]))
 
 		if err := r.readEncodingData(&buf, w, h, enc, bpp, cpixel); err != nil {
 			return nil, fmt.Errorf("encoding data rect %d/%d enc=%d: %w", i, numRects, enc, err)
@@ -256,6 +260,18 @@ func (r *rfbReader) readExact(buf *bytes.Buffer, n int) error {
 	if n <= 0 {
 		return nil
 	}
+	// Use the scratch buffer for reads that fit (avoids allocation).
+	// Most Tight tile reads are small enough (max ~12KB decompressed,
+	// but compressed data + control bytes are much smaller).
+	if n <= len(r.copyBuf) {
+		s := r.copyBuf[:n]
+		if _, err := io.ReadFull(r.br, s); err != nil {
+			return err
+		}
+		buf.Write(s)
+		return nil
+	}
+	// Large reads: allocate
 	data := make([]byte, n)
 	if _, err := io.ReadFull(r.br, data); err != nil {
 		return err
