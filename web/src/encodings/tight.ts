@@ -12,10 +12,6 @@ export class TightDecoder {
   private pako: typeof import('pako') | null = null;
   private streams: (import('pako').Inflate | null)[] = [null, null, null, null];
 
-  // Pre-allocated tile buffer to avoid per-tile allocation (max 64x64 RGBA)
-  private tileBuffer = new Uint8Array(64 * 64 * 4);
-  private tileBuffer32 = new Uint32Array(this.tileBuffer.buffer);
-
   async init(): Promise<void> {
     this.pako = await import('pako');
     for (let i = 0; i < 4; i++) {
@@ -115,17 +111,13 @@ export class TightDecoder {
         const subType = control & 0x0f;
 
         if (subType === 0x08) {
-          // Solid fill: use Uint32Array.fill for ~4x speedup over per-pixel loop
+          // Solid fill: write directly to framebuffer via fillRect
           const r = data.getUint8(offset);
           const g = data.getUint8(offset + 1);
           const b = data.getUint8(offset + 2);
           offset += 3;
 
-          const pixelCount = tileW * tileH;
-          // Pack RGBA into a single 32-bit value (little-endian: ABGR)
-          const rgba32 = (255 << 24) | (b << 16) | (g << 8) | r;
-          this.tileBuffer32.fill(rgba32, 0, pixelCount);
-          fb.writeRect(x + tx, y + ty, tileW, tileH, this.tileBuffer.subarray(0, pixelCount * 4));
+          fb.fillRect(x + tx, y + ty, tileW, tileH, r, g, b);
         } else if (subType === 0x09) {
           // JPEG: parse data now but defer decode to parallel batch
           const { length, bytesRead } = readCompactLength(data, offset);
@@ -153,19 +145,8 @@ export class TightDecoder {
 
           const decompressed = this.decompressStream(streamIdx, compressed);
 
-          // Tight basic uses 3-byte RGB pixels (CPIXEL for 32bpp/24depth).
-          // Write into pre-allocated tile buffer to avoid per-tile allocation.
-          const pixelCount = tileW * tileH;
-          const buf = this.tileBuffer;
-          for (let i = 0; i < pixelCount; i++) {
-            const i3 = i * 3;
-            const i4 = i * 4;
-            buf[i4] = decompressed[i3];
-            buf[i4 + 1] = decompressed[i3 + 1];
-            buf[i4 + 2] = decompressed[i3 + 2];
-            buf[i4 + 3] = 255;
-          }
-          fb.writeRect(x + tx, y + ty, tileW, tileH, buf.subarray(0, pixelCount * 4));
+          // Write 3-byte RGB directly to framebuffer (avoids intermediate copy)
+          fb.writeRectRGB(x + tx, y + ty, tileW, tileH, decompressed);
         }
       }
     }

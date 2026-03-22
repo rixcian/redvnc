@@ -338,16 +338,12 @@ export class VncClient {
         // Serialize FBU processing via a promise chain. Each FBU waits for
         // the previous one to finish (including async JPEG decodes) before
         // starting. This prevents interleaved writes to the framebuffer.
-        // The .catch ensures the chain never breaks — if one FBU fails,
-        // we still request the next update so the client doesn't freeze.
+        // The next FBU request is sent at the START of handleFramebufferUpdate
+        // (before decoding) to pipeline server encoding with client decoding.
         this.fbuQueue = this.fbuQueue.then(
           () => this.handleFramebufferUpdate(msg as import('./rfb-parser').FramebufferUpdateMessage),
         ).catch((err) => {
           console.error('FBU processing error:', err);
-          // Ensure we always request the next update even on catastrophic failure
-          this.connection.send(
-            writeFramebufferUpdateRequest(true, 0, 0, this._width, this._height),
-          );
         });
         break;
       case MsgBell:
@@ -388,6 +384,14 @@ export class VncClient {
 
     this._fbuTimestamps.push(performance.now());
 
+    // Request next FBU immediately BEFORE decoding. This pipelines server
+    // encoding with client decoding — the server starts preparing the next
+    // frame while we're still processing the current one. Without this,
+    // we pay a full round-trip delay between each frame.
+    this.connection.send(
+      writeFramebufferUpdateRequest(true, 0, 0, this._width, this._height),
+    );
+
     const asyncTasks: Promise<void>[] = [];
 
     for (const rect of msg.rectangles) {
@@ -407,8 +411,6 @@ export class VncClient {
             this.zlibDecoder.decode(this.framebuffer, header, data);
             break;
           case EncodingTight:
-            // Tight may be async (JPEG decode). Collect the promise so we
-            // wait for all tiles to finish before requesting the next update.
             asyncTasks.push(this.tightDecoder.decode(this.framebuffer, header, data));
             break;
           case EncodingZRLE:
@@ -423,12 +425,9 @@ export class VncClient {
         }
       } catch (err) {
         console.warn('Decode error for rect', header, err);
-        // Continue decoding remaining rectangles
       }
     }
 
-    // Wait for any async decoders (e.g. Tight JPEG) to finish.
-    // Use allSettled so a single JPEG failure doesn't stop the rest.
     if (asyncTasks.length > 0) {
       const results = await Promise.allSettled(asyncTasks);
       for (const r of results) {
@@ -437,12 +436,6 @@ export class VncClient {
         }
       }
     }
-
-    // Always request next incremental update, even if some decodes failed.
-    // Without this, the client would stop receiving updates permanently.
-    this.connection.send(
-      writeFramebufferUpdateRequest(true, 0, 0, this._width, this._height),
-    );
   }
 
   private handleCursor(

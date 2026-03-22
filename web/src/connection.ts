@@ -12,7 +12,10 @@ export class VncConnection {
   private ws: WebSocket | null = null;
   private messageHandler: MessageHandler | null = null;
   private _connected = false;
+  // Pre-allocated reassembly buffer to avoid per-message allocations.
+  // Grows as needed but never shrinks, reusing capacity across messages.
   private buffer = new Uint8Array(0);
+  private bufferUsed = 0;
 
   get connected(): boolean {
     return this._connected;
@@ -33,7 +36,7 @@ export class VncConnection {
       const ws = new WebSocket(wsUrl.toString(), 'binary');
       ws.binaryType = 'arraybuffer';
       this.ws = ws;
-      this.buffer = new Uint8Array(0);
+      this.bufferUsed = 0;
 
       let initResolved = false;
 
@@ -51,11 +54,10 @@ export class VncConnection {
         // WebSocket messages (they bypass the TCP relay). Detect and
         // dispatch them immediately to avoid mixing them into the
         // reassembly buffer for RFB stream data.
-        if (this.buffer.length === 0 && chunk[0] >= 128 && chunk.length >= 5) {
+        if (this.bufferUsed === 0 && chunk[0] >= 128 && chunk.length >= 5) {
           const peekView = new DataView(data);
           const payloadLen = peekView.getUint32(1);
           if (chunk.length === 5 + payloadLen) {
-            // Matches extension message format exactly — dispatch directly
             if (!initResolved && chunk[0] === ExtSessionInit) {
               initResolved = true;
               resolve(parseSessionInit(peekView));
@@ -66,24 +68,35 @@ export class VncConnection {
           }
         }
 
-        // Append to reassembly buffer
-        const newBuf = new Uint8Array(this.buffer.length + chunk.length);
-        newBuf.set(this.buffer);
-        newBuf.set(chunk, this.buffer.length);
-        this.buffer = newBuf;
+        // Append to reassembly buffer, growing capacity as needed
+        const needed = this.bufferUsed + chunk.length;
+        if (needed > this.buffer.length) {
+          // Grow by 2x or to needed size, whichever is larger
+          const newSize = Math.max(this.buffer.length * 2, needed);
+          const newBuf = new Uint8Array(newSize);
+          if (this.bufferUsed > 0) {
+            newBuf.set(this.buffer.subarray(0, this.bufferUsed));
+          }
+          this.buffer = newBuf;
+        }
+        this.buffer.set(chunk, this.bufferUsed);
+        this.bufferUsed += chunk.length;
 
         // Extract and dispatch complete messages
-        while (this.buffer.length > 0) {
+        let consumed = 0;
+        while (consumed < this.bufferUsed) {
+          const remaining = this.bufferUsed - consumed;
+          const bufView = this.buffer.subarray(consumed, this.bufferUsed);
+
           // Check for extension messages at the head of the buffer
-          // (can happen if an extension message landed in the buffer)
-          if (this.buffer[0] >= 128 && this.buffer.length >= 5) {
-            const extView = new DataView(this.buffer.buffer, this.buffer.byteOffset, this.buffer.byteLength);
+          if (bufView[0] >= 128 && remaining >= 5) {
+            const extView = new DataView(this.buffer.buffer, this.buffer.byteOffset + consumed, remaining);
             const payloadLen = extView.getUint32(1);
             const extMsgLen = 5 + payloadLen;
-            if (this.buffer.length < extMsgLen) break;
+            if (remaining < extMsgLen) break;
 
-            const msgBytes = this.buffer.slice(0, extMsgLen);
-            this.buffer = this.buffer.slice(extMsgLen);
+            const msgBytes = this.buffer.slice(consumed, consumed + extMsgLen);
+            consumed += extMsgLen;
             const view = new DataView(msgBytes.buffer, msgBytes.byteOffset, msgBytes.byteLength);
 
             if (!initResolved && msgBytes[0] === ExtSessionInit) {
@@ -95,18 +108,26 @@ export class VncConnection {
             continue;
           }
 
-          const msgLen = tryGetMessageLength(this.buffer);
-          if (msgLen === -1 || msgLen > this.buffer.length) {
+          const msgLen = tryGetMessageLength(bufView);
+          if (msgLen === -1 || msgLen > remaining) {
             break; // Need more data
           }
 
-          const msgBytes = this.buffer.slice(0, msgLen);
-          this.buffer = this.buffer.slice(msgLen);
+          const msgBytes = this.buffer.slice(consumed, consumed + msgLen);
+          consumed += msgLen;
 
           const view = new DataView(msgBytes.buffer, msgBytes.byteOffset, msgBytes.byteLength);
           const msgType = view.getUint8(0);
 
           this.messageHandler?.(msgType, view);
+        }
+
+        // Compact: shift unconsumed data to the front
+        if (consumed > 0) {
+          if (consumed < this.bufferUsed) {
+            this.buffer.copyWithin(0, consumed, this.bufferUsed);
+          }
+          this.bufferUsed -= consumed;
         }
       };
 
@@ -118,7 +139,7 @@ export class VncConnection {
 
       ws.onclose = (event: CloseEvent) => {
         this._connected = false;
-        this.buffer = new Uint8Array(0);
+        this.bufferUsed = 0;
         if (!initResolved) {
           reject(new Error(`WebSocket closed: ${event.reason || 'unknown'}`));
         }
@@ -139,7 +160,7 @@ export class VncConnection {
       this.ws.close();
       this.ws = null;
       this._connected = false;
-      this.buffer = new Uint8Array(0);
+      this.bufferUsed = 0;
     }
   }
 }

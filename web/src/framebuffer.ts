@@ -95,6 +95,48 @@ export class Framebuffer {
   }
 
   /**
+   * Write 3-byte RGB pixel data directly into the framebuffer as RGBA.
+   * Avoids an intermediate tile buffer copy for Tight basic encoding.
+   */
+  writeRectRGB(x: number, y: number, width: number, height: number, rgbData: Uint8Array): void {
+    const dst = this._imageData.data;
+    const fbWidth = this._width;
+
+    for (let row = 0; row < height; row++) {
+      const dstBase = ((y + row) * fbWidth + x) * 4;
+      const srcBase = row * width * 3;
+      for (let col = 0; col < width; col++) {
+        const s = srcBase + col * 3;
+        const d = dstBase + col * 4;
+        dst[d] = rgbData[s];
+        dst[d + 1] = rgbData[s + 1];
+        dst[d + 2] = rgbData[s + 2];
+        dst[d + 3] = 255;
+      }
+    }
+
+    this.markDirty(x, y, width, height);
+  }
+
+  /**
+   * Fill a rectangular region with a solid RGBA color.
+   */
+  fillRect(x: number, y: number, width: number, height: number, r: number, g: number, b: number): void {
+    const dst = this._imageData.data;
+    const fbWidth = this._width;
+    // Pack RGBA into a 32-bit value for fast filling (little-endian: ABGR)
+    const dst32 = new Uint32Array(dst.buffer, dst.byteOffset, dst.byteLength / 4);
+    const rgba32 = (255 << 24) | (b << 16) | (g << 8) | r;
+
+    for (let row = 0; row < height; row++) {
+      const dstIdx = (y + row) * fbWidth + x;
+      dst32.fill(rgba32, dstIdx, dstIdx + width);
+    }
+
+    this.markDirty(x, y, width, height);
+  }
+
+  /**
    * Copy a region within the framebuffer from (srcX, srcY) to (dstX, dstY).
    */
   copyRect(srcX: number, srcY: number, dstX: number, dstY: number, width: number, height: number): void {
