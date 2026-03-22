@@ -82,7 +82,7 @@ type GDICapture struct {
 }
 
 func NewScreenCapture() (ScreenCapture, error) {
-	return &GDICapture{}, nil
+	return &DXGICapture{}, nil
 }
 
 func (g *GDICapture) Init() error {
