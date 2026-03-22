@@ -1,3 +1,4 @@
+import { Inflate } from 'fflate';
 import type { Framebuffer } from '../framebuffer';
 import type { RectHeader } from '../types';
 
@@ -6,42 +7,42 @@ import type { RectHeader } from '../types';
  * across multiple rectangles within a connection.
  */
 export class ZlibDecoder {
-  private inflate: import('pako').Inflate | null = null;
+  private inflater: Inflate | null = null;
+  private chunks: Uint8Array[] = [];
+  private firstPush = true;
 
   async init(): Promise<void> {
-    const pako = await import('pako');
-    this.inflate = new pako.Inflate();
+    this.inflater = new Inflate((chunk) => {
+      this.chunks.push(chunk.slice());
+    });
   }
 
   decode(fb: Framebuffer, header: RectHeader, data: DataView): void {
-    if (!this.inflate) {
+    if (!this.inflater) {
       throw new Error('ZlibDecoder not initialized. Call init() first.');
     }
 
     const { x, y, width, height } = header;
     const compressedLen = data.getUint32(0);
-    const compressed = new Uint8Array(data.buffer, data.byteOffset + 4, compressedLen);
+    let compressed = new Uint8Array(data.buffer, data.byteOffset + 4, compressedLen);
 
-    const chunks: Uint8Array[] = [];
-    const origOnData = this.inflate.onData;
-    this.inflate.onData = (chunk: Uint8Array) => { chunks.push(chunk.slice()); };
-
-    this.inflate.push(compressed, 2 /* Z_SYNC_FLUSH */);
-
-    this.inflate.onData = origOnData;
-
-    if (this.inflate.err) {
-      throw new Error(`Zlib inflate error: ${this.inflate.msg}`);
+    // Skip the 2-byte zlib header on the first push
+    if (this.firstPush) {
+      compressed = compressed.subarray(2);
+      this.firstPush = false;
     }
 
+    this.chunks.length = 0;
+    this.inflater.push(compressed, false);
+
     let decompressed: Uint8Array;
-    if (chunks.length === 1) {
-      decompressed = chunks[0];
+    if (this.chunks.length === 1) {
+      decompressed = this.chunks[0];
     } else {
-      const total = chunks.reduce((s, c) => s + c.length, 0);
+      const total = this.chunks.reduce((s, c) => s + c.length, 0);
       decompressed = new Uint8Array(total);
       let off = 0;
-      for (const c of chunks) {
+      for (const c of this.chunks) {
         decompressed.set(c, off);
         off += c.length;
       }
