@@ -17,7 +17,7 @@
     "dist"
   ],
   "scripts": {
-    "dev": "vite serve demo",
+    "dev": "vite serve demo --host",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"

@@ -41,6 +41,9 @@ export class CanvasRenderer {
 
   /**
    * Render dirty regions from the framebuffer to the canvas.
+   *
+   * Coalesces all dirty rectangles into a single bounding-box putImageData
+   * call to avoid visual tearing when many small tiles update at once.
    */
   render(fb: Framebuffer): void {
     if (!this.ctx || !this.canvas) return;
@@ -48,14 +51,27 @@ export class CanvasRenderer {
     const dirtyRects = fb.dirtyRects;
     if (dirtyRects.length === 0) return;
 
-    for (const rect of dirtyRects) {
-      this.ctx.putImageData(
-        fb.imageData,
-        0, 0,
-        rect.x, rect.y,
-        rect.w, rect.h,
-      );
+    // Compute bounding box of all dirty rects
+    let minX = dirtyRects[0].x;
+    let minY = dirtyRects[0].y;
+    let maxX = dirtyRects[0].x + dirtyRects[0].w;
+    let maxY = dirtyRects[0].y + dirtyRects[0].h;
+
+    for (let i = 1; i < dirtyRects.length; i++) {
+      const r = dirtyRects[i];
+      if (r.x < minX) minX = r.x;
+      if (r.y < minY) minY = r.y;
+      if (r.x + r.w > maxX) maxX = r.x + r.w;
+      if (r.y + r.h > maxY) maxY = r.y + r.h;
     }
+
+    // Single putImageData for the entire bounding box
+    this.ctx.putImageData(
+      fb.imageData,
+      0, 0,
+      minX, minY,
+      maxX - minX, maxY - minY,
+    );
 
     fb.clearDirty();
   }
