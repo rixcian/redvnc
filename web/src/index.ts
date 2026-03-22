@@ -308,12 +308,14 @@ export class VncClient {
     }
   }
 
-  private handleFramebufferUpdate(
+  private async handleFramebufferUpdate(
     msg: import('./rfb-parser').FramebufferUpdateMessage,
-  ): void {
+  ): Promise<void> {
     if (!this.framebuffer) return;
 
     this._fbuTimestamps.push(performance.now());
+
+    const asyncTasks: Promise<void>[] = [];
 
     for (const rect of msg.rectangles) {
       const { header, data } = rect;
@@ -331,8 +333,9 @@ export class VncClient {
           this.zlibDecoder.decode(this.framebuffer, header, data);
           break;
         case EncodingTight:
-          // Tight may be async (JPEG decode). Fire and forget for now.
-          this.tightDecoder.decode(this.framebuffer, header, data);
+          // Tight may be async (JPEG decode). Collect the promise so we
+          // wait for all tiles to finish before requesting the next update.
+          asyncTasks.push(this.tightDecoder.decode(this.framebuffer, header, data));
           break;
         case EncodingZRLE:
           this.zrleDecoder.decode(this.framebuffer, header, data);
@@ -344,6 +347,14 @@ export class VncClient {
           this.handleDesktopResize(header);
           break;
       }
+    }
+
+    // Wait for any async decoders (e.g. Tight JPEG) to finish before
+    // requesting the next update. This prevents the server from sending
+    // new rectangles that overwrite tiles still being decoded, which
+    // causes flickering and incomplete rendering at the bottom of the screen.
+    if (asyncTasks.length > 0) {
+      await Promise.all(asyncTasks);
     }
 
     // Request next incremental update
