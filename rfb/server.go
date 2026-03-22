@@ -426,6 +426,11 @@ func (c *ClientConn) serveMessages() error {
 func (c *ClientConn) framebufferWriter() {
 	minInterval := time.Second / time.Duration(c.server.config.MaxFPS)
 
+	// Frame timing: track FPS and per-frame timing breakdown.
+	var frameCount int64
+	var totalCapture, totalEncode, totalSend time.Duration
+	lastReport := time.Now()
+
 	for req := range c.fbReqCh {
 		// Enforce MaxFPS: sleep if the last frame was sent too recently
 		if !c.lastFrameTime.IsZero() {
@@ -435,11 +440,47 @@ func (c *ClientConn) framebufferWriter() {
 			}
 		}
 
-		if err := c.handleFramebufferRequest(req); err != nil {
+		frameStart := time.Now()
+		captureDur, encodeDur, sendDur, err := c.handleFramebufferRequestTimed(req)
+		if err != nil {
 			c.errCh <- err
 			return
 		}
 		c.lastFrameTime = time.Now()
+
+		frameCount++
+		totalCapture += captureDur
+		totalEncode += encodeDur
+		totalSend += sendDur
+
+		// Log timing every 5 seconds
+		if since := time.Since(lastReport); since >= 5*time.Second {
+			fps := float64(frameCount) / since.Seconds()
+			avgCapture := time.Duration(0)
+			avgEncode := time.Duration(0)
+			avgSend := time.Duration(0)
+			avgTotal := time.Duration(0)
+			if frameCount > 0 {
+				avgCapture = totalCapture / time.Duration(frameCount)
+				avgEncode = totalEncode / time.Duration(frameCount)
+				avgSend = totalSend / time.Duration(frameCount)
+				avgTotal = time.Since(frameStart) // just for the log line; use per-frame below
+				_ = avgTotal
+			}
+			c.server.logger.Info("frame timing",
+				"fps", fmt.Sprintf("%.1f", fps),
+				"avg_capture", avgCapture,
+				"avg_encode", avgEncode,
+				"avg_send", avgSend,
+				"avg_frame", (totalCapture+totalEncode+totalSend)/time.Duration(frameCount),
+				"frames", frameCount,
+			)
+			frameCount = 0
+			totalCapture = 0
+			totalEncode = 0
+			totalSend = 0
+			lastReport = time.Now()
+		}
 	}
 }
 
@@ -489,22 +530,34 @@ func (c *ClientConn) supportsDesktopSize() bool {
 	return false
 }
 
-func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) error {
+// handleFramebufferRequestTimed wraps handleFramebufferRequest with timing
+// for capture, encode, and send phases.
+func (c *ClientConn) handleFramebufferRequestTimed(req *FramebufferUpdateRequest) (capture, encode, send time.Duration, err error) {
 	capturer := c.server.config.Capturer
 	if capturer == nil {
-		// Send a blank rectangle
-		return c.sendBlankFrame(req)
+		err = c.sendBlankFrame(req)
+		return
 	}
 
-	pixels, stride, err := capturer.Capture()
-	if err != nil {
-		return fmt.Errorf("capture: %w", err)
+	t0 := time.Now()
+	pixels, stride, captureErr := capturer.Capture()
+	capture = time.Since(t0)
+	if captureErr != nil {
+		err = fmt.Errorf("capture: %w", captureErr)
+		return
 	}
 
-	// Check if the screen has been resized since the last frame.
+	t1 := time.Now()
+	encode, send, err = c.encodeAndSendFrame(req, pixels, stride)
+	_ = t1
+	return
+}
+
+func (c *ClientConn) encodeAndSendFrame(req *FramebufferUpdateRequest, pixels []byte, stride int) (encode, send time.Duration, err error) {
+	capturer := c.server.config.Capturer
 	capW, capH := capturer.Bounds()
 
-	bpp := 4 // 32-bit pixels
+	bpp := 4
 	w := int(req.Width)
 	h := int(req.Height)
 	rectData := make([]byte, 0, w*h*bpp)
@@ -522,7 +575,6 @@ func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) err
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Collect pseudo-encoding rectangles to prepend to the update.
 	var pseudoRects []Rectangle
 
 	// Desktop resize: if the capturer's bounds differ from what we last told the client,
@@ -549,20 +601,28 @@ func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) err
 	bestEnc := c.bestEncoding()
 	c.server.logger.Debug("best encoding", "encoding", bestEnc, "encodings", c.encodings, "tight_available", c.server.config.NewTightEncoder != nil)
 
+	encodeStart := time.Now()
+
 	switch bestEnc {
 	case EncodingTight:
 		if c.tightEnc == nil {
 			c.tightEnc = c.server.config.NewTightEncoder()
 		}
-		rects, err := c.tightEnc.EncodeMulti(req.X, req.Y, req.Width, req.Height, pixels, stride)
-		if err != nil {
-			return fmt.Errorf("tight encode: %w", err)
+		rects, encErr := c.tightEnc.EncodeMulti(req.X, req.Y, req.Width, req.Height, pixels, stride)
+		if encErr != nil {
+			err = fmt.Errorf("tight encode: %w", encErr)
+			return
 		}
 		rects = append(pseudoRects, rects...)
-		if err := WriteFramebufferUpdate(c.bw, rects); err != nil {
-			return err
+		encode = time.Since(encodeStart)
+		sendStart := time.Now()
+		if writeErr := WriteFramebufferUpdate(c.bw, rects); writeErr != nil {
+			err = writeErr
+			return
 		}
-		return c.bw.Flush()
+		err = c.bw.Flush()
+		send = time.Since(sendStart)
+		return
 
 	case EncodingZRLE:
 		// Convert pixels to the client's pixel format first, then extract CPIXELs.
@@ -623,8 +683,9 @@ func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) err
 			}
 		}
 
-		if err := c.zrleWriter.Flush(); err != nil {
-			return fmt.Errorf("zrle zlib flush: %w", err)
+		if flushErr := c.zrleWriter.Flush(); flushErr != nil {
+			err = fmt.Errorf("zrle zlib flush: %w", flushErr)
+			return
 		}
 
 		compressedLen := c.zrleBuf.Len()
@@ -643,26 +704,30 @@ func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) err
 			Data: data,
 		}
 		allRects := append(pseudoRects, rect)
-		if err := WriteFramebufferUpdate(c.bw, allRects); err != nil {
-			return err
+		encode = time.Since(encodeStart)
+		sendStart := time.Now()
+		if writeErr := WriteFramebufferUpdate(c.bw, allRects); writeErr != nil {
+			err = writeErr
+			return
 		}
-		return c.bw.Flush()
+		err = c.bw.Flush()
+		send = time.Since(sendStart)
+		return
 
 	case EncodingZlib:
 		rectData = ConvertPixels(c.pixelFormat, c.server.config.PixelFormat, rectData, w, h)
 
-		// The zlib stream must persist across frames — the client maintains a
-		// single decompressor. Reset only the buffer (not the writer) so the
-		// dictionary is preserved, then Flush (Z_SYNC_FLUSH) instead of Close.
 		c.zlibBuf.Reset()
 		if c.zlibWriter == nil {
 			c.zlibWriter = zlib.NewWriter(&c.zlibBuf)
 		}
-		if _, err := c.zlibWriter.Write(rectData); err != nil {
-			return fmt.Errorf("zlib write: %w", err)
+		if _, zlibErr := c.zlibWriter.Write(rectData); zlibErr != nil {
+			err = fmt.Errorf("zlib write: %w", zlibErr)
+			return
 		}
-		if err := c.zlibWriter.Flush(); err != nil {
-			return fmt.Errorf("zlib flush: %w", err)
+		if zlibErr := c.zlibWriter.Flush(); zlibErr != nil {
+			err = fmt.Errorf("zlib flush: %w", zlibErr)
+			return
 		}
 
 		compressedLen := c.zlibBuf.Len()
@@ -681,10 +746,15 @@ func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) err
 			Data: data,
 		}
 		allRects := append(pseudoRects, rect)
-		if err := WriteFramebufferUpdate(c.bw, allRects); err != nil {
-			return err
+		encode = time.Since(encodeStart)
+		sendStart := time.Now()
+		if writeErr := WriteFramebufferUpdate(c.bw, allRects); writeErr != nil {
+			err = writeErr
+			return
 		}
-		return c.bw.Flush()
+		err = c.bw.Flush()
+		send = time.Since(sendStart)
+		return
 
 	default:
 		rectData = ConvertPixels(c.pixelFormat, c.server.config.PixelFormat, rectData, w, h)
@@ -701,10 +771,15 @@ func (c *ClientConn) handleFramebufferRequest(req *FramebufferUpdateRequest) err
 		}
 
 		allRects := append(pseudoRects, rect)
-		if err := WriteFramebufferUpdate(c.bw, allRects); err != nil {
-			return err
+		encode = time.Since(encodeStart)
+		sendStart := time.Now()
+		if writeErr := WriteFramebufferUpdate(c.bw, allRects); writeErr != nil {
+			err = writeErr
+			return
 		}
-		return c.bw.Flush()
+		err = c.bw.Flush()
+		send = time.Since(sendStart)
+		return
 	}
 }
 
