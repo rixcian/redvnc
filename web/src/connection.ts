@@ -50,19 +50,34 @@ export class VncConnection {
 
         const chunk = new Uint8Array(data);
 
-        // FAST PATH: Extension messages are sent as complete WebSocket frames
-        // by the proxy (they bypass the raw TCP relay). Dispatch them directly
-        // without buffering.
-        if (this.bufferUsed === 0 && chunk[0] >= 128 && chunk.length >= 5) {
+        // FAST PATH: When the reassembly buffer is empty, the proxy has sent
+        // a complete RFB message as a single WebSocket frame. Dispatch it
+        // directly without buffering or scanning for message boundaries.
+        // This eliminates expensive tryGetMessageLength() calls that scan
+        // through all Tight tiles (~510 per full-screen FBU) just to find
+        // the message length — work that's unnecessary when the proxy already
+        // guarantees complete messages.
+        if (this.bufferUsed === 0) {
           const peekView = new DataView(data);
-          const payloadLen = peekView.getUint32(1);
-          if (chunk.length === 5 + payloadLen) {
-            if (!initResolved && chunk[0] === ExtSessionInit) {
-              initResolved = true;
-              resolve(parseSessionInit(peekView));
+          const msgType = chunk[0];
+
+          // Extension messages
+          if (msgType >= 128 && chunk.length >= 5) {
+            const payloadLen = peekView.getUint32(1);
+            if (chunk.length === 5 + payloadLen) {
+              if (!initResolved && msgType === ExtSessionInit) {
+                initResolved = true;
+                resolve(parseSessionInit(peekView));
+                return;
+              }
+              this.messageHandler?.(msgType, peekView);
               return;
             }
-            this.messageHandler?.(chunk[0], peekView);
+          } else if (msgType <= 3) {
+            // Standard RFB message types (0=FBUpdate, 1=ColourMap, 2=Bell, 3=CutText).
+            // The proxy sends each as a complete WebSocket frame, so we can
+            // dispatch directly without scanning for message boundaries.
+            this.messageHandler?.(msgType, peekView);
             return;
           }
         }

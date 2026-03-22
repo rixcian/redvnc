@@ -32,8 +32,7 @@ type Proxy struct {
 	session   *Session
 	server    *Server
 	rfbReader *rfbReader
-	tcpReader *bufio.Reader // shared buffered reader for TCP→WS relay
-	authType  uint8         // RFB security type used (1=None, 2=VNCAuth)
+	authType  uint8 // RFB security type used (1=None, 2=VNCAuth)
 }
 
 // NewProxy creates a new proxy for the given session.
@@ -77,9 +76,8 @@ func (p *Proxy) Run(ctx context.Context) {
 
 	p.server.logger.Info("handshake complete", "session_id", p.session.ID, "width", serverInit.Width, "height", serverInit.Height, "name", serverInit.Name)
 
-	// Store the buffered reader for raw TCP→WS relay.
-	// Also create RFB reader for SetPixelFormat tracking (browser→VNC path).
-	p.tcpReader = br
+	// Create RFB message reader using the server's initial pixel format.
+	// This is updated when the client sends SetPixelFormat.
 	pf := serverInit.PixelFormat
 	p.rfbReader = newRFBReader(br, pf.BitsPerPixel, pf.Depth, pf.TrueColour)
 
@@ -274,31 +272,25 @@ func (p *Proxy) sendSessionInit(ctx context.Context, init *rfb.ServerInit) error
 	return p.session.WSConn.Write(ctx, websocket.MessageBinary, buf)
 }
 
-// relayVNCToBrowser forwards raw TCP bytes from the VNC server to the browser
-// as WebSocket messages. Unlike message-aware relay, this does NOT parse RFB
-// message boundaries — it sends data as soon as it's available from the TCP
-// buffer. The browser's reassembly buffer handles message framing.
-//
-// This reduces proxy latency by eliminating tile-by-tile Tight parsing and
-// the need to buffer entire FBU messages before forwarding.
+// relayVNCToBrowser reads complete RFB messages from the TCP connection and
+// writes each as a single WebSocket message. This ensures the browser always
+// receives properly framed RFB messages regardless of TCP chunking.
 func (p *Proxy) relayVNCToBrowser(ctx context.Context) {
-	buf := make([]byte, 128*1024) // 128KB read buffer
 	for {
-		n, err := p.tcpReader.Read(buf)
-		if n > 0 {
-			p.session.TouchActivity()
-			p.session.BytesToClient.Add(int64(n))
-
-			if writeErr := p.session.WSConn.Write(ctx, websocket.MessageBinary, buf[:n]); writeErr != nil {
-				if ctx.Err() == nil {
-					p.server.logger.Warn("WS write error", "session_id", p.session.ID, "error", writeErr)
-				}
-				return
-			}
-		}
+		msg, err := p.rfbReader.ReadMessage()
 		if err != nil {
 			if ctx.Err() == nil {
 				p.server.logger.Warn("VNC read error", "session_id", p.session.ID, "error", err)
+			}
+			return
+		}
+
+		p.session.TouchActivity()
+		p.session.BytesToClient.Add(int64(len(msg)))
+
+		if err := p.session.WSConn.Write(ctx, websocket.MessageBinary, msg); err != nil {
+			if ctx.Err() == nil {
+				p.server.logger.Warn("WS write error", "session_id", p.session.ID, "error", err)
 			}
 			return
 		}
