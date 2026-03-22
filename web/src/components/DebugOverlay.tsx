@@ -13,6 +13,12 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function formatRate(bytesPerSec: number): string {
+  if (bytesPerSec < 1024) return `${Math.round(bytesPerSec)} B/s`;
+  if (bytesPerSec < 1024 * 1024) return `${(bytesPerSec / 1024).toFixed(1)} KB/s`;
+  return `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
+}
+
 export const DebugOverlay: React.FC<DebugOverlayProps> = ({ client, visible }) => {
   const [stats, setStats] = useState<ConnectionStats | null>(null);
 
@@ -66,6 +72,7 @@ export const DebugOverlay: React.FC<DebugOverlayProps> = ({ client, visible }) =
       <Row label="Auth" value={stats.authType} />
       <Row label="Renderer" value={client?.rendererType ?? 'unknown'} />
       <Row label="FPS" value={String(stats.fps)} />
+      <Row label="Data rate" value={formatRate(stats.dataRate)} />
       <Row label="Data received" value={formatBytes(stats.bytesReceived)} />
       <Row label="Total rects" value={stats.totalRectangles.toLocaleString()} />
 

@@ -102,6 +102,7 @@ export class VncClient {
   private _totalRectangles = 0;
   private _bytesReceived = 0;
   private _fbuTimestamps: number[] = []; // timestamps of recent FramebufferUpdate messages
+  private _bytesReceivedSamples: { time: number; bytes: number }[] = []; // for data rate calculation
 
   private eventHandlers: { [K in keyof VncEventMap]?: VncEventMap[K][] } = {};
   private rafId: number | null = null;
@@ -157,6 +158,19 @@ export class VncClient {
     this._fbuTimestamps = this._fbuTimestamps.filter(t => t > cutoff);
     const fps = this._fbuTimestamps.length;
 
+    // Calculate data rate over the last 2 seconds
+    const rateCutoff = now - 2000;
+    this._bytesReceivedSamples = this._bytesReceivedSamples.filter(s => s.time > rateCutoff);
+    const samples = this._bytesReceivedSamples;
+    let dataRate = 0;
+    if (samples.length >= 2) {
+      const oldest = samples[0];
+      const newest = samples[samples.length - 1];
+      const timeDelta = (newest.time - oldest.time) / 1000; // seconds
+      const bytesDelta = newest.bytes - oldest.bytes;
+      dataRate = timeDelta > 0 ? bytesDelta / timeDelta : 0;
+    }
+
     const encodings: Record<string, number> = {};
     for (const [enc, count] of Object.entries(this._encodingCounts)) {
       const name = ENCODING_NAMES[Number(enc)] ?? `Unknown(${enc})`;
@@ -171,6 +185,7 @@ export class VncClient {
       fps,
       totalRectangles: this._totalRectangles,
       bytesReceived: this._bytesReceived,
+      dataRate,
     };
   }
 
@@ -179,6 +194,7 @@ export class VncClient {
     this._totalRectangles = 0;
     this._bytesReceived = 0;
     this._fbuTimestamps = [];
+    this._bytesReceivedSamples = [];
   }
 
   async connect(): Promise<void> {
@@ -306,6 +322,7 @@ export class VncClient {
 
   private handleMessage(type: number, view: DataView): void {
     this._bytesReceived += view.byteLength;
+    this._bytesReceivedSamples.push({ time: performance.now(), bytes: this._bytesReceived });
 
     let msg;
     try {

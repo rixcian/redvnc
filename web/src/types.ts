@@ -63,6 +63,8 @@ export interface ConnectionStats {
   fps: number;
   totalRectangles: number;
   bytesReceived: number;
+  /** Data rate in bytes per second (measured over the last 2 seconds). */
+  dataRate: number;
 }
 
 export interface RectHeader {

@@ -22,14 +22,33 @@ export class TightDecoder {
   /**
    * Decompress data using a persistent zlib stream.
    *
-   * pako 2.x only calls onData when the internal output buffer is completely
-   * full (avail_out === 0) or on Z_STREAM_END.  With Z_SYNC_FLUSH on small
-   * tiles (e.g. 12 KB << 64 KB default buffer), onData is never called and the
-   * decompressed data stays in strm.output.  We extract it directly after push.
+   * pako 2.x quirks with Z_SYNC_FLUSH that we must work around:
+   *
+   * 1. onData is only called when the internal 64KB output buffer is completely
+   *    full (avail_out === 0) or on Z_STREAM_END.  Small tiles (~12KB) never
+   *    trigger onData — the data stays in strm.output.
+   *
+   * 2. strm.next_out and strm.avail_out are NOT reset between push() calls.
+   *    They accumulate across pushes, so without intervention, output from
+   *    previous tiles bleeds into the current extraction window.
+   *
+   * Fix: reset strm.next_out/avail_out before each push so output always
+   * starts at offset 0, then extract strm.output[0..next_out] after push.
+   * The zlib dictionary state (strm.state) is unaffected by this reset.
    */
   private decompressStream(streamIdx: number, compressed: Uint8Array): Uint8Array {
     const inflater = this.streams[streamIdx];
     if (!inflater) throw new Error('TightDecoder not initialized');
+
+    const strm = (inflater as any).strm;
+
+    // Reset the output write position so this push's data starts at offset 0.
+    // Without this, next_out accumulates across pushes and we'd extract stale
+    // data from previous tiles along with the current tile's data.
+    if (strm && strm.output) {
+      strm.next_out = 0;
+      strm.avail_out = strm.output.length;
+    }
 
     // Collect output chunks produced by onData (called when internal buffer fills)
     const chunks: Uint8Array[] = [];
@@ -46,7 +65,6 @@ export class TightDecoder {
 
     // Extract any remaining data from pako's internal output buffer that
     // wasn't flushed via onData (the common case for small tiles).
-    const strm = (inflater as any).strm;
     if (strm && strm.next_out > 0) {
       chunks.push(new Uint8Array(strm.output.buffer, strm.output.byteOffset, strm.next_out).slice());
     }
