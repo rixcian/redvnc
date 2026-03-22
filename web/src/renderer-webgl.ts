@@ -20,13 +20,10 @@ void main() {
 }`;
 
 /**
- * WebGL 2 renderer that uploads the full framebuffer as a GPU texture each
- * frame. This is simpler and more robust than per-dirty-rect texSubImage2D:
+ * WebGL 2 renderer that uploads framebuffer data as a GPU texture.
  *
- *  - A single texImage2D call replaces 500+ texSubImage2D calls per frame
- *  - No pixel extraction loops or sub-rect buffer allocations
- *  - Eliminates any possibility of stale/partial texture regions
- *  - GPU handles the ~8 MB upload efficiently via DMA
+ * Uses an adaptive strategy: texSubImage2D for incremental updates (few
+ * dirty rects) and full texImage2D when most of the screen changed.
  *
  * The GPU does all the scaling via the fullscreen-quad shader, replacing
  * the CSS objectFit: contain approach used by Canvas2D.
@@ -170,12 +167,13 @@ export class WebGLRenderer implements IRenderer {
   }
 
   /**
-   * Upload the entire framebuffer to the GPU texture and draw.
+   * Upload changed regions to the GPU texture and draw.
    *
-   * We upload the full ImageData every frame instead of tracking dirty rects
-   * because a single texImage2D with the full buffer (~8 MB for 1920x1080)
-   * is faster than hundreds of texSubImage2D calls with pixel-extraction
-   * loops, and eliminates any possibility of stale texture regions.
+   * Strategy: use texSubImage2D for incremental updates (few dirty rects)
+   * and fall back to full texImage2D when most of the screen changed.
+   * For a 1920x1080 display, the full upload is ~8 MB. When only a few
+   * tiles changed (e.g. cursor movement, partial screen update), uploading
+   * just those rects via texSubImage2D is significantly faster.
    */
   render(fb: Framebuffer): void {
     const gl = this.gl;
@@ -186,19 +184,54 @@ export class WebGLRenderer implements IRenderer {
 
     gl.bindTexture(gl.TEXTURE_2D, this.texture);
 
-    // Upload the full framebuffer as a single GPU texture
-    // Use Uint8Array view of the same buffer to avoid Uint8ClampedArray overhead
-    const pixels = new Uint8Array(
-      fb.imageData.data.buffer,
-      fb.imageData.data.byteOffset,
-      fb.imageData.data.byteLength,
-    );
-    gl.texImage2D(
-      gl.TEXTURE_2D, 0, gl.RGBA,
-      fb.width, fb.height, 0,
-      gl.RGBA, gl.UNSIGNED_BYTE,
-      pixels,
-    );
+    // Heuristic: if dirty area covers >30% of framebuffer, full upload is cheaper
+    // than many texSubImage2D calls (avoids per-rect overhead + driver batching).
+    const fbArea = fb.width * fb.height;
+    let dirtyArea = 0;
+    for (let i = 0; i < dirtyRects.length; i++) {
+      dirtyArea += dirtyRects[i].w * dirtyRects[i].h;
+    }
+
+    if (dirtyRects.length > 100 || dirtyArea > fbArea * 0.3) {
+      // Full framebuffer upload
+      const pixels = new Uint8Array(
+        fb.imageData.data.buffer,
+        fb.imageData.data.byteOffset,
+        fb.imageData.data.byteLength,
+      );
+      gl.texImage2D(
+        gl.TEXTURE_2D, 0, gl.RGBA,
+        fb.width, fb.height, 0,
+        gl.RGBA, gl.UNSIGNED_BYTE,
+        pixels,
+      );
+    } else {
+      // Incremental upload: update only dirty regions via texSubImage2D.
+      // WebGL texSubImage2D with UNPACK_ROW_LENGTH lets us upload sub-rects
+      // directly from the full-width framebuffer without extracting pixels.
+      gl.pixelStorei(gl.UNPACK_ROW_LENGTH, fb.width);
+      const fbData = fb.imageData.data;
+
+      for (let i = 0; i < dirtyRects.length; i++) {
+        const r = dirtyRects[i];
+        // Calculate byte offset into the framebuffer for this rect's top-left pixel
+        const byteOffset = (r.y * fb.width + r.x) * 4;
+        const subPixels = new Uint8Array(
+          fbData.buffer,
+          fbData.byteOffset + byteOffset,
+          fbData.byteLength - byteOffset,
+        );
+        gl.texSubImage2D(
+          gl.TEXTURE_2D, 0,
+          r.x, r.y, r.w, r.h,
+          gl.RGBA, gl.UNSIGNED_BYTE,
+          subPixels,
+        );
+      }
+
+      // Reset row length to default
+      gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
+    }
 
     // Draw the fullscreen quad
     gl.useProgram(this.program);

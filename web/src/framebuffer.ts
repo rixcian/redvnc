@@ -4,6 +4,11 @@ export class Framebuffer {
   private _imageData: ImageData;
   private _dirtyRects: Array<{ x: number; y: number; w: number; h: number }> = [];
 
+  // Reusable OffscreenCanvas for JPEG bitmap pixel extraction.
+  // Avoids creating a new canvas per tile (~510 per full-screen FBU).
+  private _bitmapCanvas: OffscreenCanvas | null = null;
+  private _bitmapCtx: OffscreenCanvasRenderingContext2D | null = null;
+
   constructor(width: number, height: number) {
     this._width = width;
     this._height = height;
@@ -113,11 +118,15 @@ export class Framebuffer {
 
   /**
    * Draw an ImageBitmap into the framebuffer at position (x, y).
-   * Uses an offscreen canvas to extract pixel data.
+   * Reuses a single OffscreenCanvas to avoid per-tile allocation overhead.
    */
   drawBitmap(bitmap: ImageBitmap, x: number, y: number, width: number, height: number): void {
-    const canvas = new OffscreenCanvas(width, height);
-    const ctx = canvas.getContext('2d')!;
+    // Reuse or create the offscreen canvas, resizing only when needed
+    if (!this._bitmapCanvas || this._bitmapCanvas.width < width || this._bitmapCanvas.height < height) {
+      this._bitmapCanvas = new OffscreenCanvas(width, height);
+      this._bitmapCtx = this._bitmapCanvas.getContext('2d', { willReadFrequently: true })!;
+    }
+    const ctx = this._bitmapCtx!;
     ctx.drawImage(bitmap, 0, 0);
     const imgData = ctx.getImageData(0, 0, width, height);
     this.writeRect(x, y, width, height, imgData.data);
