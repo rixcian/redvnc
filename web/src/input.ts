@@ -1,5 +1,5 @@
 import { writeKeyEvent, writePointerEvent } from './rfb-writer';
-import type { CanvasRenderer } from './renderer';
+import type { IRenderer } from './renderer-interface';
 
 // X11 keysym mapping from KeyboardEvent.code
 const CODE_TO_KEYSYM: Record<string, number> = {
@@ -78,7 +78,7 @@ export type SendFn = (data: ArrayBuffer) => void;
 
 export class InputHandler {
   private canvas: HTMLCanvasElement | null = null;
-  private renderer: CanvasRenderer;
+  private renderer: IRenderer;
   private sendFn: SendFn;
   private fbWidth: number = 0;
   private fbHeight: number = 0;
@@ -97,7 +97,7 @@ export class InputHandler {
   private boundTouchMove: (e: TouchEvent) => void;
   private boundTouchEnd: (e: TouchEvent) => void;
 
-  constructor(renderer: CanvasRenderer, sendFn: SendFn, viewOnly: boolean = false) {
+  constructor(renderer: IRenderer, sendFn: SendFn, viewOnly: boolean = false) {
     this.renderer = renderer;
     this.sendFn = sendFn;
     this.viewOnly = viewOnly;

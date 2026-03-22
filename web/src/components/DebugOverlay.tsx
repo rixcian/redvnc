@@ -64,6 +64,7 @@ export const DebugOverlay: React.FC<DebugOverlayProps> = ({ client, visible }) =
       <Row label="Server" value={stats.serverName} />
       <Row label="Resolution" value={`${stats.resolution.width}x${stats.resolution.height}`} />
       <Row label="Auth" value={stats.authType} />
+      <Row label="Renderer" value={client?.rendererType ?? 'unknown'} />
       <Row label="FPS" value={String(stats.fps)} />
       <Row label="Data received" value={formatBytes(stats.bytesReceived)} />
       <Row label="Total rects" value={stats.totalRectangles.toLocaleString()} />

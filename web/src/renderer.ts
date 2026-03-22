@@ -1,6 +1,7 @@
 import type { Framebuffer } from './framebuffer';
+import type { IRenderer } from './renderer-interface';
 
-export class CanvasRenderer {
+export class CanvasRenderer implements IRenderer {
   private canvas: HTMLCanvasElement | null = null;
   private ctx: CanvasRenderingContext2D | null = null;
   private scaleToFit: boolean;

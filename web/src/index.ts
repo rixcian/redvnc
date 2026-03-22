@@ -8,6 +8,8 @@ import {
 } from './rfb-writer';
 import { Framebuffer } from './framebuffer';
 import { CanvasRenderer } from './renderer';
+import { WebGLRenderer } from './renderer-webgl';
+import type { IRenderer } from './renderer-interface';
 import { InputHandler } from './input';
 import { ClipboardHandler } from './clipboard';
 import { FileUploadHandler } from './file-upload';
@@ -58,11 +60,29 @@ const AUTH_TYPE_NAMES: Record<number, string> = {
   2: 'VNC Password',
 };
 
+/**
+ * Create a renderer: try WebGL first, fall back to Canvas 2D.
+ */
+function createRenderer(preference: 'auto' | 'canvas2d' | 'webgl', scaleToFit: boolean): IRenderer {
+  if (preference === 'canvas2d') {
+    return new CanvasRenderer(scaleToFit);
+  }
+  // For 'auto' and 'webgl', try WebGL first
+  // We can't test WebGL without a canvas, so return a WebGLRenderer and
+  // handle attach failure in attachCanvas.
+  if (preference === 'webgl') {
+    return new WebGLRenderer(scaleToFit);
+  }
+  // 'auto': try WebGL, fall back below in attachCanvas
+  return new WebGLRenderer(scaleToFit);
+}
+
 export class VncClient {
   private options: VncClientOptions;
   private connection: VncConnection;
   private framebuffer: Framebuffer | null = null;
-  private renderer: CanvasRenderer;
+  private renderer: IRenderer;
+  private rendererPreference: 'auto' | 'canvas2d' | 'webgl';
   private inputHandler: InputHandler;
   private clipboardHandler: ClipboardHandler;
   private fileUploadHandler: FileUploadHandler;
@@ -75,6 +95,7 @@ export class VncClient {
   private _height = 0;
   private _name = '';
   private _authType = 0;
+  private _rendererType = 'unknown';
 
   // Stats tracking
   private _encodingCounts: Record<number, number> = {};
@@ -89,10 +110,20 @@ export class VncClient {
   private reconnectAttempt = 0;
   private canvas: HTMLCanvasElement | null = null;
 
+  // FBU serialization: ensure only one FBU is processed at a time.
+  // Without this, async JPEG decodes in one FBU can interleave with the
+  // next FBU, causing race conditions and visual artifacts.
+  private fbuQueue: Promise<void> = Promise.resolve();
+
+  // Render gating: suppress rendering while an FBU decode is in progress
+  // to prevent showing partial state (black tiles from un-decoded regions).
+  private fbuDecoding = false;
+
   constructor(options: VncClientOptions) {
     this.options = options;
     this.connection = new VncConnection();
-    this.renderer = new CanvasRenderer(options.scaleToFit ?? false);
+    this.rendererPreference = ((options as unknown as Record<string, unknown>).renderer as 'auto' | 'canvas2d' | 'webgl') ?? 'auto';
+    this.renderer = createRenderer(this.rendererPreference, options.scaleToFit ?? false);
     this.zlibDecoder = new ZlibDecoder();
     this.tightDecoder = new TightDecoder();
     this.zrleDecoder = new ZrleDecoder();
@@ -117,6 +148,10 @@ export class VncClient {
 
   get name(): string {
     return this._name;
+  }
+
+  get rendererType(): string {
+    return this._rendererType;
   }
 
   getStats(): ConnectionStats {
@@ -213,7 +248,19 @@ export class VncClient {
 
   attachCanvas(canvas: HTMLCanvasElement): void {
     this.canvas = canvas;
-    this.renderer.attach(canvas);
+
+    // Try attaching with current renderer; fall back to Canvas2D on WebGL failure
+    try {
+      this.renderer.attach(canvas);
+      this._rendererType = this.renderer instanceof WebGLRenderer ? 'WebGL' : 'Canvas2D';
+    } catch {
+      // WebGL not available — fall back to Canvas2D
+      console.warn('WebGL not available, falling back to Canvas2D renderer');
+      this.renderer = new CanvasRenderer(this.options.scaleToFit ?? false);
+      this.renderer.attach(canvas);
+      this._rendererType = 'Canvas2D';
+    }
+
     this.inputHandler.attach(canvas);
     if (this.framebuffer) {
       this.renderer.updateCanvasSize(this.framebuffer);
@@ -275,7 +322,12 @@ export class VncClient {
 
     switch (msg.type) {
       case MsgFramebufferUpdate:
-        this.handleFramebufferUpdate(msg);
+        // Serialize FBU processing via a promise chain. Each FBU waits for
+        // the previous one to finish (including async JPEG decodes) before
+        // starting. This prevents interleaved writes to the framebuffer.
+        this.fbuQueue = this.fbuQueue.then(() =>
+          this.handleFramebufferUpdate(msg as import('./rfb-parser').FramebufferUpdateMessage),
+        );
         break;
       case MsgBell:
         this.emit('bell');
@@ -313,6 +365,8 @@ export class VncClient {
   ): Promise<void> {
     if (!this.framebuffer) return;
 
+    // Gate rendering: don't show partial decode state
+    this.fbuDecoding = true;
     this._fbuTimestamps.push(performance.now());
 
     const asyncTasks: Promise<void>[] = [];
@@ -322,42 +376,54 @@ export class VncClient {
       this._encodingCounts[header.encoding] = (this._encodingCounts[header.encoding] ?? 0) + 1;
       this._totalRectangles++;
 
-      switch (header.encoding) {
-        case EncodingRaw:
-          decodeRaw(this.framebuffer, header, data);
-          break;
-        case EncodingCopyRect:
-          decodeCopyRect(this.framebuffer, header, data);
-          break;
-        case EncodingZlib:
-          this.zlibDecoder.decode(this.framebuffer, header, data);
-          break;
-        case EncodingTight:
-          // Tight may be async (JPEG decode). Collect the promise so we
-          // wait for all tiles to finish before requesting the next update.
-          asyncTasks.push(this.tightDecoder.decode(this.framebuffer, header, data));
-          break;
-        case EncodingZRLE:
-          this.zrleDecoder.decode(this.framebuffer, header, data);
-          break;
-        case EncodingCursor:
-          this.handleCursor(header, data);
-          break;
-        case EncodingDesktopSize:
-          this.handleDesktopResize(header);
-          break;
+      try {
+        switch (header.encoding) {
+          case EncodingRaw:
+            decodeRaw(this.framebuffer, header, data);
+            break;
+          case EncodingCopyRect:
+            decodeCopyRect(this.framebuffer, header, data);
+            break;
+          case EncodingZlib:
+            this.zlibDecoder.decode(this.framebuffer, header, data);
+            break;
+          case EncodingTight:
+            // Tight may be async (JPEG decode). Collect the promise so we
+            // wait for all tiles to finish before requesting the next update.
+            asyncTasks.push(this.tightDecoder.decode(this.framebuffer, header, data));
+            break;
+          case EncodingZRLE:
+            this.zrleDecoder.decode(this.framebuffer, header, data);
+            break;
+          case EncodingCursor:
+            this.handleCursor(header, data);
+            break;
+          case EncodingDesktopSize:
+            this.handleDesktopResize(header);
+            break;
+        }
+      } catch (err) {
+        console.warn('Decode error for rect', header, err);
+        // Continue decoding remaining rectangles
       }
     }
 
-    // Wait for any async decoders (e.g. Tight JPEG) to finish before
-    // requesting the next update. This prevents the server from sending
-    // new rectangles that overwrite tiles still being decoded, which
-    // causes flickering and incomplete rendering at the bottom of the screen.
+    // Wait for any async decoders (e.g. Tight JPEG) to finish.
+    // Use allSettled so a single JPEG failure doesn't stop the rest.
     if (asyncTasks.length > 0) {
-      await Promise.all(asyncTasks);
+      const results = await Promise.allSettled(asyncTasks);
+      for (const r of results) {
+        if (r.status === 'rejected') {
+          console.warn('Async decode error:', r.reason);
+        }
+      }
     }
 
-    // Request next incremental update
+    // Allow rendering now that all tiles are decoded
+    this.fbuDecoding = false;
+
+    // Always request next incremental update, even if some decodes failed.
+    // Without this, the client would stop receiving updates permanently.
     this.connection.send(
       writeFramebufferUpdateRequest(true, 0, 0, this._width, this._height),
     );
@@ -471,6 +537,7 @@ export class VncClient {
     this._authType = sessionInit.authType;
     this._connected = true;
     this.resetStats();
+    this.fbuQueue = Promise.resolve();
 
     this.framebuffer = new Framebuffer(this._width, this._height);
     this.inputHandler.setFramebufferSize(this._width, this._height);
@@ -504,7 +571,9 @@ export class VncClient {
 
   private startRenderLoop(): void {
     const loop = () => {
-      if (this.framebuffer) {
+      // Only render when no FBU decode is in progress, to prevent showing
+      // partial state (un-decoded tiles appear as black rectangles).
+      if (this.framebuffer && !this.fbuDecoding) {
         this.renderer.render(this.framebuffer);
       }
       this.rafId = requestAnimationFrame(loop);
