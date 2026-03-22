@@ -20,9 +20,16 @@ void main() {
 }`;
 
 /**
- * WebGL 2 renderer that uploads the framebuffer as a GPU texture
- * and renders it with a fullscreen quad. Dirty rectangles are uploaded
- * via texSubImage2D for efficient partial updates.
+ * WebGL 2 renderer that uploads the full framebuffer as a GPU texture each
+ * frame. This is simpler and more robust than per-dirty-rect texSubImage2D:
+ *
+ *  - A single texImage2D call replaces 500+ texSubImage2D calls per frame
+ *  - No pixel extraction loops or sub-rect buffer allocations
+ *  - Eliminates any possibility of stale/partial texture regions
+ *  - GPU handles the ~8 MB upload efficiently via DMA
+ *
+ * The GPU does all the scaling via the fullscreen-quad shader, replacing
+ * the CSS objectFit: contain approach used by Canvas2D.
  */
 export class WebGLRenderer implements IRenderer {
   private canvas: HTMLCanvasElement | null = null;
@@ -91,15 +98,12 @@ export class WebGLRenderer implements IRenderer {
     gl.deleteShader(fs);
     this.program = program;
 
-    // Fullscreen quad (two triangles, clip space coords + tex coords)
-    // Positions: covers [-1,1] clip space
-    // TexCoords: covers [0,1] with Y flipped (top-left origin)
+    // Fullscreen quad (triangle strip, clip space + tex coords with Y flipped)
     const vertices = new Float32Array([
-      // pos        texCoord
-      -1, -1,      0, 1,
-       1, -1,      1, 1,
-      -1,  1,      0, 0,
-       1,  1,      1, 0,
+      -1, -1,   0, 1,
+       1, -1,   1, 1,
+      -1,  1,   0, 0,
+       1,  1,   1, 0,
     ]);
 
     const vao = gl.createVertexArray()!;
@@ -127,6 +131,8 @@ export class WebGLRenderer implements IRenderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    // Ensure pixel unpack alignment is 1 for arbitrary-width framebuffers
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     gl.bindTexture(gl.TEXTURE_2D, null);
     this.texture = texture;
   }
@@ -146,30 +152,30 @@ export class WebGLRenderer implements IRenderer {
   updateCanvasSize(fb: Framebuffer): void {
     if (!this.canvas || !this.gl) return;
 
-    // Always set canvas internal resolution to match framebuffer
     this.canvas.width = fb.width;
     this.canvas.height = fb.height;
     this.gl.viewport(0, 0, fb.width, fb.height);
+    this.texWidth = fb.width;
+    this.texHeight = fb.height;
 
-    // Reallocate texture if size changed
-    if (fb.width !== this.texWidth || fb.height !== this.texHeight) {
-      this.texWidth = fb.width;
-      this.texHeight = fb.height;
-
-      this.gl.bindTexture(this.gl.TEXTURE_2D, this.texture);
-      this.gl.texImage2D(
-        this.gl.TEXTURE_2D, 0, this.gl.RGBA,
-        fb.width, fb.height, 0,
-        this.gl.RGBA, this.gl.UNSIGNED_BYTE,
-        null, // allocate without data
-      );
-      this.gl.bindTexture(this.gl.TEXTURE_2D, null);
-    }
+    // Pre-allocate the texture at the framebuffer size
+    this.gl.bindTexture(this.gl.TEXTURE_2D, this.texture);
+    this.gl.texImage2D(
+      this.gl.TEXTURE_2D, 0, this.gl.RGBA,
+      fb.width, fb.height, 0,
+      this.gl.RGBA, this.gl.UNSIGNED_BYTE,
+      null,
+    );
+    this.gl.bindTexture(this.gl.TEXTURE_2D, null);
   }
 
   /**
-   * Render dirty regions from the framebuffer to the canvas via WebGL.
-   * Uses texSubImage2D for efficient partial texture updates.
+   * Upload the entire framebuffer to the GPU texture and draw.
+   *
+   * We upload the full ImageData every frame instead of tracking dirty rects
+   * because a single texImage2D with the full buffer (~8 MB for 1920x1080)
+   * is faster than hundreds of texSubImage2D calls with pixel-extraction
+   * loops, and eliminates any possibility of stale texture regions.
    */
   render(fb: Framebuffer): void {
     const gl = this.gl;
@@ -180,28 +186,19 @@ export class WebGLRenderer implements IRenderer {
 
     gl.bindTexture(gl.TEXTURE_2D, this.texture);
 
-    // Upload dirty regions to the texture
-    // We need to extract the dirty sub-rectangles from the full ImageData
-    const fbData = fb.imageData.data;
-    const fbWidth = fb.width;
-
-    for (const rect of dirtyRects) {
-      // Extract the sub-rectangle pixels
-      const subPixels = new Uint8Array(rect.w * rect.h * 4);
-      for (let row = 0; row < rect.h; row++) {
-        const srcOff = ((rect.y + row) * fbWidth + rect.x) * 4;
-        const dstOff = row * rect.w * 4;
-        subPixels.set(fbData.subarray(srcOff, srcOff + rect.w * 4), dstOff);
-      }
-
-      gl.texSubImage2D(
-        gl.TEXTURE_2D, 0,
-        rect.x, rect.y,
-        rect.w, rect.h,
-        gl.RGBA, gl.UNSIGNED_BYTE,
-        subPixels,
-      );
-    }
+    // Upload the full framebuffer as a single GPU texture
+    // Use Uint8Array view of the same buffer to avoid Uint8ClampedArray overhead
+    const pixels = new Uint8Array(
+      fb.imageData.data.buffer,
+      fb.imageData.data.byteOffset,
+      fb.imageData.data.byteLength,
+    );
+    gl.texImage2D(
+      gl.TEXTURE_2D, 0, gl.RGBA,
+      fb.width, fb.height, 0,
+      gl.RGBA, gl.UNSIGNED_BYTE,
+      pixels,
+    );
 
     // Draw the fullscreen quad
     gl.useProgram(this.program);

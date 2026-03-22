@@ -115,10 +115,6 @@ export class VncClient {
   // next FBU, causing race conditions and visual artifacts.
   private fbuQueue: Promise<void> = Promise.resolve();
 
-  // Render gating: suppress rendering while an FBU decode is in progress
-  // to prevent showing partial state (black tiles from un-decoded regions).
-  private fbuDecoding = false;
-
   constructor(options: VncClientOptions) {
     this.options = options;
     this.connection = new VncConnection();
@@ -325,9 +321,17 @@ export class VncClient {
         // Serialize FBU processing via a promise chain. Each FBU waits for
         // the previous one to finish (including async JPEG decodes) before
         // starting. This prevents interleaved writes to the framebuffer.
-        this.fbuQueue = this.fbuQueue.then(() =>
-          this.handleFramebufferUpdate(msg as import('./rfb-parser').FramebufferUpdateMessage),
-        );
+        // The .catch ensures the chain never breaks — if one FBU fails,
+        // we still request the next update so the client doesn't freeze.
+        this.fbuQueue = this.fbuQueue.then(
+          () => this.handleFramebufferUpdate(msg as import('./rfb-parser').FramebufferUpdateMessage),
+        ).catch((err) => {
+          console.error('FBU processing error:', err);
+          // Ensure we always request the next update even on catastrophic failure
+          this.connection.send(
+            writeFramebufferUpdateRequest(true, 0, 0, this._width, this._height),
+          );
+        });
         break;
       case MsgBell:
         this.emit('bell');
@@ -365,8 +369,6 @@ export class VncClient {
   ): Promise<void> {
     if (!this.framebuffer) return;
 
-    // Gate rendering: don't show partial decode state
-    this.fbuDecoding = true;
     this._fbuTimestamps.push(performance.now());
 
     const asyncTasks: Promise<void>[] = [];
@@ -418,9 +420,6 @@ export class VncClient {
         }
       }
     }
-
-    // Allow rendering now that all tiles are decoded
-    this.fbuDecoding = false;
 
     // Always request next incremental update, even if some decodes failed.
     // Without this, the client would stop receiving updates permanently.
@@ -571,9 +570,7 @@ export class VncClient {
 
   private startRenderLoop(): void {
     const loop = () => {
-      // Only render when no FBU decode is in progress, to prevent showing
-      // partial state (un-decoded tiles appear as black rectangles).
-      if (this.framebuffer && !this.fbuDecoding) {
+      if (this.framebuffer) {
         this.renderer.render(this.framebuffer);
       }
       this.rafId = requestAnimationFrame(loop);
