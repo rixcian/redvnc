@@ -459,6 +459,7 @@ export class VncClient {
   }
 
   private handleDesktopResize(header: import('./types').RectHeader): void {
+    console.warn(`[VNC] DesktopResize: ${header.width}x${header.height} (was ${this._width}x${this._height})`);
     this._width = header.width;
     this._height = header.height;
     this.framebuffer?.resize(this._width, this._height);

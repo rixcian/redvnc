@@ -8,6 +8,16 @@ export class Framebuffer {
     this._width = width;
     this._height = height;
     this._imageData = new ImageData(width, height);
+    // Fill with magenta so un-decoded tiles are visually obvious.
+    // Black = server sent black data.  Magenta = tile was never decoded.
+    const d = this._imageData.data;
+    for (let i = 0; i < d.length; i += 4) {
+      d[i] = 255;     // R
+      d[i + 1] = 0;   // G
+      d[i + 2] = 255;  // B
+      d[i + 3] = 255;  // A
+    }
+    this.markDirty(0, 0, width, height);
   }
 
   get width(): number {
@@ -39,9 +49,16 @@ export class Framebuffer {
   }
 
   resize(width: number, height: number): void {
+    // Skip if dimensions unchanged — avoids clearing the framebuffer
+    if (width === this._width && height === this._height) return;
     this._width = width;
     this._height = height;
     this._imageData = new ImageData(width, height);
+    // Fill with magenta so un-decoded tiles are obvious
+    const d = this._imageData.data;
+    for (let i = 0; i < d.length; i += 4) {
+      d[i] = 255; d[i + 1] = 0; d[i + 2] = 255; d[i + 3] = 255;
+    }
     this._dirtyRects = [];
   }
 
