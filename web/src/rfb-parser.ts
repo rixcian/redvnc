@@ -243,14 +243,16 @@ function parseFramebufferUpdate(view: DataView): FramebufferUpdateMessage {
     };
     offset += 12;
 
-    // The remaining bytes after the header for this rect are the encoding data.
-    // We pass a DataView starting at the encoding data offset.
-    // The decoder will need to figure out the length based on encoding type.
     const data = new DataView(view.buffer, view.byteOffset + offset);
     rectangles.push({ header, data });
 
-    // Advance offset based on encoding
-    offset += getEncodingDataLength(header, data);
+    // Only compute encoding data length if there are more rects after this one.
+    // For the last rect (and the common single-rect case), this skips the
+    // expensive getTightDataLength() which scans all ~510 tiles per full-screen
+    // Tight rectangle — work that's duplicated by the decoder anyway.
+    if (i < numRects - 1) {
+      offset += getEncodingDataLength(header, data);
+    }
   }
 
   return { type: MsgFramebufferUpdate, rectangles };
