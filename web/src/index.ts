@@ -352,6 +352,7 @@ export class VncClient {
         this.emit('bell');
         break;
       case MsgServerCutText:
+        console.debug('[VNC] MsgServerCutText dispatched', { textLen: msg.text.length });
         this.clipboardHandler.handleClipboardUpdate(msg.text);
         this.emit('clipboard', msg.text);
         break;

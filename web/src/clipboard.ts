@@ -50,12 +50,24 @@ export class ClipboardHandler {
    * Handle clipboard update from the server.
    */
   handleClipboardUpdate(text: string): void {
+    console.debug('[VNC] clipboard update from server', {
+      textLen: text.length,
+      preview: text.slice(0, 80),
+      autoSync: this.autoSync,
+    });
+
     this.clipboardCallback?.(text);
 
     if (this.autoSync) {
+      if (!navigator.clipboard) {
+        console.warn('[VNC] clipboard sync skipped: navigator.clipboard not available (requires HTTPS or localhost)');
+        return;
+      }
       // Try to write to the browser clipboard
-      navigator.clipboard?.writeText(text).catch(() => {
-        // Clipboard API may fail without user interaction or permissions
+      navigator.clipboard.writeText(text).then(() => {
+        console.debug('[VNC] clipboard written to browser successfully');
+      }).catch((err: unknown) => {
+        console.warn('[VNC] clipboard write failed (requires document focus and permission)', err);
       });
     }
   }

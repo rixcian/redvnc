@@ -288,6 +288,18 @@ func (p *Proxy) relayVNCToBrowser(ctx context.Context) {
 		p.session.TouchActivity()
 		p.session.BytesToClient.Add(int64(len(msg)))
 
+		// Log clipboard messages from the VNC server so clipboard sync
+		// issues can be diagnosed without code changes on the client side.
+		if len(msg) > 0 && msg[0] == 3 {
+			textLen := 0
+			if len(msg) >= 8 {
+				textLen = int(binary.BigEndian.Uint32(msg[4:8]))
+			}
+			p.server.logger.Debug("ServerCutText received from VNC",
+				"session_id", p.session.ID,
+				"text_bytes", textLen)
+		}
+
 		if err := p.session.WSConn.Write(ctx, websocket.MessageBinary, msg); err != nil {
 			if ctx.Err() == nil {
 				p.server.logger.Warn("WS write error", "session_id", p.session.ID, "error", err)
