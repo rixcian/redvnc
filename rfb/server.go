@@ -408,11 +408,13 @@ func (c *ClientConn) serveMessages() error {
 			}
 
 		case MsgClientCutText:
-			_, err := ReadClientCutText(c.br)
+			text, err := ReadClientCutText(c.br)
 			if err != nil {
 				return err
 			}
-			// Clipboard handling can be extended later
+			c.server.logger.Info("ClientCutText received from client",
+				"text_bytes", len(text),
+				"preview", previewText(text, 60))
 
 		default:
 			return fmt.Errorf("unknown message type: %d", msgType)
@@ -846,6 +848,39 @@ func (s *Server) SendCursorUpdate(cursor *CursorImage) {
 	}
 }
 
+// SendClipboard broadcasts a ServerCutText message to all connected clients.
+// Call this whenever the server-side clipboard changes (e.g. after detecting
+// a copy operation on the host OS).
+func (s *Server) SendClipboard(text string) {
+	s.mu.Lock()
+	clients := make([]*ClientConn, 0, len(s.clients))
+	for c := range s.clients {
+		clients = append(clients, c)
+	}
+	s.mu.Unlock()
+
+	s.logger.Info("SendClipboard broadcasting to clients",
+		"num_clients", len(clients),
+		"text_bytes", len(text),
+		"preview", previewText(text, 60))
+
+	for _, c := range clients {
+		c.mu.Lock()
+		if err := WriteServerCutText(c.bw, text); err != nil {
+			c.mu.Unlock()
+			s.logger.Warn("ServerCutText send error", "remote_addr", c.conn.RemoteAddr(), "error", err)
+			continue
+		}
+		if err := c.bw.Flush(); err != nil {
+			c.mu.Unlock()
+			s.logger.Warn("ServerCutText flush error", "remote_addr", c.conn.RemoteAddr(), "error", err)
+			continue
+		}
+		c.mu.Unlock()
+		s.logger.Debug("ServerCutText sent to client", "remote_addr", c.conn.RemoteAddr())
+	}
+}
+
 func (c *ClientConn) sendBlankFrame(req *FramebufferUpdateRequest) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -939,6 +974,15 @@ func (n *noneSecurity) Handshake(rw io.ReadWriter) error {
 type bufReadWriter struct {
 	r io.Reader
 	w *bufio.Writer
+}
+
+// previewText returns up to maxLen characters of s for use in log messages.
+func previewText(s string, maxLen int) string {
+	runes := []rune(s)
+	if len(runes) <= maxLen {
+		return s
+	}
+	return string(runes[:maxLen]) + "…"
 }
 
 func (brw *bufReadWriter) Read(p []byte) (int, error) {
