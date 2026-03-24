@@ -3,15 +3,27 @@
 package input
 
 import (
+	"fmt"
 	"syscall"
 	"unsafe"
 )
 
 var (
-	user32Input          = syscall.NewLazyDLL("user32.dll")
-	procSendInput        = user32Input.NewProc("SendInput")
-	procMapVirtualKeyW   = user32Input.NewProc("MapVirtualKeyW")
+	user32Input           = syscall.NewLazyDLL("user32.dll")
+	kernel32Input         = syscall.NewLazyDLL("kernel32.dll")
+	procSendInput         = user32Input.NewProc("SendInput")
+	procMapVirtualKeyW    = user32Input.NewProc("MapVirtualKeyW")
 	procGetSystemMetricsI = user32Input.NewProc("GetSystemMetrics")
+	// Clipboard (used by SetClipboard)
+	procOpenClipboardI    = user32Input.NewProc("OpenClipboard")
+	procCloseClipboardI   = user32Input.NewProc("CloseClipboard")
+	procEmptyClipboardI   = user32Input.NewProc("EmptyClipboard")
+	procSetClipboardDataI = user32Input.NewProc("SetClipboardData")
+	procGlobalAllocI      = kernel32Input.NewProc("GlobalAlloc")
+	procGlobalFreeI       = kernel32Input.NewProc("GlobalFree")
+	procGlobalLockI       = kernel32Input.NewProc("GlobalLock")
+	procGlobalUnlockI     = kernel32Input.NewProc("GlobalUnlock")
+	procRtlMoveMemoryI    = kernel32Input.NewProc("RtlMoveMemory")
 )
 
 const (
@@ -184,6 +196,54 @@ func (w *WindowsInput) sendWheelRaw(delta int32) {
 	inp.Type = inputMouse
 	*(*mouseInput)(unsafe.Pointer(&inp.U[0])) = mi
 	procSendInput.Call(1, uintptr(unsafe.Pointer(&inp)), winInputSize)
+}
+
+// SetClipboard sets the Windows system clipboard to text so the focused
+// application can paste it with Ctrl+V. Called when the VNC server receives
+// a ClientCutText message from the browser client.
+func (w *WindowsInput) SetClipboard(text string) error {
+	// Convert Go string to UTF-16LE with NUL terminator.
+	utf16, err := syscall.UTF16FromString(text)
+	if err != nil {
+		return fmt.Errorf("clipboard: UTF16FromString: %w", err)
+	}
+	byteLen := uintptr(len(utf16) * 2)
+
+	// Allocate moveable global memory (GMEM_MOVEABLE = 0x0002).
+	hMem, _, _ := procGlobalAllocI.Call(0x0002, byteLen)
+	if hMem == 0 {
+		return fmt.Errorf("clipboard: GlobalAlloc failed")
+	}
+
+	// Lock the allocation and copy our UTF-16 data into it via RtlMoveMemory.
+	// We pass hMem's locked pointer as a raw uintptr destination (no
+	// unsafe.Pointer conversion of a stored uintptr) and our Go slice as the
+	// source (converting unsafe.Pointer in the call expression — safe per
+	// Go unsafe rule 4).
+	ptr, _, _ := procGlobalLockI.Call(hMem)
+	if ptr == 0 {
+		procGlobalFreeI.Call(hMem)
+		return fmt.Errorf("clipboard: GlobalLock failed")
+	}
+	procRtlMoveMemoryI.Call(ptr, uintptr(unsafe.Pointer(&utf16[0])), byteLen)
+	procGlobalUnlockI.Call(hMem)
+
+	// Open clipboard, replace its contents, close.
+	r, _, winErr := procOpenClipboardI.Call(0)
+	if r == 0 {
+		procGlobalFreeI.Call(hMem)
+		return fmt.Errorf("clipboard: OpenClipboard: %w", winErr)
+	}
+	procEmptyClipboardI.Call()
+	r2, _, _ := procSetClipboardDataI.Call(13 /* CF_UNICODETEXT */, hMem)
+	procCloseClipboardI.Call()
+	if r2 == 0 {
+		// SetClipboardData failed — ownership was NOT transferred, must free.
+		procGlobalFreeI.Call(hMem)
+		return fmt.Errorf("clipboard: SetClipboardData failed")
+	}
+	// On success Windows owns hMem; we must NOT free it.
+	return nil
 }
 
 func (w *WindowsInput) Close() error {

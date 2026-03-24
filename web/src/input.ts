@@ -84,6 +84,7 @@ export class InputHandler {
   private fbHeight: number = 0;
   private buttonMask: number = 0;
   private viewOnly: boolean;
+  private sendClipboard: ((text: string) => void) | null = null;
 
   // Bound event handlers for cleanup
   private boundKeyDown: (e: KeyboardEvent) => void;
@@ -112,6 +113,10 @@ export class InputHandler {
     this.boundTouchStart = this.handleTouchStart.bind(this);
     this.boundTouchMove = this.handleTouchMove.bind(this);
     this.boundTouchEnd = this.handleTouchEnd.bind(this);
+  }
+
+  setSendClipboard(fn: (text: string) => void): void {
+    this.sendClipboard = fn;
   }
 
   setFramebufferSize(width: number, height: number): void {
@@ -157,6 +162,53 @@ export class InputHandler {
 
   private handleKeyDown(e: KeyboardEvent): void {
     e.preventDefault();
+
+    // Intercept paste shortcut: Cmd+V (macOS) or Ctrl+V (Windows/Linux).
+    // Read the browser clipboard, send it to the remote so the OS clipboard
+    // is updated before the paste key event arrives at the remote app.
+    // Translate Cmd+V → Ctrl+V so Windows/Linux remotes recognise the shortcut.
+    if (e.key === 'v' && (e.metaKey || e.ctrlKey)) {
+      const sendFn = this.sendFn;
+      const sendClipboard = this.sendClipboard;
+
+      // On macOS, MetaLeft keydown was already relayed to the remote.
+      // Release it now so it doesn't interfere with the Ctrl+V we're about
+      // to send.
+      if (e.metaKey && !e.ctrlKey) {
+        sendFn(writeKeyEvent(false, 0xffe7)); // MetaLeft up
+        sendFn(writeKeyEvent(false, 0xffe8)); // MetaRight up (just in case)
+      }
+
+      const sendPaste = () => {
+        if (e.ctrlKey && !e.metaKey) {
+          // ControlLeft is already held on the remote (from its own keydown
+          // event). Just send v down/up to complete the Ctrl+V chord.
+          sendFn(writeKeyEvent(true, 0x0076));
+          sendFn(writeKeyEvent(false, 0x0076));
+        } else {
+          // Cmd+V on macOS: Meta was released above; send a full Ctrl+V.
+          sendFn(writeKeyEvent(true, 0xffe3));  // ControlLeft down
+          sendFn(writeKeyEvent(true, 0x0076));  // v down
+          sendFn(writeKeyEvent(false, 0x0076)); // v up
+          sendFn(writeKeyEvent(false, 0xffe3)); // ControlLeft up
+        }
+      };
+
+      if (sendClipboard && navigator.clipboard?.readText) {
+        navigator.clipboard.readText().then(text => {
+          if (text) sendClipboard(text);
+          sendPaste();
+        }).catch(() => {
+          // Clipboard read denied (no HTTPS or permission); still send the
+          // paste key so text already on the remote clipboard is pasted.
+          sendPaste();
+        });
+      } else {
+        sendPaste();
+      }
+      return;
+    }
+
     const keysym = keyEventToKeysym(e);
     if (keysym) {
       this.sendFn(writeKeyEvent(true, keysym));

@@ -128,6 +128,7 @@ export class VncClient {
     const sendFn = (data: ArrayBuffer | Uint8Array) => this.connection.send(data);
     this.inputHandler = new InputHandler(this.renderer, sendFn, options.viewOnly ?? false);
     this.clipboardHandler = new ClipboardHandler(sendFn, options.clipboardSync ?? true);
+    this.inputHandler.setSendClipboard((text) => this.clipboardHandler.sendClipboard(text));
     this.fileUploadHandler = new FileUploadHandler(sendFn, options.uploadDir ?? '');
   }
 
@@ -532,6 +533,7 @@ export class VncClient {
     const sendFn = (data: ArrayBuffer | Uint8Array) => this.connection.send(data);
     this.inputHandler = new InputHandler(this.renderer, sendFn, this.options.viewOnly ?? false);
     this.clipboardHandler = new ClipboardHandler(sendFn, this.options.clipboardSync ?? true);
+    this.inputHandler.setSendClipboard((text) => this.clipboardHandler.sendClipboard(text));
     this.fileUploadHandler = new FileUploadHandler(sendFn, this.options.uploadDir ?? '');
 
     this.connection.onMessage((type, view) => {

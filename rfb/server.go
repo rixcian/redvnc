@@ -42,6 +42,14 @@ type InputHandler interface {
 	PointerEvent(buttonMask uint8, x, y uint16)
 }
 
+// ClipboardSetter is an optional extension of InputHandler. When the server's
+// InputHandler also implements ClipboardSetter, the server will call
+// SetClipboard whenever a VNC client sends a ClientCutText message so the OS
+// clipboard is updated and the focused application can paste it with Ctrl+V.
+type ClipboardSetter interface {
+	SetClipboard(text string) error
+}
+
 // CursorProvider supplies cursor image data to the server.
 // The server calls Cursor() when building framebuffer updates for clients
 // that support the Cursor pseudo-encoding.
@@ -415,6 +423,11 @@ func (c *ClientConn) serveMessages() error {
 			c.server.logger.Info("ClientCutText received from client",
 				"text_bytes", len(text),
 				"preview", previewText(text, 60))
+			if cs, ok := c.server.config.Input.(ClipboardSetter); ok {
+				if err := cs.SetClipboard(string(text)); err != nil {
+					c.server.logger.Warn("SetClipboard failed", "error", err)
+				}
+			}
 
 		default:
 			return fmt.Errorf("unknown message type: %d", msgType)
