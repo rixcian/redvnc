@@ -295,7 +295,7 @@ func (p *Proxy) relayVNCToBrowser(ctx context.Context) {
 			if len(msg) >= 8 {
 				textLen = int(binary.BigEndian.Uint32(msg[4:8]))
 			}
-			p.server.logger.Debug("ServerCutText received from VNC",
+			p.server.logger.Info("ServerCutText received from VNC",
 				"session_id", p.session.ID,
 				"text_bytes", textLen)
 		}
