@@ -77,6 +77,10 @@ export class VncConnection {
             // Standard RFB message types (0=FBUpdate, 1=ColourMap, 2=Bell, 3=CutText).
             // The proxy sends each as a complete WebSocket frame, so we can
             // dispatch directly without scanning for message boundaries.
+            if (msgType === 3) {
+              const textLen = chunk.length >= 8 ? peekView.getUint32(4) : -1;
+              console.debug('[VNC] ServerCutText received', { frameBytes: chunk.length, textLen });
+            }
             this.messageHandler?.(msgType, peekView);
             return;
           }
