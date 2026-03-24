@@ -1,24 +1,39 @@
 import { writeClipboardSet } from './rfb-writer';
 import type { SendFn } from './input';
+import type { ClipboardEntry } from './types';
+
+const MAX_HISTORY = 50;
 
 export class ClipboardHandler {
   private sendFn: SendFn;
   private clipboardCallback: ((text: string) => void) | null = null;
-  private autoSync: boolean;
+  private historyCallback: ((entries: ClipboardEntry[]) => void) | null = null;
+  private _autoSync: boolean;
+  private _history: ClipboardEntry[] = [];
+  private _nextId = 1;
   private canvas: HTMLCanvasElement | null = null;
   private boundPaste: (e: ClipboardEvent) => void;
 
   constructor(sendFn: SendFn, autoSync: boolean = true) {
     this.sendFn = sendFn;
-    this.autoSync = autoSync;
+    this._autoSync = autoSync;
     this.boundPaste = this.handlePaste.bind(this);
+  }
+
+  get autoSync(): boolean {
+    return this._autoSync;
+  }
+
+  set autoSync(enabled: boolean) {
+    this._autoSync = enabled;
+  }
+
+  get history(): ClipboardEntry[] {
+    return this._history;
   }
 
   /**
    * Attach to a canvas element to intercept paste events (Ctrl+V).
-   * When the user pastes into the canvas, the browser clipboard text is
-   * sent to the VNC server so the remote clipboard is up-to-date before
-   * the Ctrl+V key events trigger the actual paste in the remote app.
    */
   attach(canvas: HTMLCanvasElement): void {
     this.canvas = canvas;
@@ -44,6 +59,7 @@ export class ClipboardHandler {
    */
   sendClipboard(text: string): void {
     this.sendFn(writeClipboardSet(text));
+    this.addEntry(text, 'local');
   }
 
   /**
@@ -53,17 +69,17 @@ export class ClipboardHandler {
     console.debug('[VNC] clipboard update from server', {
       textLen: text.length,
       preview: text.slice(0, 80),
-      autoSync: this.autoSync,
+      autoSync: this._autoSync,
     });
 
+    this.addEntry(text, 'remote');
     this.clipboardCallback?.(text);
 
-    if (this.autoSync) {
+    if (this._autoSync) {
       if (!navigator.clipboard) {
         console.warn('[VNC] clipboard sync skipped: navigator.clipboard not available (requires HTTPS or localhost)');
         return;
       }
-      // Try to write to the browser clipboard
       navigator.clipboard.writeText(text).then(() => {
         console.debug('[VNC] clipboard written to browser successfully');
       }).catch((err: unknown) => {
@@ -74,5 +90,26 @@ export class ClipboardHandler {
 
   onClipboard(callback: (text: string) => void): void {
     this.clipboardCallback = callback;
+  }
+
+  onHistoryChange(callback: (entries: ClipboardEntry[]) => void): void {
+    this.historyCallback = callback;
+  }
+
+  private addEntry(text: string, source: 'local' | 'remote'): void {
+    // Skip duplicate consecutive entries with the same text and source
+    if (this._history.length > 0) {
+      const last = this._history[0];
+      if (last.text === text && last.source === source) return;
+    }
+
+    const entry: ClipboardEntry = {
+      id: this._nextId++,
+      text,
+      source,
+      timestamp: Date.now(),
+    };
+    this._history = [entry, ...this._history].slice(0, MAX_HISTORY);
+    this.historyCallback?.(this._history);
   }
 }

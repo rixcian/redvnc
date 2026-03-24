@@ -147,6 +147,14 @@ export const RGBA_PIXEL_FORMAT: PixelFormat = {
   blueShift: 16,
 };
 
+// Clipboard history entry
+export interface ClipboardEntry {
+  id: number;
+  text: string;
+  source: 'local' | 'remote';
+  timestamp: number; // Date.now()
+}
+
 // Default encoding preference order
 export const DEFAULT_ENCODINGS = [
   EncodingTight,
