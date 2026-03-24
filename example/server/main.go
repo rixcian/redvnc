@@ -148,6 +148,12 @@ func main() {
 
 	addr := fmt.Sprintf(":%d", *port)
 	server := rfb.NewServer(config)
+
+	// Start OS clipboard monitoring. When clipboard content changes the watcher
+	// calls server.SendClipboard so connected clients receive ServerCutText.
+	stopClipboard := make(chan struct{})
+	go startClipboardSync(server, stopClipboard)
+
 	log.Printf("starting VNC server on %s (password protected: %v)", addr, *password != "")
 	log.Fatal(server.ListenAndServe(addr))
 }
