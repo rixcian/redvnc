@@ -5,10 +5,38 @@ export class ClipboardHandler {
   private sendFn: SendFn;
   private clipboardCallback: ((text: string) => void) | null = null;
   private autoSync: boolean;
+  private canvas: HTMLCanvasElement | null = null;
+  private boundPaste: (e: ClipboardEvent) => void;
 
   constructor(sendFn: SendFn, autoSync: boolean = true) {
     this.sendFn = sendFn;
     this.autoSync = autoSync;
+    this.boundPaste = this.handlePaste.bind(this);
+  }
+
+  /**
+   * Attach to a canvas element to intercept paste events (Ctrl+V).
+   * When the user pastes into the canvas, the browser clipboard text is
+   * sent to the VNC server so the remote clipboard is up-to-date before
+   * the Ctrl+V key events trigger the actual paste in the remote app.
+   */
+  attach(canvas: HTMLCanvasElement): void {
+    this.canvas = canvas;
+    canvas.addEventListener('paste', this.boundPaste);
+  }
+
+  detach(): void {
+    if (this.canvas) {
+      this.canvas.removeEventListener('paste', this.boundPaste);
+      this.canvas = null;
+    }
+  }
+
+  private handlePaste(e: ClipboardEvent): void {
+    const text = e.clipboardData?.getData('text/plain');
+    if (text) {
+      this.sendClipboard(text);
+    }
   }
 
   /**

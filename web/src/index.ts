@@ -274,6 +274,7 @@ export class VncClient {
     }
 
     this.inputHandler.attach(canvas);
+    this.clipboardHandler.attach(canvas);
     if (this.framebuffer) {
       this.renderer.updateCanvasSize(this.framebuffer);
     }
@@ -281,6 +282,7 @@ export class VncClient {
 
   detachCanvas(): void {
     this.inputHandler.detach();
+    this.clipboardHandler.detach();
     this.renderer.detach();
   }
 
@@ -566,6 +568,7 @@ export class VncClient {
     // Re-attach canvas if we had one
     if (this.canvas) {
       this.inputHandler.attach(this.canvas);
+      this.clipboardHandler.attach(this.canvas);
     }
 
     this.startRenderLoop();

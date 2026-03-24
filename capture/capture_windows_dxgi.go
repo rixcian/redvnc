@@ -86,7 +86,7 @@ type d3d11Texture2DDesc struct {
 }
 
 type d3d11MappedSubresource struct {
-	PData      uintptr
+	PData      unsafe.Pointer // C: void*
 	RowPitch   uint32
 	DepthPitch uint32
 }
@@ -108,26 +108,26 @@ type dxgiOutduplFrameInfo struct {
 var ptrSize = unsafe.Sizeof(uintptr(0))
 
 // comMethod returns the function pointer for the nth vtable method on a COM object.
-func comMethod(obj uintptr, index int) uintptr {
-	vtbl := *(*uintptr)(unsafe.Pointer(obj))
-	return *(*uintptr)(unsafe.Pointer(vtbl + uintptr(index)*ptrSize))
+func comMethod(obj unsafe.Pointer, index int) uintptr {
+	vtbl := *(*unsafe.Pointer)(obj)
+	return *(*uintptr)(unsafe.Add(vtbl, uintptr(index)*ptrSize))
 }
 
 // comRelease calls IUnknown::Release on a COM object.
-func comRelease(obj uintptr) {
-	if obj != 0 {
-		syscall.SyscallN(comMethod(obj, 2), obj)
+func comRelease(obj unsafe.Pointer) {
+	if obj != nil {
+		syscall.SyscallN(comMethod(obj, 2), uintptr(obj))
 	}
 }
 
 // comQueryInterface calls IUnknown::QueryInterface.
-func comQueryInterface(obj uintptr, iid *comGUID) (uintptr, error) {
-	var result uintptr
-	hr, _, _ := syscall.SyscallN(comMethod(obj, 0), obj,
+func comQueryInterface(obj unsafe.Pointer, iid *comGUID) (unsafe.Pointer, error) {
+	var result unsafe.Pointer
+	hr, _, _ := syscall.SyscallN(comMethod(obj, 0), uintptr(obj),
 		uintptr(unsafe.Pointer(iid)),
 		uintptr(unsafe.Pointer(&result)))
 	if hr != 0 {
-		return 0, fmt.Errorf("QueryInterface failed: 0x%08X", hr)
+		return nil, fmt.Errorf("QueryInterface failed: 0x%08X", hr)
 	}
 	return result, nil
 }
@@ -137,10 +137,10 @@ func comQueryInterface(obj uintptr, iid *comGUID) (uintptr, error) {
 // Requires Windows 8 or later. Falls back to GDI if DXGI is unavailable.
 type DXGICapture struct {
 	mu      sync.Mutex
-	device  uintptr // ID3D11Device*
-	ctx     uintptr // ID3D11DeviceContext*
-	dupl    uintptr // IDXGIOutputDuplication*
-	staging uintptr // ID3D11Texture2D* (staging, CPU-readable)
+	device  unsafe.Pointer // ID3D11Device*
+	ctx     unsafe.Pointer // ID3D11DeviceContext*
+	dupl    unsafe.Pointer // IDXGIOutputDuplication*
+	staging unsafe.Pointer // ID3D11Texture2D* (staging, CPU-readable)
 	width   uint16
 	height  uint16
 	stride  int
@@ -165,7 +165,7 @@ func (d *DXGICapture) initDXGI() error {
 	}
 
 	// 1. Create D3D11 device with default hardware adapter
-	var device, ctx uintptr
+	var device, ctx unsafe.Pointer
 	hr, _, _ := procD3D11CreateDevice.Call(
 		0,                                    // pAdapter (NULL = default)
 		uintptr(d3dDriverTypeHardware),       // DriverType
@@ -191,9 +191,9 @@ func (d *DXGICapture) initDXGI() error {
 	}
 	defer comRelease(dxgiDev)
 
-	var adapter uintptr
+	var adapter unsafe.Pointer
 	hr, _, _ = syscall.SyscallN(comMethod(dxgiDev, methDXGIDeviceGetAdapter),
-		dxgiDev, uintptr(unsafe.Pointer(&adapter)))
+		uintptr(dxgiDev), uintptr(unsafe.Pointer(&adapter)))
 	if hr != 0 {
 		comRelease(ctx)
 		comRelease(device)
@@ -201,9 +201,9 @@ func (d *DXGICapture) initDXGI() error {
 	}
 	defer comRelease(adapter)
 
-	var output uintptr
+	var output unsafe.Pointer
 	hr, _, _ = syscall.SyscallN(comMethod(adapter, methAdapterEnumOutputs),
-		adapter, 0, uintptr(unsafe.Pointer(&output)))
+		uintptr(adapter), 0, uintptr(unsafe.Pointer(&output)))
 	if hr != 0 {
 		comRelease(ctx)
 		comRelease(device)
@@ -219,9 +219,9 @@ func (d *DXGICapture) initDXGI() error {
 	}
 	defer comRelease(output1)
 
-	var dupl uintptr
+	var dupl unsafe.Pointer
 	hr, _, _ = syscall.SyscallN(comMethod(output1, methOutput1DuplicateOutput),
-		output1, device, uintptr(unsafe.Pointer(&dupl)))
+		uintptr(output1), uintptr(device), uintptr(unsafe.Pointer(&dupl)))
 	if hr != 0 {
 		comRelease(ctx)
 		comRelease(device)
@@ -248,9 +248,9 @@ func (d *DXGICapture) initDXGI() error {
 		Usage:          d3d11UsageStaging,
 		CPUAccessFlags: d3d11CPUAccessRead,
 	}
-	var staging uintptr
+	var staging unsafe.Pointer
 	hr, _, _ = syscall.SyscallN(comMethod(device, methDeviceCreateTexture2D),
-		device,
+		uintptr(device),
 		uintptr(unsafe.Pointer(&desc)),
 		0, // pInitialData
 		uintptr(unsafe.Pointer(&staging)))
@@ -294,16 +294,16 @@ func (d *DXGICapture) Capture() ([]byte, int, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	if d.dupl == 0 {
+	if d.dupl == nil {
 		return nil, 0, fmt.Errorf("DXGI capture not initialized")
 	}
 
 	// Acquire the next desktop frame (timeout 0 = non-blocking).
 	// If no frame is available (screen unchanged), return the last captured pixels.
 	var frameInfo dxgiOutduplFrameInfo
-	var desktopResource uintptr
+	var desktopResource unsafe.Pointer
 	hr, _, _ := syscall.SyscallN(comMethod(d.dupl, methDuplAcquireNextFrame),
-		d.dupl,
+		uintptr(d.dupl),
 		0, // timeout ms (0 = non-blocking)
 		uintptr(unsafe.Pointer(&frameInfo)),
 		uintptr(unsafe.Pointer(&desktopResource)))
@@ -327,27 +327,27 @@ func (d *DXGICapture) Capture() ([]byte, int, error) {
 	desktopTex, err := comQueryInterface(desktopResource, &iidID3D11Texture2D)
 	comRelease(desktopResource)
 	if err != nil {
-		syscall.SyscallN(comMethod(d.dupl, methDuplReleaseFrame), d.dupl)
+		syscall.SyscallN(comMethod(d.dupl, methDuplReleaseFrame), uintptr(d.dupl))
 		return nil, 0, fmt.Errorf("QueryInterface(ID3D11Texture2D): %w", err)
 	}
 
 	// Copy desktop texture to our staging texture (GPU→GPU, fast)
 	syscall.SyscallN(comMethod(d.ctx, methCtxCopyResource),
-		d.ctx, d.staging, desktopTex)
+		uintptr(d.ctx), uintptr(d.staging), uintptr(desktopTex))
 	comRelease(desktopTex)
 
 	// Map the staging texture to CPU memory
 	var mapped d3d11MappedSubresource
 	hr, _, _ = syscall.SyscallN(comMethod(d.ctx, methCtxMap),
-		d.ctx,
-		d.staging,
-		0,                    // Subresource
+		uintptr(d.ctx),
+		uintptr(d.staging),
+		0,                     // Subresource
 		uintptr(d3d11MapRead), // MapType
-		0,                    // MapFlags
+		0,                     // MapFlags
 		uintptr(unsafe.Pointer(&mapped)))
 
 	if hr != 0 {
-		syscall.SyscallN(comMethod(d.dupl, methDuplReleaseFrame), d.dupl)
+		syscall.SyscallN(comMethod(d.dupl, methDuplReleaseFrame), uintptr(d.dupl))
 		return nil, 0, fmt.Errorf("Map(staging): 0x%08X", hr)
 	}
 
@@ -360,20 +360,20 @@ func (d *DXGICapture) Capture() ([]byte, int, error) {
 
 	if srcPitch == rowBytes {
 		// Fast path: no padding, single memcpy
-		src := unsafe.Slice((*byte)(unsafe.Pointer(mapped.PData)), h*srcPitch)
+		src := unsafe.Slice((*byte)(mapped.PData), h*srcPitch)
 		copy(d.pixels, src)
 	} else {
 		// Row-by-row copy (GPU pitch != display width)
 		for row := 0; row < h; row++ {
-			srcRow := unsafe.Slice((*byte)(unsafe.Pointer(mapped.PData+uintptr(row*srcPitch))), rowBytes)
+			srcRow := unsafe.Slice((*byte)(unsafe.Add(mapped.PData, row*srcPitch)), rowBytes)
 			dstOff := row * rowBytes
 			copy(d.pixels[dstOff:dstOff+rowBytes], srcRow)
 		}
 	}
 
 	// Unmap and release
-	syscall.SyscallN(comMethod(d.ctx, methCtxUnmap), d.ctx, d.staging, 0)
-	syscall.SyscallN(comMethod(d.dupl, methDuplReleaseFrame), d.dupl)
+	syscall.SyscallN(comMethod(d.ctx, methCtxUnmap), uintptr(d.ctx), uintptr(d.staging), 0)
+	syscall.SyscallN(comMethod(d.dupl, methDuplReleaseFrame), uintptr(d.dupl))
 
 	return d.pixels, d.stride, nil
 }
@@ -382,9 +382,9 @@ func (d *DXGICapture) Capture() ([]byte, int, error) {
 // re-creating the output duplication. This happens on desktop switches
 // (UAC, lock screen, Ctrl+Alt+Del).
 func (d *DXGICapture) recreateDuplication() {
-	if d.dupl != 0 {
+	if d.dupl != nil {
 		comRelease(d.dupl)
-		d.dupl = 0
+		d.dupl = nil
 	}
 
 	// Re-traverse: device → IDXGIDevice → adapter → output → output1 → DuplicateOutput
@@ -395,18 +395,18 @@ func (d *DXGICapture) recreateDuplication() {
 	}
 	defer comRelease(dxgiDev)
 
-	var adapter uintptr
+	var adapter unsafe.Pointer
 	hr, _, _ := syscall.SyscallN(comMethod(dxgiDev, methDXGIDeviceGetAdapter),
-		dxgiDev, uintptr(unsafe.Pointer(&adapter)))
+		uintptr(dxgiDev), uintptr(unsafe.Pointer(&adapter)))
 	if hr != 0 {
 		log.Printf("DXGI recreate: GetAdapter failed: 0x%08X", hr)
 		return
 	}
 	defer comRelease(adapter)
 
-	var output uintptr
+	var output unsafe.Pointer
 	hr, _, _ = syscall.SyscallN(comMethod(adapter, methAdapterEnumOutputs),
-		adapter, 0, uintptr(unsafe.Pointer(&output)))
+		uintptr(adapter), 0, uintptr(unsafe.Pointer(&output)))
 	if hr != 0 {
 		log.Printf("DXGI recreate: EnumOutputs failed: 0x%08X", hr)
 		return
@@ -420,9 +420,9 @@ func (d *DXGICapture) recreateDuplication() {
 	}
 	defer comRelease(output1)
 
-	var dupl uintptr
+	var dupl unsafe.Pointer
 	hr, _, _ = syscall.SyscallN(comMethod(output1, methOutput1DuplicateOutput),
-		output1, d.device, uintptr(unsafe.Pointer(&dupl)))
+		uintptr(output1), uintptr(d.device), uintptr(unsafe.Pointer(&dupl)))
 	if hr != 0 {
 		log.Printf("DXGI recreate: DuplicateOutput failed: 0x%08X", hr)
 		return
@@ -440,21 +440,21 @@ func (d *DXGICapture) Close() error {
 		return d.gdi.Close()
 	}
 
-	if d.staging != 0 {
+	if d.staging != nil {
 		comRelease(d.staging)
-		d.staging = 0
+		d.staging = nil
 	}
-	if d.dupl != 0 {
+	if d.dupl != nil {
 		comRelease(d.dupl)
-		d.dupl = 0
+		d.dupl = nil
 	}
-	if d.ctx != 0 {
+	if d.ctx != nil {
 		comRelease(d.ctx)
-		d.ctx = 0
+		d.ctx = nil
 	}
-	if d.device != 0 {
+	if d.device != nil {
 		comRelease(d.device)
-		d.device = 0
+		d.device = nil
 	}
 	d.pixels = nil
 	return nil
