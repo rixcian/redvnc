@@ -27,6 +27,16 @@ func (a *inputInjectorAdapter) PointerEvent(buttonMask uint8, x, y uint16) {
 	}
 }
 
+// SetClipboard implements rfb.ClipboardSetter. It delegates to the underlying
+// injector if it supports clipboard operations (WindowsInput does).
+func (a *inputInjectorAdapter) SetClipboard(text string) error {
+	type setter interface{ SetClipboard(string) error }
+	if s, ok := a.injector.(setter); ok {
+		return s.SetClipboard(text)
+	}
+	return nil
+}
+
 func setupPlatformCaptureAndInput() (rfb.ScreenCapturer, rfb.InputHandler, rfb.CursorProvider, error) {
 	cap, err := capture.NewScreenCapture()
 	if err != nil {
