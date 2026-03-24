@@ -1,5 +1,6 @@
-import { useCallback, useRef } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import type { VncClient } from '../index';
+import { ClipboardPanel } from './ClipboardPanel';
 
 interface ToolbarProps {
   client: VncClient | null;
@@ -9,16 +10,7 @@ interface ToolbarProps {
 
 export const Toolbar: React.FC<ToolbarProps> = ({ client, className, style }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
-
-  const handleClipboardPaste = useCallback(async () => {
-    if (!client?.connected) return;
-    try {
-      const text = await navigator.clipboard.readText();
-      client.sendClipboard(text);
-    } catch {
-      // Clipboard API requires user permission
-    }
-  }, [client]);
+  const [showClipboard, setShowClipboard] = useState(false);
 
   const handleFileUpload = useCallback(() => {
     fileInputRef.current?.click();
@@ -49,10 +41,17 @@ export const Toolbar: React.FC<ToolbarProps> = ({ client, className, style }) =>
     fontSize: '13px',
   };
 
+  const activeButtonStyle: React.CSSProperties = {
+    ...buttonStyle,
+    background: '#4a6cf7',
+    borderColor: '#4a6cf7',
+  };
+
   return (
     <div
       className={className}
       style={{
+        position: 'relative',
         display: 'flex',
         gap: '8px',
         padding: '8px',
@@ -61,8 +60,11 @@ export const Toolbar: React.FC<ToolbarProps> = ({ client, className, style }) =>
         ...style,
       }}
     >
-      <button style={buttonStyle} onClick={handleClipboardPaste}>
-        Paste Clipboard
+      <button
+        style={showClipboard ? activeButtonStyle : buttonStyle}
+        onClick={() => setShowClipboard(v => !v)}
+      >
+        Clipboard
       </button>
       <button style={buttonStyle} onClick={handleFileUpload}>
         Upload File
@@ -76,6 +78,11 @@ export const Toolbar: React.FC<ToolbarProps> = ({ client, className, style }) =>
         multiple
         style={{ display: 'none' }}
         onChange={handleFileChange}
+      />
+      <ClipboardPanel
+        client={client}
+        visible={showClipboard}
+        onClose={() => setShowClipboard(false)}
       />
     </div>
   );

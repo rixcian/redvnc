@@ -39,9 +39,10 @@ import {
   type UploadOptions,
   type UploadResult,
   type UploadProgress,
+  type ClipboardEntry,
 } from './types';
 
-export type { VncClientOptions, UploadOptions, UploadResult, UploadProgress, ConnectionStats };
+export type { VncClientOptions, UploadOptions, UploadResult, UploadProgress, ConnectionStats, ClipboardEntry };
 export type { VncViewerProps } from './types';
 
 const ENCODING_NAMES: Record<number, string> = {
@@ -293,6 +294,22 @@ export class VncClient {
 
   onClipboard(callback: (text: string) => void): void {
     this.clipboardHandler.onClipboard(callback);
+  }
+
+  getClipboardHistory(): ClipboardEntry[] {
+    return this.clipboardHandler.history;
+  }
+
+  onClipboardHistory(callback: (entries: ClipboardEntry[]) => void): void {
+    this.clipboardHandler.onHistoryChange(callback);
+  }
+
+  get clipboardAutoSync(): boolean {
+    return this.clipboardHandler.autoSync;
+  }
+
+  set clipboardAutoSync(enabled: boolean) {
+    this.clipboardHandler.autoSync = enabled;
   }
 
   async uploadFile(file: File, options?: UploadOptions): Promise<UploadResult> {
@@ -608,3 +625,4 @@ export { VncViewer } from './components/VncViewer';
 export { DebugOverlay } from './components/DebugOverlay';
 export { FileUploadDropZone } from './components/FileUpload';
 export { Toolbar } from './components/Toolbar';
+export { ClipboardPanel } from './components/ClipboardPanel';

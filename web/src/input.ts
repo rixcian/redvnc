@@ -1,6 +1,11 @@
 import { writeKeyEvent, writePointerEvent } from './rfb-writer';
 import type { IRenderer } from './renderer-interface';
 
+// Detect macOS so we can differentiate Cmd+V (system paste) from Ctrl+V
+// (which should pass through to the remote as a regular key event).
+const isMac = typeof navigator !== 'undefined' &&
+  /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+
 // X11 keysym mapping from KeyboardEvent.code
 const CODE_TO_KEYSYM: Record<string, number> = {
   Backspace: 0xff08,
@@ -163,18 +168,28 @@ export class InputHandler {
   private handleKeyDown(e: KeyboardEvent): void {
     e.preventDefault();
 
-    // Intercept paste shortcut: Cmd+V (macOS) or Ctrl+V (Windows/Linux).
-    // Read the browser clipboard, send it to the remote so the OS clipboard
-    // is updated before the paste key event arrives at the remote app.
-    // Translate Cmd+V → Ctrl+V so Windows/Linux remotes recognise the shortcut.
-    if (e.key === 'v' && (e.metaKey || e.ctrlKey)) {
+    // Intercept the SYSTEM paste shortcut only:
+    //   macOS  → Cmd+V  (metaKey, NOT ctrlKey)
+    //   Other  → Ctrl+V (ctrlKey, NOT metaKey)
+    //
+    // On macOS, Ctrl+V is NOT the paste shortcut — it should pass through to
+    // the remote as a regular key event (e.g. for terminal use). Intercepting
+    // it would read the local clipboard and overwrite the remote clipboard,
+    // breaking copy-from-remote workflows.
+    const isPasteShortcut =
+      e.key === 'v' &&
+      (isMac
+        ? (e.metaKey && !e.ctrlKey)   // Cmd+V on macOS
+        : (e.ctrlKey && !e.metaKey)); // Ctrl+V on Windows/Linux
+
+    if (isPasteShortcut) {
       const sendFn = this.sendFn;
       const sendClipboard = this.sendClipboard;
 
       // On macOS, MetaLeft keydown was already relayed to the remote.
       // Release it now so it doesn't interfere with the Ctrl+V we're about
       // to send.
-      if (e.metaKey && !e.ctrlKey) {
+      if (e.metaKey) {
         sendFn(writeKeyEvent(false, 0xffe7)); // MetaLeft up
         sendFn(writeKeyEvent(false, 0xffe8)); // MetaRight up (just in case)
       }
