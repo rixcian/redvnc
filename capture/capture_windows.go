@@ -79,6 +79,7 @@ type GDICapture struct {
 	bits      unsafe.Pointer
 	width     uint16
 	height    uint16
+	pixels    []byte // persistent pixel buffer — allocated once in Init, reused every frame
 }
 
 func NewScreenCapture() (ScreenCapture, error) {
@@ -137,6 +138,7 @@ func (g *GDICapture) Init() error {
 	g.bits = bits
 	g.width = uint16(w)
 	g.height = uint16(h)
+	g.pixels = make([]byte, int(w)*int(h)*4)
 
 	log.Println("screen capture: using GDI BitBlt (Windows 7+)")
 	return nil
@@ -169,18 +171,17 @@ func (g *GDICapture) Capture() ([]byte, int, error) {
 	stride := w * 4
 	size := stride * h
 
-	// Copy pixel data from the DIB section.
+	// Copy pixel data from the DIB section into the persistent buffer.
 	// The DIB section stores pixels as BGRX (32bpp, X = unused alpha).
 	src := unsafe.Slice((*byte)(g.bits), size)
-	pixels := make([]byte, size)
-	copy(pixels, src)
+	copy(g.pixels, src)
 
-	// Set alpha channel to 255 (DIB section leaves it as 0).
+	// Set alpha channel to 255 in-place (DIB section leaves it as 0).
 	for i := 3; i < size; i += 4 {
-		pixels[i] = 255
+		g.pixels[i] = 255
 	}
 
-	return pixels, stride, nil
+	return g.pixels, stride, nil
 }
 
 func (g *GDICapture) Close() error {

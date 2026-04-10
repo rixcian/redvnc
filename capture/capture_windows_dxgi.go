@@ -4,6 +4,7 @@ package capture
 
 import (
 	"fmt"
+	"image"
 	"log"
 	"sync"
 	"syscall"
@@ -53,6 +54,10 @@ const (
 	methOutput1DuplicateOutput = 22
 	// IDXGIOutputDuplication::AcquireNextFrame (IUnknown=3 + IDXGIObject=4 + 1)
 	methDuplAcquireNextFrame = 8
+	// IDXGIOutputDuplication::GetFrameDirtyRects (IUnknown=3 + IDXGIObject=4 + 2)
+	methDuplGetFrameDirtyRects = 9
+	// IDXGIOutputDuplication::GetFrameMoveRects (IUnknown=3 + IDXGIObject=4 + 3)
+	methDuplGetFrameMoveRects = 10
 	// IDXGIOutputDuplication::ReleaseFrame (IUnknown=3 + IDXGIObject=4 + 7)
 	methDuplReleaseFrame = 14
 	// ID3D11Device::CreateTexture2D (IUnknown=3 + 2)
@@ -90,6 +95,9 @@ type d3d11MappedSubresource struct {
 	RowPitch   uint32
 	DepthPitch uint32
 }
+
+// winRECT matches the Windows RECT structure used by DXGI dirty rect metadata.
+type winRECT struct{ Left, Top, Right, Bottom int32 }
 
 type dxgiOutduplFrameInfo struct {
 	LastPresentTime           int64
@@ -135,6 +143,7 @@ func comQueryInterface(obj unsafe.Pointer, iid *comGUID) (unsafe.Pointer, error)
 // DXGICapture captures the primary screen using DXGI Desktop Duplication.
 // This is significantly faster than GDI BitBlt (typically <5ms vs 30ms+).
 // Requires Windows 8 or later. Falls back to GDI if DXGI is unavailable.
+// Implements the optional DirtyRectCapture interface.
 type DXGICapture struct {
 	mu      sync.Mutex
 	device  unsafe.Pointer // ID3D11Device*
@@ -145,6 +154,13 @@ type DXGICapture struct {
 	height  uint16
 	stride  int
 	pixels  []byte // persistent pixel buffer (avoids per-frame allocation)
+
+	// Dirty rect tracking. lastDirtyRects is set by each Capture() call:
+	//   nil  = full-frame change (unknown which regions changed)
+	//   []   = no change (DXGI_ERROR_WAIT_TIMEOUT or zero metadata)
+	//   [..] = specific changed regions
+	lastDirtyRects []image.Rectangle
+	metaBuf        []byte // reusable metadata scratch buffer for GetFrameDirtyRects
 
 	gdi *GDICapture // fallback if DXGI unavailable
 }
@@ -309,7 +325,9 @@ func (d *DXGICapture) Capture() ([]byte, int, error) {
 		uintptr(unsafe.Pointer(&desktopResource)))
 
 	if hr == uintptr(dxgiErrorWaitTimeout) {
-		// No new frame — return last captured pixels
+		// No new frame — screen unchanged. Return cached pixels and signal no change
+		// via an empty (non-nil) dirty rect slice.
+		d.lastDirtyRects = d.lastDirtyRects[:0]
 		return d.pixels, d.stride, nil
 	}
 
@@ -336,7 +354,17 @@ func (d *DXGICapture) Capture() ([]byte, int, error) {
 		uintptr(d.ctx), uintptr(d.staging), uintptr(desktopTex))
 	comRelease(desktopTex)
 
-	// Map the staging texture to CPU memory
+	// Query dirty rect metadata before releasing the frame.
+	// GetFrameDirtyRects must be called while the frame is still acquired.
+	d.lastDirtyRects = d.queryDirtyRects(frameInfo.TotalMetadataBufferSize)
+
+	// Release the duplication frame now, before Map().
+	// The staging texture is an independent GPU resource — it does not depend on
+	// the frame remaining acquired. Releasing early lets DXGI start accumulating
+	// the next frame's changes sooner, reducing AcquireNextFrame latency next call.
+	syscall.SyscallN(comMethod(d.dupl, methDuplReleaseFrame), uintptr(d.dupl))
+
+	// Map the staging texture to CPU memory (stalls until GPU write completes)
 	var mapped d3d11MappedSubresource
 	hr, _, _ = syscall.SyscallN(comMethod(d.ctx, methCtxMap),
 		uintptr(d.ctx),
@@ -347,7 +375,6 @@ func (d *DXGICapture) Capture() ([]byte, int, error) {
 		uintptr(unsafe.Pointer(&mapped)))
 
 	if hr != 0 {
-		syscall.SyscallN(comMethod(d.dupl, methDuplReleaseFrame), uintptr(d.dupl))
 		return nil, 0, fmt.Errorf("Map(staging): 0x%08X", hr)
 	}
 
@@ -371,11 +398,65 @@ func (d *DXGICapture) Capture() ([]byte, int, error) {
 		}
 	}
 
-	// Unmap and release
 	syscall.SyscallN(comMethod(d.ctx, methCtxUnmap), uintptr(d.ctx), uintptr(d.staging), 0)
-	syscall.SyscallN(comMethod(d.dupl, methDuplReleaseFrame), uintptr(d.dupl))
 
 	return d.pixels, d.stride, nil
+}
+
+// queryDirtyRects calls GetFrameDirtyRects to retrieve the list of screen
+// regions that changed since the previous AcquireNextFrame. Must be called
+// while the frame is still acquired (before ReleaseFrame).
+// Returns nil if the full frame changed (unexpected metadata size), or a
+// slice of rectangles (may be empty if nothing changed).
+func (d *DXGICapture) queryDirtyRects(metaSize uint32) []image.Rectangle {
+	if metaSize == 0 {
+		// No metadata means either nothing changed (but we didn't get timeout)
+		// or DXGI coalesced everything — treat as full frame.
+		return nil
+	}
+
+	// Grow scratch buffer if needed (never shrinks to avoid repeated allocs).
+	if uint32(cap(d.metaBuf)) < metaSize {
+		d.metaBuf = make([]byte, metaSize)
+	}
+	d.metaBuf = d.metaBuf[:metaSize]
+
+	var sizeRequired uint32
+	hr, _, _ := syscall.SyscallN(comMethod(d.dupl, methDuplGetFrameDirtyRects),
+		uintptr(d.dupl),
+		uintptr(metaSize),
+		uintptr(unsafe.Pointer(&d.metaBuf[0])),
+		uintptr(unsafe.Pointer(&sizeRequired)))
+	if hr != 0 {
+		// Query failed — fall back to full-frame encode.
+		return nil
+	}
+
+	rectSize := unsafe.Sizeof(winRECT{})
+	count := uintptr(sizeRequired) / rectSize
+	if count == 0 {
+		// Reuse slice with zero length to signal "no change".
+		return d.lastDirtyRects[:0]
+	}
+
+	rects := make([]image.Rectangle, 0, count)
+	for i := uintptr(0); i < count; i++ {
+		r := (*winRECT)(unsafe.Pointer(&d.metaBuf[i*rectSize]))
+		rects = append(rects, image.Rect(int(r.Left), int(r.Top), int(r.Right), int(r.Bottom)))
+	}
+	return rects
+}
+
+// LastDirtyRects returns the dirty rectangles from the most recent Capture()
+// call. It implements the optional DirtyRectCapture interface.
+//
+//   - nil  → full-frame change; encode the entire frame.
+//   - []   → no change; safe to skip encoding this frame.
+//   - [..] → only these regions changed; encode them selectively.
+//
+// Must be called from the same goroutine as Capture().
+func (d *DXGICapture) LastDirtyRects() []image.Rectangle {
+	return d.lastDirtyRects
 }
 
 // recreateDuplication handles DXGI_ERROR_ACCESS_LOST by releasing and
