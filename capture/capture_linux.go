@@ -82,8 +82,13 @@ static x11_capture_t* x11_capture_init(int *out_w, int *out_h) {
 	return ctx;
 }
 
-static int x11_capture_frame(x11_capture_t *ctx, unsigned char **out_pixels, int *out_stride) {
-	if (!ctx || !ctx->dpy) return -1;
+// x11_capture_frame_into captures the screen directly into the caller-provided
+// buffer dst (width*height*4 bytes, tight stride = width*4). This eliminates
+// the intermediate malloc and the extra Go-side allocation that the old API
+// required. The function handles source images with non-tight strides by
+// copying row-by-row.
+static int x11_capture_frame_into(x11_capture_t *ctx, unsigned char *dst, int dst_width, int dst_height) {
+	if (!ctx || !ctx->dpy || !dst) return -1;
 
 	XImage *img = NULL;
 
@@ -102,23 +107,29 @@ static int x11_capture_frame(x11_capture_t *ctx, unsigned char **out_pixels, int
 
 	// X11 ZPixmap with depth 24/32 gives us pixels in BGRX or BGRA format (on little-endian).
 	// The server expects BGRA, so we just need to ensure alpha = 255.
-	int stride = img->bytes_per_line;
-	int size = stride * ctx->height;
+	int src_stride = img->bytes_per_line;
+	int dst_stride = dst_width * 4;
+	int rows = dst_height < ctx->height ? dst_height : ctx->height;
 
-	unsigned char *buf = (unsigned char*)malloc(size);
-	if (!buf) return -1;
-
-	memcpy(buf, img->data, size);
-
-	// Set alpha channel to 255 if 32-bit pixels
-	if (img->bits_per_pixel == 32) {
-		for (int i = 3; i < size; i += 4) {
-			buf[i] = 255;
+	if (src_stride == dst_stride) {
+		// Fast path: source and destination strides match — single copy.
+		memcpy(dst, img->data, (size_t)dst_stride * (size_t)rows);
+	} else {
+		// Row-by-row copy to handle GPU-aligned source strides.
+		int copy_bytes = src_stride < dst_stride ? src_stride : dst_stride;
+		for (int row = 0; row < rows; row++) {
+			memcpy(dst + row * dst_stride, img->data + row * src_stride, copy_bytes);
 		}
 	}
 
-	*out_pixels = buf;
-	*out_stride = stride;
+	// Set alpha channel to 255 in-place if 32-bit pixels.
+	if (img->bits_per_pixel == 32) {
+		int size = dst_stride * rows;
+		for (int i = 3; i < size; i += 4) {
+			dst[i] = 255;
+		}
+	}
+
 	return 0;
 }
 
@@ -154,6 +165,8 @@ type X11Capture struct {
 	ctx    *C.x11_capture_t
 	width  uint16
 	height uint16
+	pixels []byte // persistent pixel buffer — allocated once in Init, reused every frame
+	stride int
 }
 
 func NewScreenCapture() (ScreenCapture, error) {
@@ -169,6 +182,8 @@ func (x *X11Capture) Init() error {
 	x.ctx = ctx
 	x.width = uint16(w)
 	x.height = uint16(h)
+	x.stride = int(w) * 4
+	x.pixels = make([]byte, int(w)*int(h)*4)
 	return nil
 }
 
@@ -181,20 +196,14 @@ func (x *X11Capture) Capture() ([]byte, int, error) {
 		return nil, 0, fmt.Errorf("X11 capture not initialized")
 	}
 
-	var buf *C.uchar
-	var stride C.int
-
-	rc := C.x11_capture_frame(x.ctx, &buf, &stride)
+	rc := C.x11_capture_frame_into(x.ctx,
+		(*C.uchar)(unsafe.Pointer(&x.pixels[0])),
+		C.int(x.width), C.int(x.height))
 	if rc != 0 {
 		return nil, 0, fmt.Errorf("X11 screen capture failed")
 	}
-	defer C.free(unsafe.Pointer(buf))
 
-	size := int(stride) * int(x.height)
-	pixels := make([]byte, size)
-	copy(pixels, unsafe.Slice((*byte)(unsafe.Pointer(buf)), size))
-
-	return pixels, int(stride), nil
+	return x.pixels, x.stride, nil
 }
 
 func (x *X11Capture) Close() error {

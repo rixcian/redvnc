@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
+	"image"
 	"io"
 	"log/slog"
 	"net"
@@ -32,6 +33,19 @@ type ScreenCapturer interface {
 	// Capture captures the current screen into a pixel buffer.
 	// Returns raw pixel data in the server's pixel format and the stride (bytes per row).
 	Capture() (pixels []byte, stride int, err error)
+}
+
+// dirtyRectCapturer is an optional extension of ScreenCapturer. When the
+// configured Capturer also implements this interface, the server queries
+// dirty rectangles after each Capture() call and encodes only changed regions.
+//
+// Return conventions for LastDirtyRects:
+//
+//	nil  → full-frame change; encode everything.
+//	[]   → no change since last frame; send empty FBU.
+//	[..] → only these regions changed; encode selectively (Tight only).
+type dirtyRectCapturer interface {
+	LastDirtyRects() []image.Rectangle
 }
 
 // InputHandler processes keyboard and pointer events from VNC clients.
@@ -133,6 +147,11 @@ func NewServer(config ServerConfig) *Server {
 	}
 	if config.Capturer != nil {
 		config.Width, config.Height = config.Capturer.Bounds()
+		// Wrap the capturer in a PipelinedCapturer so capture overlaps with
+		// encode+send of the previous frame, hiding capture latency.
+		pc := NewPipelinedCapturer(config.Capturer)
+		pc.Start(config.MaxFPS)
+		config.Capturer = pc
 	}
 	if config.Width == 0 {
 		config.Width = 1024
@@ -562,13 +581,20 @@ func (c *ClientConn) handleFramebufferRequestTimed(req *FramebufferUpdateRequest
 		return
 	}
 
-	t1 := time.Now()
-	encode, send, err = c.encodeAndSendFrame(req, pixels, stride)
-	_ = t1
+	// Query dirty rectangles if the capturer supports it.
+	// nil  → full-frame change (default when interface not implemented).
+	// []   → no change; encodeAndSendFrame will send an empty FBU.
+	// [..] → partial update; Tight path will encode only changed regions.
+	var dirtyRects []image.Rectangle
+	if dc, ok := capturer.(dirtyRectCapturer); ok {
+		dirtyRects = dc.LastDirtyRects()
+	}
+
+	encode, send, err = c.encodeAndSendFrame(req, pixels, stride, dirtyRects)
 	return
 }
 
-func (c *ClientConn) encodeAndSendFrame(req *FramebufferUpdateRequest, pixels []byte, stride int) (encode, send time.Duration, err error) {
+func (c *ClientConn) encodeAndSendFrame(req *FramebufferUpdateRequest, pixels []byte, stride int, dirtyRects []image.Rectangle) (encode, send time.Duration, err error) {
 	capturer := c.server.config.Capturer
 	capW, capH := capturer.Bounds()
 
@@ -616,6 +642,22 @@ func (c *ClientConn) encodeAndSendFrame(req *FramebufferUpdateRequest, pixels []
 	bestEnc := c.bestEncoding()
 	c.server.logger.Debug("best encoding", "encoding", bestEnc, "encodings", c.encodings, "tight_available", c.server.config.NewTightEncoder != nil)
 
+	// If dirtyRects is non-nil and empty, the capturer signalled no change.
+	// Send an empty FBU (RFC 6143 §7.6.1 permits zero rectangles) so the client
+	// can issue its next request. Pseudo-rects (cursor, desktop resize) are still
+	// sent when present so they are never dropped.
+	if dirtyRects != nil && len(dirtyRects) == 0 {
+		encode = 0
+		sendStart := time.Now()
+		if writeErr := WriteFramebufferUpdate(c.bw, pseudoRects); writeErr != nil {
+			err = writeErr
+			return
+		}
+		err = c.bw.Flush()
+		send = time.Since(sendStart)
+		return
+	}
+
 	encodeStart := time.Now()
 
 	switch bestEnc {
@@ -623,10 +665,33 @@ func (c *ClientConn) encodeAndSendFrame(req *FramebufferUpdateRequest, pixels []
 		if c.tightEnc == nil {
 			c.tightEnc = c.server.config.NewTightEncoder()
 		}
-		rects, encErr := c.tightEnc.EncodeMulti(req.X, req.Y, req.Width, req.Height, pixels, stride)
-		if encErr != nil {
-			err = fmt.Errorf("tight encode: %w", encErr)
-			return
+		var rects []Rectangle
+		if len(dirtyRects) > 0 {
+			// Dirty-rect path: encode only the changed regions intersected with req.
+			reqRect := image.Rect(int(req.X), int(req.Y), int(req.X)+int(req.Width), int(req.Y)+int(req.Height))
+			for _, dr := range dirtyRects {
+				ix := dr.Intersect(reqRect)
+				if ix.Empty() {
+					continue
+				}
+				tileRects, encErr := c.tightEnc.EncodeMulti(
+					uint16(ix.Min.X), uint16(ix.Min.Y),
+					uint16(ix.Dx()), uint16(ix.Dy()),
+					pixels, stride)
+				if encErr != nil {
+					err = fmt.Errorf("tight encode: %w", encErr)
+					return
+				}
+				rects = append(rects, tileRects...)
+			}
+		} else {
+			// Full-frame path (dirtyRects == nil: full change or no dirty-rect support).
+			var encErr error
+			rects, encErr = c.tightEnc.EncodeMulti(req.X, req.Y, req.Width, req.Height, pixels, stride)
+			if encErr != nil {
+				err = fmt.Errorf("tight encode: %w", encErr)
+				return
+			}
 		}
 		rects = append(pseudoRects, rects...)
 		encode = time.Since(encodeStart)
