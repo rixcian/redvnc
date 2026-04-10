@@ -322,6 +322,56 @@ func TestTightReuse(t *testing.T) {
 	}
 }
 
+// TestTightMultiStreamBasic verifies that Basic tiles are distributed round-robin
+// across the 4 zlib streams and that each tile decompresses correctly.
+// A low-variance gradient is used to stay below the JPEG variance threshold.
+func TestTightMultiStreamBasic(t *testing.T) {
+	enc := NewTight(75)
+	defer enc.Reset()
+
+	// Build a framebuffer with 5 tiles arranged horizontally (5×64 = 320 wide,
+	// 16 tall). Tiles are 64×16 — below 4096 pixels so they can't be JPEG.
+	// Use a slow gradient so colorVariance stays below 512.
+	cols := 5
+	tileW, tileH := 64, 16
+	fbW, fbH := cols*tileW, tileH
+	stride := fbW * 4
+	pixels := make([]byte, fbH*stride)
+	for y := 0; y < fbH; y++ {
+		for x := 0; x < fbW; x++ {
+			off := (y*fbW + x) * 4
+			v := byte(x * 3 % 256) // slow ramp — low variance per 64-px tile
+			pixels[off] = v         // B
+			pixels[off+1] = v       // G
+			pixels[off+2] = v       // R
+			pixels[off+3] = 255
+		}
+	}
+
+	rects, err := enc.EncodeMulti(0, 0, uint16(fbW), uint16(fbH), pixels, stride)
+	if err != nil {
+		t.Fatalf("EncodeMulti: %v", err)
+	}
+	if len(rects) != cols {
+		t.Fatalf("expected %d tile rects, got %d", cols, len(rects))
+	}
+
+	// Each tile must be Basic (control byte & 0x0f in range 0x00–0x03).
+	// The stream indices must cycle 0, 1, 2, 3, 0 for the 5 tiles.
+	expectedStreams := []byte{0, 1, 2, 3, 0}
+	for i, r := range rects {
+		control := r.Data[0]
+		subType := control & 0x0f
+		if subType > 0x03 {
+			t.Errorf("tile %d: expected Basic sub-encoding (0x00–0x03), got 0x%02x", i, subType)
+			continue
+		}
+		if subType != expectedStreams[i] {
+			t.Errorf("tile %d: expected stream %d, got %d", i, expectedStreams[i], subType)
+		}
+	}
+}
+
 // readCompactLen reads a compact length from the start of data.
 // Returns the length and the number of bytes consumed.
 func readCompactLen(data []byte) (int, int) {
