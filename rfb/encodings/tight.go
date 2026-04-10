@@ -7,6 +7,7 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	"sync"
 
 	"github.com/rixcian/redvnc/rfb"
 )
@@ -81,23 +82,33 @@ func (t *Tight) Encode(x, y, width, height uint16, pixels []byte, stride int) (*
 // EncodeMulti encodes pixel data into multiple Tight rectangles (one per tile).
 // Each rectangle has its own rect header with correct tile position and size.
 // pixels is raw BGRA pixel data, stride is the number of bytes per row of the full framebuffer.
+//
+// Tiles are encoded in parallel: JPEG tiles run in independent goroutines, Basic
+// tiles are distributed round-robin across the 4 zlib streams (one goroutine per
+// stream, tiles within a stream encoded sequentially to preserve the zlib dictionary),
+// and Solid tiles are encoded inline with no goroutine overhead.
 func (t *Tight) EncodeMulti(x, y, width, height uint16, pixels []byte, stride int) ([]rfb.Rectangle, error) {
-	w := int(width)
-	h := int(height)
-	var rects []rfb.Rectangle
+	w, h := int(width), int(height)
+
+	// --- Phase 1: classify tiles ---
+	type tileInfo struct {
+		absX, absY             int
+		tileW, tileH           int
+		pixels                 []byte
+		isSolid                bool
+		solidR, solidG, solidB byte
+		isJPEG                 bool
+		streamIdx              int // Basic tiles only
+	}
+
+	basicCount := 0
+	var tiles []tileInfo
 
 	for tileY := 0; tileY < h; tileY += tileSize {
-		tileH := tileSize
-		if tileY+tileH > h {
-			tileH = h - tileY
-		}
+		tileH := min(tileSize, h-tileY)
 		for tileX := 0; tileX < w; tileX += tileSize {
-			tileW := tileSize
-			if tileX+tileW > w {
-				tileW = w - tileX
-			}
+			tileW := min(tileSize, w-tileX)
 
-			// Extract tile pixels (BGRA) from the framebuffer
 			tilePixels := make([]byte, tileW*tileH*4)
 			for row := 0; row < tileH; row++ {
 				srcY := int(y) + tileY + row
@@ -110,24 +121,100 @@ func (t *Tight) EncodeMulti(x, y, width, height uint16, pixels []byte, stride in
 				copy(tilePixels[row*tileW*4:], pixels[srcOffset:srcEnd])
 			}
 
-			tileData, err := t.encodeTile(tilePixels, tileW, tileH)
-			if err != nil {
-				return nil, fmt.Errorf("tight encode tile (%d,%d): %w", tileX, tileY, err)
+			ti := tileInfo{
+				absX: int(x) + tileX, absY: int(y) + tileY,
+				tileW: tileW, tileH: tileH, pixels: tilePixels,
 			}
-
-			rects = append(rects, rfb.Rectangle{
-				Header: rfb.RectHeader{
-					X:        x + uint16(tileX),
-					Y:        y + uint16(tileY),
-					Width:    uint16(tileW),
-					Height:   uint16(tileH),
-					Encoding: rfb.EncodingTight,
-				},
-				Data: tileData,
-			})
+			if r, g, b, ok := t.isSolidColor(tilePixels, tileW, tileH); ok {
+				ti.isSolid = true
+				ti.solidR, ti.solidG, ti.solidB = r, g, b
+			} else if tileW*tileH >= 4096 && t.colorVariance(tilePixels, tileW, tileH) > 512 {
+				ti.isJPEG = true
+			} else {
+				ti.streamIdx = basicCount % 4
+				basicCount++
+			}
+			tiles = append(tiles, ti)
 		}
 	}
 
+	// --- Phase 2: parallel encoding ---
+	results := make([][]byte, len(tiles))
+	errs := make([]error, len(tiles))
+	var wg sync.WaitGroup
+
+	// Solid: encode inline, no goroutine needed.
+	for i := range tiles {
+		if tiles[i].isSolid {
+			ti := tiles[i]
+			results[i] = []byte{0x08, ti.solidR, ti.solidG, ti.solidB}
+		}
+	}
+
+	// JPEG: each tile is fully independent — one goroutine per tile.
+	for i := range tiles {
+		if !tiles[i].isJPEG {
+			continue
+		}
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i], errs[i] = t.encodeJPEG(tiles[i].pixels, tiles[i].tileW, tiles[i].tileH)
+		}(i)
+	}
+
+	// Basic: group by stream index; one goroutine per stream encodes its tiles
+	// sequentially to preserve the per-stream zlib dictionary across tiles.
+	// Goroutines for different streams are fully independent (each touches only
+	// its own t.streams[s] entry).
+	type basicWork struct {
+		idx int
+		ti  tileInfo
+	}
+	var streamWork [4][]basicWork
+	for i := range tiles {
+		if !tiles[i].isSolid && !tiles[i].isJPEG {
+			s := tiles[i].streamIdx
+			streamWork[s] = append(streamWork[s], basicWork{i, tiles[i]})
+		}
+	}
+	for s := 0; s < 4; s++ {
+		if len(streamWork[s]) == 0 {
+			continue
+		}
+		wg.Add(1)
+		go func(s int, work []basicWork) {
+			defer wg.Done()
+			for _, w := range work {
+				data, err := t.encodeBasic(w.ti.pixels, w.ti.tileW, w.ti.tileH, s)
+				results[w.idx] = data
+				errs[w.idx] = err
+				if err != nil {
+					return
+				}
+			}
+		}(s, streamWork[s])
+	}
+
+	wg.Wait()
+
+	// --- Phase 3: assemble rectangles in original row-major order ---
+	rects := make([]rfb.Rectangle, len(tiles))
+	for i, ti := range tiles {
+		if errs[i] != nil {
+			return nil, fmt.Errorf("tight encode tile (%d,%d): %w", ti.absX, ti.absY, errs[i])
+		}
+		rects[i] = rfb.Rectangle{
+			Header: rfb.RectHeader{
+				X:        uint16(ti.absX),
+				Y:        uint16(ti.absY),
+				Width:    uint16(ti.tileW),
+				Height:   uint16(ti.tileH),
+				Encoding: rfb.EncodingTight,
+			},
+			Data: results[i],
+		}
+	}
 	return rects, nil
 }
 
@@ -136,21 +223,6 @@ func (t *Tight) Reset() {
 	for _, s := range t.streams {
 		s.reset()
 	}
-}
-
-func (t *Tight) encodeTile(tilePixels []byte, tileW, tileH int) ([]byte, error) {
-	// Check for solid color
-	if r, g, b, ok := t.isSolidColor(tilePixels, tileW, tileH); ok {
-		return []byte{0x08, r, g, b}, nil
-	}
-
-	// Use JPEG for large, high-variance tiles
-	if tileW*tileH >= 4096 && t.colorVariance(tilePixels, tileW, tileH) > 512 {
-		return t.encodeJPEG(tilePixels, tileW, tileH)
-	}
-
-	// Fall back to Basic (zlib stream 0)
-	return t.encodeBasic(tilePixels, tileW, tileH, 0)
 }
 
 // isSolidColor checks if all pixels in the tile are the same color.

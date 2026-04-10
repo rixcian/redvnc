@@ -220,6 +220,29 @@ These are the optimizations currently in place. Understanding them prevents re-d
 |---|---|---|
 | **MaxFPS rate limiting** | `server.go` `framebufferWriter` | Prevents wasting CPU on faster-than-displayable frame rates. Default: 30 FPS. |
 | **Frame timing diagnostics** | `server.go` `framebufferWriter` | Logs fps/capture/encode/send breakdown every 5s for bottleneck identification. |
+| **Parallel Tight tile encoding** | `rfb/encodings/tight.go` `EncodeMulti` | JPEG tiles fan out to independent goroutines; Basic tiles round-robin across 4 zlib streams (one goroutine per stream). See benchmark results below. |
+
+### Server-side Tight Encoding Benchmark Results
+
+Measured on Intel Xeon Platinum 8581C @ 2.10GHz, 16 logical cores, Go 1.24, 1920×1080.
+Run with: `go test -bench=. -benchtime=5s -benchmem ./rfb/encodings/`
+
+| Tile path | Parallel (`EncodeMulti`) | Sequential (baseline) | Speedup |
+|---|---|---|---|
+| **JPEG** (all 510 tiles, high-variance) | 11.3 ms/frame | 101.5 ms/frame | **9×** |
+| **Basic/zlib** (all 510 tiles, low-variance) | 9.9 ms/frame | 28.3 ms/frame | **2.9×** |
+| **Solid** (all 510 tiles, uniform) | 5.8 ms/frame | 5.6 ms/frame | ~1× (inline, no goroutines) |
+
+Projected full-frame FPS at 1920×1080 (assuming avg_capture=45ms, avg_send=2ms from timing logs):
+
+| Content | Before | After |
+|---|---|---|
+| JPEG-heavy | ~7 FPS (147ms) | ~17 FPS (58ms) |
+| Basic-heavy | ~13 FPS (75ms) | ~18 FPS (57ms) |
+| Typical mixed (~9-11 FPS measured) | ~10 FPS (102ms) | ~16–17 FPS (~58ms) |
+| Capture-limited ceiling (encode→0) | — | ~21 FPS (47ms) |
+
+JPEG speedup scales with available CPU cores (9× on 16 cores). Basic speedup is capped at 4× by the 4-stream Tight protocol limit.
 
 ### What was tried and didn't help
 
@@ -238,8 +261,11 @@ INFO frame timing fps=9.2 avg_capture=45ms avg_encode=55ms avg_send=2ms avg_fram
 
 **Next optimization targets (in priority order):**
 1. **Server capture optimization** — if `avg_capture` is high, optimize the platform-specific screen capture (e.g., DXGI on Windows, ScreenCaptureKit on macOS)
-2. **Server Tight encoding optimization** — if `avg_encode` is high, profile the Go Tight encoder (`rfb/encodings/tight.go`)
-3. **Incremental/dirty-rect capture** — only capture and encode changed screen regions instead of full screen every frame
+2. **Parallel Tight tile encoding** — the Tight encoder is currently single-threaded (tiles processed sequentially in `EncodeMulti`). Two tiers of parallelism are possible:
+   - **JPEG tiles**: fully independent (each allocates its own buffer, no shared state). Can be fanned out to goroutines and results collected in order. Straightforward `sync.WaitGroup` / channel approach.
+   - **Basic (zlib) tiles**: stream 0 is currently used for all Basic tiles, and zlib stream state is sequential (each tile's compressed bytes depend on the previous tile's dictionary). However, Tight defines **4 independent streams** (indices 0–3), each with its own `fflate.Inflate` on the browser side. Distributing tiles across all 4 streams (e.g., round-robin by tile index) allows 4-way parallelism — one goroutine per stream, each processing its assigned subset in order. Compression ratio drops slightly (each stream sees ¼ the data) but throughput should increase proportionally to CPU cores up to 4×.
+3. **Server Tight encoding optimization** — if `avg_encode` is high, profile the Go Tight encoder (`rfb/encodings/tight.go`); the pixel format conversion loops (BGRA→RGB in `encodeBasic`, BGRA→RGBA in `encodeJPEG`) are additional candidates for SIMD or batch optimization
+4. **Incremental/dirty-rect capture** — only capture and encode changed screen regions instead of full screen every frame
 
 ---
 

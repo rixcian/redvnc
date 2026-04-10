@@ -322,6 +322,205 @@ func TestTightReuse(t *testing.T) {
 	}
 }
 
+// TestTightMultiStreamBasic verifies that Basic tiles are distributed round-robin
+// across the 4 zlib streams and that each tile decompresses correctly.
+// A low-variance gradient is used to stay below the JPEG variance threshold.
+func TestTightMultiStreamBasic(t *testing.T) {
+	enc := NewTight(75)
+	defer enc.Reset()
+
+	// Build a framebuffer with 5 tiles arranged horizontally (5×64 = 320 wide,
+	// 16 tall). Tiles are 64×16 — below 4096 pixels so they can't be JPEG.
+	// Use a slow gradient so colorVariance stays below 512.
+	cols := 5
+	tileW, tileH := 64, 16
+	fbW, fbH := cols*tileW, tileH
+	stride := fbW * 4
+	pixels := make([]byte, fbH*stride)
+	for y := 0; y < fbH; y++ {
+		for x := 0; x < fbW; x++ {
+			off := (y*fbW + x) * 4
+			v := byte(x * 3 % 256) // slow ramp — low variance per 64-px tile
+			pixels[off] = v         // B
+			pixels[off+1] = v       // G
+			pixels[off+2] = v       // R
+			pixels[off+3] = 255
+		}
+	}
+
+	rects, err := enc.EncodeMulti(0, 0, uint16(fbW), uint16(fbH), pixels, stride)
+	if err != nil {
+		t.Fatalf("EncodeMulti: %v", err)
+	}
+	if len(rects) != cols {
+		t.Fatalf("expected %d tile rects, got %d", cols, len(rects))
+	}
+
+	// Each tile must be Basic (control byte & 0x0f in range 0x00–0x03).
+	// The stream indices must cycle 0, 1, 2, 3, 0 for the 5 tiles.
+	expectedStreams := []byte{0, 1, 2, 3, 0}
+	for i, r := range rects {
+		control := r.Data[0]
+		subType := control & 0x0f
+		if subType > 0x03 {
+			t.Errorf("tile %d: expected Basic sub-encoding (0x00–0x03), got 0x%02x", i, subType)
+			continue
+		}
+		if subType != expectedStreams[i] {
+			t.Errorf("tile %d: expected stream %d, got %d", i, expectedStreams[i], subType)
+		}
+	}
+}
+
+// --- Benchmarks ---
+
+const (
+	bench1080W = 1920
+	bench1080H = 1080
+)
+
+// makeLowVariancePixels creates pixels with per-tile colorVariance << 512
+// (values cycle 0-3), so all tiles take the Basic/zlib path.
+func makeLowVariancePixels(w, h int) ([]byte, int) {
+	stride := w * 4
+	pixels := make([]byte, h*stride)
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			off := (y*w + x) * 4
+			v := byte(x % 4)
+			pixels[off] = v
+			pixels[off+1] = v
+			pixels[off+2] = v
+			pixels[off+3] = 255
+		}
+	}
+	return pixels, stride
+}
+
+// sequentialEncodeMulti is the pre-parallelisation reference implementation,
+// used only as a benchmark baseline.
+func sequentialEncodeMulti(t *Tight, x, y, width, height uint16, pixels []byte, stride int) ([]rfb.Rectangle, error) {
+	w, h := int(width), int(height)
+	var rects []rfb.Rectangle
+	for tileY := 0; tileY < h; tileY += tileSize {
+		tileH := min(tileSize, h-tileY)
+		for tileX := 0; tileX < w; tileX += tileSize {
+			tileW := min(tileSize, w-tileX)
+			tilePixels := make([]byte, tileW*tileH*4)
+			for row := 0; row < tileH; row++ {
+				srcY := int(y) + tileY + row
+				srcX := int(x) + tileX
+				srcOffset := srcY*stride + srcX*4
+				copy(tilePixels[row*tileW*4:], pixels[srcOffset:srcOffset+tileW*4])
+			}
+			var (
+				data []byte
+				err  error
+			)
+			if r, g, b, ok := t.isSolidColor(tilePixels, tileW, tileH); ok {
+				data = []byte{0x08, r, g, b}
+			} else if tileW*tileH >= 4096 && t.colorVariance(tilePixels, tileW, tileH) > 512 {
+				data, err = t.encodeJPEG(tilePixels, tileW, tileH)
+			} else {
+				data, err = t.encodeBasic(tilePixels, tileW, tileH, 0)
+			}
+			if err != nil {
+				return nil, err
+			}
+			rects = append(rects, rfb.Rectangle{
+				Header: rfb.RectHeader{
+					X: x + uint16(tileX), Y: y + uint16(tileY),
+					Width: uint16(tileW), Height: uint16(tileH),
+					Encoding: rfb.EncodingTight,
+				},
+				Data: data,
+			})
+		}
+	}
+	return rects, nil
+}
+
+// BenchmarkTightEncodeMulti_1080p_JPEG — all tiles take the JPEG path
+// (high-variance pixels, all 64×64 tiles qualify). Maximum parallelism benefit.
+func BenchmarkTightEncodeMulti_1080p_JPEG(b *testing.B) {
+	enc := NewTight(75)
+	defer enc.Reset()
+	pixels, stride := makeVariedPixels(bench1080W, bench1080H)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := enc.EncodeMulti(0, 0, bench1080W, bench1080H, pixels, stride); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkTightEncodeMulti_1080p_Basic — all tiles take the Basic/zlib path
+// (low variance, not solid). Tests 4-stream parallelism.
+func BenchmarkTightEncodeMulti_1080p_Basic(b *testing.B) {
+	enc := NewTight(75)
+	defer enc.Reset()
+	pixels, stride := makeLowVariancePixels(bench1080W, bench1080H)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := enc.EncodeMulti(0, 0, bench1080W, bench1080H, pixels, stride); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkTightEncodeMulti_1080p_Solid — all tiles take the Solid path.
+// No goroutines spawned; represents pure overhead of the classification phase.
+func BenchmarkTightEncodeMulti_1080p_Solid(b *testing.B) {
+	enc := NewTight(75)
+	defer enc.Reset()
+	pixels, stride := makeSolidPixels(bench1080W, bench1080H, 0x40, 0x80, 0xC0)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := enc.EncodeMulti(0, 0, bench1080W, bench1080H, pixels, stride); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkTightSeq_1080p_JPEG — sequential baseline for JPEG tiles.
+func BenchmarkTightSeq_1080p_JPEG(b *testing.B) {
+	enc := NewTight(75)
+	defer enc.Reset()
+	pixels, stride := makeVariedPixels(bench1080W, bench1080H)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := sequentialEncodeMulti(enc, 0, 0, bench1080W, bench1080H, pixels, stride); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkTightSeq_1080p_Basic — sequential baseline for Basic/zlib tiles.
+func BenchmarkTightSeq_1080p_Basic(b *testing.B) {
+	enc := NewTight(75)
+	defer enc.Reset()
+	pixels, stride := makeLowVariancePixels(bench1080W, bench1080H)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := sequentialEncodeMulti(enc, 0, 0, bench1080W, bench1080H, pixels, stride); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkTightSeq_1080p_Solid — sequential baseline for Solid tiles.
+func BenchmarkTightSeq_1080p_Solid(b *testing.B) {
+	enc := NewTight(75)
+	defer enc.Reset()
+	pixels, stride := makeSolidPixels(bench1080W, bench1080H, 0x40, 0x80, 0xC0)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := sequentialEncodeMulti(enc, 0, 0, bench1080W, bench1080H, pixels, stride); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // readCompactLen reads a compact length from the start of data.
 // Returns the length and the number of bytes consumed.
 func readCompactLen(data []byte) (int, int) {
