@@ -8,9 +8,18 @@
 //	go run ./example/server -demo                  # gradient test pattern
 //	go run ./example/server -port 5901             # custom port
 //	go run ./example/server -password secret       # VNC auth enabled
+//	go run ./example/server -vencrypt-cert cert.pem -vencrypt-key key.pem            # VeNCrypt with TLS
+//	go run ./example/server -vencrypt-cert cert.pem -vencrypt-key key.pem \
+//	        -password secret -vencrypt-username admin                                 # VeNCrypt + Plain auth
+//
+// Generate a self-signed certificate for testing:
+//
+//	openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -days 365 \
+//	  -keyout key.pem -out cert.pem -nodes -subj "/CN=localhost"
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log"
@@ -90,11 +99,14 @@ func (i *inputLogger) PointerEvent(buttonMask uint8, x, y uint16) {
 // ---------------------------------------------------------------------------
 
 func main() {
-	port := flag.Int("port", 5900, "TCP port to listen on")
-	password := flag.String("password", "", "VNC password (empty = no auth)")
-	width := flag.Int("width", 800, "Framebuffer width")
-	height := flag.Int("height", 600, "Framebuffer height")
-	demo := flag.Bool("demo", false, "Use gradient test pattern instead of real screen")
+	port             := flag.Int("port", 5900, "TCP port to listen on")
+	password         := flag.String("password", "", "VNC password (empty = no auth)")
+	width            := flag.Int("width", 800, "Framebuffer width")
+	height           := flag.Int("height", 600, "Framebuffer height")
+	demo             := flag.Bool("demo", false, "Use gradient test pattern instead of real screen")
+	vencryptCert     := flag.String("vencrypt-cert", "", "PEM certificate file for VeNCrypt TLS sub-types")
+	vencryptKey      := flag.String("vencrypt-key", "", "PEM key file for VeNCrypt TLS sub-types")
+	vencryptUsername := flag.String("vencrypt-username", "", "Username accepted by VeNCrypt Plain sub-types (uses -password for the password)")
 	flag.Parse()
 
 	var capturer rfb.ScreenCapturer
@@ -132,7 +144,42 @@ func main() {
 		},
 	}
 
-	if *password != "" {
+	// Build security handler list.
+	if *vencryptCert != "" && *vencryptKey != "" {
+		// VeNCrypt mode: load TLS cert/key and offer all sub-types.
+		cert, err := tls.LoadX509KeyPair(*vencryptCert, *vencryptKey)
+		if err != nil {
+			log.Fatalf("error: load vencrypt cert/key: %v", err)
+		}
+		tlsCfg := &tls.Config{Certificates: []tls.Certificate{cert}}
+
+		venc := &security.VeNCrypt{
+			TLSConfig:   tlsCfg,
+			VNCPassword: *password,
+		}
+		if *vencryptUsername != "" {
+			user := *vencryptUsername
+			pass := *password
+			venc.PlainAuth = func(username, pw string) error {
+				if username == user && pw == pass {
+					return nil
+				}
+				return fmt.Errorf("invalid credentials")
+			}
+		}
+
+		// Offer VeNCrypt first, then fall back to VNCAuth/None for legacy clients.
+		config.Security = []rfb.SecurityHandler{venc}
+		if *password != "" {
+			config.Security = append(config.Security, &security.VNCAuth{Password: *password})
+		}
+		config.Security = append(config.Security, &security.None{})
+
+		log.Printf("VeNCrypt enabled (cert: %s)", *vencryptCert)
+		if *vencryptUsername != "" {
+			log.Printf("VeNCrypt Plain auth enabled (username: %s)", *vencryptUsername)
+		}
+	} else if *password != "" {
 		config.Security = []rfb.SecurityHandler{
 			&security.VNCAuth{Password: *password},
 		}

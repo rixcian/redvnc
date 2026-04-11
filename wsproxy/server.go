@@ -86,6 +86,10 @@ type Config struct {
 	// Default: 30s.
 	ShutdownTimeout time.Duration
 
+	// VeNCrypt configures VeNCrypt authentication when connecting to upstream VNC servers.
+	// When Enabled is true, the proxy will attempt VeNCrypt before falling back to VNCAuth/None.
+	VeNCrypt VeNCryptConfig
+
 	// Logger is the structured logger. If nil, slog.Default() is used.
 	Logger *slog.Logger
 }

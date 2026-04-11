@@ -266,6 +266,25 @@ func main() {
 		logger.Warn("No allowed origins configured. WebSocket connections from any origin will be accepted.")
 	}
 
+	// VeNCrypt config
+	var vencryptCfg wsproxy.VeNCryptConfig
+	if fileCfg != nil && fileCfg.Security != nil && fileCfg.Security.VeNCrypt != nil {
+		v := fileCfg.Security.VeNCrypt
+		vencryptCfg = wsproxy.VeNCryptConfig{
+			Enabled:           v.Enabled,
+			Insecure:          v.Insecure,
+			CACertFile:        v.CACertFile,
+			ClientCertFile:    v.ClientCertFile,
+			ClientKeyFile:     v.ClientKeyFile,
+			Username:          v.Username,
+			PreferredSubTypes: v.PreferredSubTypes,
+		}
+	}
+	// VNC username from config (for Plain sub-types)
+	if fileCfg != nil && fileCfg.Security != nil && fileCfg.Security.VNCUsername != "" && vencryptCfg.Username == "" {
+		vencryptCfg.Username = fileCfg.Security.VNCUsername
+	}
+
 	config := wsproxy.Config{
 		ListenAddr:              finalListen,
 		AllowedVNCTargets:       finalTargets,
@@ -279,6 +298,7 @@ func main() {
 		TLSKeyFile:              finalTLSKey,
 		AllowedOrigins:          finalOrigins,
 		ShutdownTimeout:         finalShutdownTimeout,
+		VeNCrypt:                vencryptCfg,
 		Logger:                  logger,
 	}
 

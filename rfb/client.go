@@ -12,6 +12,8 @@ import (
 	"io"
 	"net"
 	"sync"
+
+	"github.com/rixcian/redvnc/rfb/security"
 )
 
 // ClientConfig holds configuration for a VNC client connection.
@@ -29,6 +31,23 @@ type ClientConfig struct {
 	// TLSConfig enables TLS encryption on the client. If non-nil, the client
 	// wraps the connection in TLS before the RFB handshake.
 	TLSConfig *tls.Config
+
+	// VeNCrypt-specific fields (used when the server offers security type 19).
+
+	// Username is the login name for VeNCrypt Plain-based sub-types (256, 259, 262).
+	Username string
+
+	// VeNCryptPassword is the password for VeNCrypt Plain sub-types (256, 259, 262).
+	// If empty, Password is used.
+	VeNCryptPassword string
+
+	// VeNCryptSubTypes is the ordered list of preferred VeNCrypt sub-types.
+	// If empty, the library default order is used (X509VNCAuth first, Plain last).
+	VeNCryptSubTypes []uint32
+
+	// VeNCryptTLSConfig is the TLS config used for VeNCrypt TLS/X509 sub-types.
+	// If nil, TLSConfig is used as the base config.
+	VeNCryptTLSConfig *tls.Config
 }
 
 // Client represents a VNC client connected to a server.
@@ -123,7 +142,10 @@ func (c *Client) handshake() error {
 		return err
 	}
 
-	// Perform security handshake
+	// Perform security handshake.
+	// vencryptHandled is set true when VeNCrypt inner auth already sent+consumed
+	// the SecurityResult, so the outer read below must be skipped.
+	vencryptHandled := false
 	switch chosenType {
 	case SecurityNone:
 		// Nothing to do
@@ -131,25 +153,56 @@ func (c *Client) handshake() error {
 		if err := c.performVNCAuth(); err != nil {
 			return err
 		}
+	case SecurityVeNCrypt:
+		tlsCfg := c.config.VeNCryptTLSConfig
+		if tlsCfg == nil {
+			tlsCfg = c.config.TLSConfig
+		}
+		vncPassword := c.config.VeNCryptPassword
+		if vncPassword == "" {
+			vncPassword = c.config.Password
+		}
+		vCfg := security.VeNCryptClientConfig{
+			PreferredSubTypes: c.config.VeNCryptSubTypes,
+			TLSConfig:         tlsCfg,
+			VNCPassword:       vncPassword,
+			Username:          c.config.Username,
+			Password:          c.config.VeNCryptPassword,
+		}
+		// Plain sub-type password falls back to Password as well.
+		if vCfg.Password == "" {
+			vCfg.Password = c.config.Password
+		}
+		upgConn, newBR, newBW, err := security.VeNCryptClient(c.conn, c.br, c.bw, vCfg)
+		if err != nil {
+			return err
+		}
+		c.conn = upgConn
+		c.br = newBR
+		c.bw = newBW
+		vencryptHandled = true
 	default:
 		return fmt.Errorf("unsupported security type: %d", chosenType)
 	}
 
-	// Read SecurityResult
-	var secResult uint32
-	if err := binary.Read(c.br, binary.BigEndian, &secResult); err != nil {
-		return fmt.Errorf("read security result: %w", err)
-	}
-	if secResult != 0 {
-		var reasonLen uint32
-		if err := binary.Read(c.br, binary.BigEndian, &reasonLen); err != nil {
-			return fmt.Errorf("authentication failed (could not read reason)")
+	// Read SecurityResult. VeNCrypt inner auth already consumed this, so skip it
+	// when VeNCrypt was used.
+	if !vencryptHandled {
+		var secResult uint32
+		if err := binary.Read(c.br, binary.BigEndian, &secResult); err != nil {
+			return fmt.Errorf("read security result: %w", err)
 		}
-		reason := make([]byte, reasonLen)
-		if _, err := io.ReadFull(c.br, reason); err != nil {
-			return fmt.Errorf("authentication failed (could not read reason text)")
+		if secResult != 0 {
+			var reasonLen uint32
+			if err := binary.Read(c.br, binary.BigEndian, &reasonLen); err != nil {
+				return fmt.Errorf("authentication failed (could not read reason)")
+			}
+			reason := make([]byte, reasonLen)
+			if _, err := io.ReadFull(c.br, reason); err != nil {
+				return fmt.Errorf("authentication failed (could not read reason text)")
+			}
+			return fmt.Errorf("authentication failed: %s", string(reason))
 		}
-		return fmt.Errorf("authentication failed: %s", string(reason))
 	}
 
 	// Send ClientInit
@@ -196,6 +249,20 @@ func (c *Client) handshake() error {
 }
 
 func (c *Client) chooseSecurityType(available []uint8) uint8 {
+	// Prefer VeNCrypt when any VeNCrypt-specific config is set, or when a
+	// password is provided (VeNCrypt offers encrypted VNCAuth sub-types).
+	wantVeNCrypt := len(c.config.VeNCryptSubTypes) > 0 ||
+		c.config.Username != "" ||
+		c.config.VeNCryptTLSConfig != nil ||
+		c.config.Password != ""
+	if wantVeNCrypt {
+		for _, t := range available {
+			if t == SecurityVeNCrypt {
+				return SecurityVeNCrypt
+			}
+		}
+	}
+	// Fall back to VNCAuth if a password is set.
 	if c.config.Password != "" {
 		for _, t := range available {
 			if t == SecurityVNCAuth {

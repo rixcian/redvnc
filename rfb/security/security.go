@@ -1,12 +1,14 @@
-// Package security implements RFB security types (None and VNC Authentication).
+// Package security implements RFB security types (None, VNC Authentication, and VeNCrypt).
 package security
 
 import (
+	"bufio"
 	"crypto/des"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"net"
 )
 
 // SecurityType defines the interface for RFB security handlers.
@@ -14,8 +16,10 @@ type SecurityType interface {
 	// Type returns the RFB security type number.
 	Type() uint8
 	// Handshake performs the server-side security handshake.
-	// Returns nil on success, an error on authentication failure.
-	Handshake(rw io.ReadWriter) error
+	// It may return a TLS-upgraded net.Conn (e.g. VeNCrypt). Non-upgrading
+	// handlers return conn unchanged. The caller must replace its conn/br/bw
+	// if the returned conn differs from the input conn.
+	Handshake(conn net.Conn, br *bufio.Reader, bw *bufio.Writer) (net.Conn, error)
 }
 
 // None implements SecurityType with no authentication.
@@ -23,9 +27,10 @@ type None struct{}
 
 func (n *None) Type() uint8 { return 1 }
 
-func (n *None) Handshake(rw io.ReadWriter) error {
+func (n *None) Handshake(conn net.Conn, br *bufio.Reader, bw *bufio.Writer) (net.Conn, error) {
 	// SecurityResult: OK
-	return binary.Write(rw, binary.BigEndian, uint32(0))
+	err := binary.Write(bw, binary.BigEndian, uint32(0))
+	return conn, err
 }
 
 // VNCAuth implements SecurityType with VNC DES challenge-response authentication.
@@ -35,26 +40,35 @@ type VNCAuth struct {
 
 func (v *VNCAuth) Type() uint8 { return 2 }
 
-func (v *VNCAuth) Handshake(rw io.ReadWriter) error {
+func (v *VNCAuth) Handshake(conn net.Conn, br *bufio.Reader, bw *bufio.Writer) (net.Conn, error) {
+	return conn, vncAuthHandshake(br, bw, v.Password)
+}
+
+// vncAuthHandshake performs the server-side VNC DES challenge-response handshake,
+// writing the SecurityResult. It is reused by VeNCrypt inner auth.
+func vncAuthHandshake(br *bufio.Reader, bw *bufio.Writer, password string) error {
 	// Generate 16-byte random challenge
 	challenge := make([]byte, 16)
 	if _, err := rand.Read(challenge); err != nil {
 		return fmt.Errorf("generate challenge: %w", err)
 	}
 
-	// Send challenge
-	if _, err := rw.Write(challenge); err != nil {
+	// Send challenge and flush so the client can read it
+	if _, err := bw.Write(challenge); err != nil {
 		return fmt.Errorf("send challenge: %w", err)
+	}
+	if err := bw.Flush(); err != nil {
+		return fmt.Errorf("flush challenge: %w", err)
 	}
 
 	// Read 16-byte response
 	response := make([]byte, 16)
-	if _, err := io.ReadFull(rw, response); err != nil {
+	if _, err := io.ReadFull(br, response); err != nil {
 		return fmt.Errorf("read response: %w", err)
 	}
 
 	// Verify response
-	expected, err := vncEncrypt(challenge, v.Password)
+	expected, err := vncEncrypt(challenge, password)
 	if err != nil {
 		return fmt.Errorf("vnc auth encrypt: %w", err)
 	}
@@ -67,21 +81,21 @@ func (v *VNCAuth) Handshake(rw io.ReadWriter) error {
 
 	if !ok {
 		// SecurityResult: Failed
-		if err := binary.Write(rw, binary.BigEndian, uint32(1)); err != nil {
+		if err := binary.Write(bw, binary.BigEndian, uint32(1)); err != nil {
 			return err
 		}
 		reason := "authentication failed"
-		if err := binary.Write(rw, binary.BigEndian, uint32(len(reason))); err != nil {
+		if err := binary.Write(bw, binary.BigEndian, uint32(len(reason))); err != nil {
 			return err
 		}
-		if _, err := rw.Write([]byte(reason)); err != nil {
+		if _, err := bw.Write([]byte(reason)); err != nil {
 			return err
 		}
 		return fmt.Errorf("vnc auth: %s", reason)
 	}
 
 	// SecurityResult: OK
-	return binary.Write(rw, binary.BigEndian, uint32(0))
+	return binary.Write(bw, binary.BigEndian, uint32(0))
 }
 
 // vncEncrypt encrypts a 16-byte challenge using the VNC DES scheme.

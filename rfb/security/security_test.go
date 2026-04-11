@@ -1,8 +1,10 @@
 package security
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
+	"net"
 	"testing"
 )
 
@@ -52,16 +54,35 @@ func TestNoneHandshake(t *testing.T) {
 		t.Errorf("expected type 1, got %d", none.Type())
 	}
 
-	var buf bytes.Buffer
-	err := none.Handshake(&buf)
-	if err != nil {
-		t.Fatalf("None.Handshake: %v", err)
-	}
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
 
+	br := bufio.NewReader(serverConn)
+	bw := bufio.NewWriter(serverConn)
+
+	// Run handshake in goroutine (it writes SecurityResult)
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := none.Handshake(serverConn, br, bw)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		errCh <- bw.Flush()
+	}()
+
+	// Client reads SecurityResult
 	var result uint32
-	binary.Read(&buf, binary.BigEndian, &result)
+	if err := binary.Read(clientConn, binary.BigEndian, &result); err != nil {
+		t.Fatalf("read security result: %v", err)
+	}
 	if result != 0 {
 		t.Errorf("expected security result 0, got %d", result)
+	}
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("None.Handshake: %v", err)
 	}
 }
 
@@ -76,56 +97,49 @@ func TestVNCAuthHandshakeSuccess(t *testing.T) {
 	password := "testpass"
 	auth := &VNCAuth{Password: password}
 
-	// Simulate the handshake: server writes challenge, client responds
-	var serverBuf bytes.Buffer
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
 
-	// We need a pipe-like setup. Let's do it manually.
-	// Server writes challenge → client reads challenge → client computes response → server verifies
+	br := bufio.NewReader(serverConn)
+	bw := bufio.NewWriter(serverConn)
 
-	// Step 1: Generate challenge (the Handshake method does this internally)
-	// We'll test by calling VNCAuthClient with the same password
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := auth.Handshake(serverConn, br, bw)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		errCh <- bw.Flush()
+	}()
 
-	// Create a connected pair using bytes.Buffer as intermediary
-	challengeResponse := &authSimulator{password: password}
-	err := auth.Handshake(challengeResponse)
-	if err != nil {
-		t.Fatalf("VNCAuth.Handshake with correct password should succeed: %v", err)
+	// Simulate client: read challenge, send response
+	challenge := make([]byte, 16)
+	if _, err := clientConn.Read(challenge); err != nil {
+		t.Fatalf("read challenge: %v", err)
 	}
 
-	// Verify the security result was written
+	response, err := vncEncrypt(challenge, password)
+	if err != nil {
+		t.Fatalf("vncEncrypt: %v", err)
+	}
+	if _, err := clientConn.Write(response); err != nil {
+		t.Fatalf("write response: %v", err)
+	}
+
+	// Read SecurityResult
 	var result uint32
-	binary.Read(&serverBuf, binary.BigEndian, &result)
-	// The result is written to the authSimulator, which we can check
-}
-
-// authSimulator simulates a VNC client for testing the server handshake.
-type authSimulator struct {
-	password  string
-	challenge []byte
-	writeBuf  bytes.Buffer
-}
-
-func (a *authSimulator) Read(p []byte) (int, error) {
-	if a.challenge == nil {
-		return 0, nil
+	if err := binary.Read(clientConn, binary.BigEndian, &result); err != nil {
+		t.Fatalf("read security result: %v", err)
 	}
-	// Return the encrypted response
-	response, err := vncEncrypt(a.challenge, a.password)
-	if err != nil {
-		return 0, err
+	if result != 0 {
+		t.Errorf("expected security result 0, got %d", result)
 	}
-	return copy(p, response), nil
-}
 
-func (a *authSimulator) Write(p []byte) (int, error) {
-	if a.challenge == nil && len(p) == 16 {
-		// Server is writing the challenge
-		a.challenge = make([]byte, 16)
-		copy(a.challenge, p)
-		return len(p), nil
+	if err := <-errCh; err != nil {
+		t.Fatalf("VNCAuth.Handshake: %v", err)
 	}
-	// Server is writing security result
-	return a.writeBuf.Write(p)
 }
 
 func TestVNCAuthPasswordTruncation(t *testing.T) {

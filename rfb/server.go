@@ -73,9 +73,12 @@ type CursorProvider interface {
 }
 
 // SecurityHandler performs the security handshake with a client.
+// Handshake may return a TLS-upgraded net.Conn (e.g. VeNCrypt). Non-upgrading
+// handlers return conn unchanged. The caller must replace its conn/br/bw if
+// the returned conn differs from the input conn.
 type SecurityHandler interface {
 	Type() uint8
-	Handshake(rw io.ReadWriter) error
+	Handshake(conn net.Conn, br *bufio.Reader, bw *bufio.Writer) (net.Conn, error)
 }
 
 // ServerConfig holds configuration for the VNC server.
@@ -339,11 +342,17 @@ func (c *ClientConn) handshake() error {
 		return fmt.Errorf("client chose unsupported security type: %d", chosenType)
 	}
 
-	// Create a ReadWriter combining buffered reader/writer for the handshake
-	rw := &bufReadWriter{r: c.br, w: c.bw}
-	if err := handler.Handshake(rw); err != nil {
+	upgradedConn, err := handler.Handshake(c.conn, c.br, c.bw)
+	if err != nil {
 		c.bw.Flush()
 		return err
+	}
+	if upgradedConn != c.conn {
+		// TLS upgrade happened (e.g. VeNCrypt); replace conn and buffered I/O so
+		// the rest of the session (ServerInit, framebuffer relay, etc.) uses TLS.
+		c.conn = upgradedConn
+		c.br = bufio.NewReaderSize(upgradedConn, c.br.Size())
+		c.bw = bufio.NewWriterSize(upgradedConn, c.bw.Size())
 	}
 	if err := c.bw.Flush(); err != nil {
 		return fmt.Errorf("flush security result: %w", err)
@@ -1044,14 +1053,8 @@ func (c *ClientConn) Close() error {
 type noneSecurity struct{}
 
 func (n *noneSecurity) Type() uint8 { return SecurityNone }
-func (n *noneSecurity) Handshake(rw io.ReadWriter) error {
-	return binary.Write(rw, binary.BigEndian, uint32(0))
-}
-
-// bufReadWriter combines a buffered reader and writer into an io.ReadWriter.
-type bufReadWriter struct {
-	r io.Reader
-	w *bufio.Writer
+func (n *noneSecurity) Handshake(conn net.Conn, br *bufio.Reader, bw *bufio.Writer) (net.Conn, error) {
+	return conn, binary.Write(bw, binary.BigEndian, uint32(0))
 }
 
 // previewText returns up to maxLen characters of s for use in log messages.
@@ -1061,16 +1064,4 @@ func previewText(s string, maxLen int) string {
 		return s
 	}
 	return string(runes[:maxLen]) + "…"
-}
-
-func (brw *bufReadWriter) Read(p []byte) (int, error) {
-	return brw.r.Read(p)
-}
-
-func (brw *bufReadWriter) Write(p []byte) (int, error) {
-	n, err := brw.w.Write(p)
-	if err != nil {
-		return n, err
-	}
-	return n, brw.w.Flush()
 }

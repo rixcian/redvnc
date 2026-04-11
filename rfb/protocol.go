@@ -16,8 +16,20 @@ const (
 
 // Security types.
 const (
-	SecurityNone    uint8 = 1
-	SecurityVNCAuth uint8 = 2
+	SecurityNone     uint8 = 1
+	SecurityVNCAuth  uint8 = 2
+	SecurityVeNCrypt uint8 = 19
+)
+
+// VeNCrypt sub-type codes (uint32 values negotiated within the VeNCrypt handshake).
+const (
+	VeNCryptPlain       uint32 = 256
+	VeNCryptTLSNone     uint32 = 257
+	VeNCryptTLSVNCAuth  uint32 = 258
+	VeNCryptTLSPlain    uint32 = 259
+	VeNCryptX509None    uint32 = 260
+	VeNCryptX509VNCAuth uint32 = 261
+	VeNCryptX509Plain   uint32 = 262
 )
 
 // Client-to-server message types.

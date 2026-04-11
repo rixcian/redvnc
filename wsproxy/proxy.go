@@ -60,7 +60,7 @@ func (p *Proxy) Run(ctx context.Context) {
 	br := bufio.NewReaderSize(tcpConn, 256*1024)
 
 	// Perform RFB handshake with VNC server
-	serverInit, err := p.performHandshake(tcpConn, br)
+	serverInit, br, err := p.performHandshake(tcpConn, br)
 	if err != nil {
 		p.server.logger.Warn("handshake failed", "session_id", p.session.ID, "error", err)
 		// Record auth failure for rate limiting
@@ -78,6 +78,7 @@ func (p *Proxy) Run(ctx context.Context) {
 
 	// Create RFB message reader using the server's initial pixel format.
 	// This is updated when the client sends SetPixelFormat.
+	// br may be a new TLS-backed reader if VeNCrypt was used.
 	pf := serverInit.PixelFormat
 	p.rfbReader = newRFBReader(br, pf.BitsPerPixel, pf.Depth, pf.TrueColour)
 
@@ -113,126 +114,155 @@ func (p *Proxy) Run(ctx context.Context) {
 }
 
 // performHandshake performs the RFB handshake with the VNC server.
-func (p *Proxy) performHandshake(conn net.Conn, br *bufio.Reader) (*rfb.ServerInit, error) {
+// It returns the ServerInit, the (possibly TLS-upgraded) bufio.Reader, and any error.
+// The caller must use the returned br for subsequent reads (e.g. newRFBReader).
+func (p *Proxy) performHandshake(conn net.Conn, br *bufio.Reader) (*rfb.ServerInit, *bufio.Reader, error) {
 	bw := bufio.NewWriter(conn)
 
 	// Read server version
 	serverVersion := make([]byte, 12)
 	if _, err := io.ReadFull(br, serverVersion); err != nil {
-		return nil, fmt.Errorf("read server version: %w", err)
+		return nil, br, fmt.Errorf("read server version: %w", err)
 	}
 
 	// Send our version (3.8)
 	if _, err := bw.WriteString(rfb.VersionString3_8); err != nil {
-		return nil, fmt.Errorf("write version: %w", err)
+		return nil, br, fmt.Errorf("write version: %w", err)
 	}
 	if err := bw.Flush(); err != nil {
-		return nil, fmt.Errorf("flush version: %w", err)
+		return nil, br, fmt.Errorf("flush version: %w", err)
 	}
 
 	// Read security types
 	var numTypes uint8
 	if err := binary.Read(br, binary.BigEndian, &numTypes); err != nil {
-		return nil, fmt.Errorf("read security type count: %w", err)
+		return nil, br, fmt.Errorf("read security type count: %w", err)
 	}
 	if numTypes == 0 {
 		// Server refused connection, read reason
 		var reasonLen uint32
 		if err := binary.Read(br, binary.BigEndian, &reasonLen); err != nil {
-			return nil, fmt.Errorf("read failure reason length: %w", err)
+			return nil, br, fmt.Errorf("read failure reason length: %w", err)
 		}
 		reason := make([]byte, reasonLen)
 		if _, err := io.ReadFull(br, reason); err != nil {
-			return nil, fmt.Errorf("read failure reason: %w", err)
+			return nil, br, fmt.Errorf("read failure reason: %w", err)
 		}
-		return nil, fmt.Errorf("server refused connection: %s", string(reason))
+		return nil, br, fmt.Errorf("server refused connection: %s", string(reason))
 	}
 
 	secTypes := make([]uint8, numTypes)
 	for i := range secTypes {
 		if err := binary.Read(br, binary.BigEndian, &secTypes[i]); err != nil {
-			return nil, fmt.Errorf("read security type: %w", err)
+			return nil, br, fmt.Errorf("read security type: %w", err)
 		}
 	}
 
 	// Choose security type
-	chosenType := chooseSecurityType(secTypes, p.session.Password)
+	chosenType := chooseSecurityType(secTypes, p.session.Password, p.server.config.VeNCrypt.Enabled)
 	p.authType = chosenType
 	if err := binary.Write(bw, binary.BigEndian, chosenType); err != nil {
-		return nil, fmt.Errorf("write security choice: %w", err)
+		return nil, br, fmt.Errorf("write security choice: %w", err)
 	}
 	if err := bw.Flush(); err != nil {
-		return nil, fmt.Errorf("flush security choice: %w", err)
+		return nil, br, fmt.Errorf("flush security choice: %w", err)
 	}
 
-	// Perform security handshake
-	// We use a combined reader/writer that works through the buffered streams
+	// Perform security handshake.
+	// vencryptHandled is true when VeNCrypt inner auth already consumed the SecurityResult.
+	vencryptHandled := false
 	rw := &bufReadWriter{br: br, bw: bw}
 	switch chosenType {
 	case rfb.SecurityNone:
 		// Nothing to do before reading result
 	case rfb.SecurityVNCAuth:
 		if err := security.VNCAuthClient(rw, p.session.Password); err != nil {
-			return nil, fmt.Errorf("vnc auth: %w", err)
+			return nil, br, fmt.Errorf("vnc auth: %w", err)
 		}
 		if err := bw.Flush(); err != nil {
-			return nil, fmt.Errorf("flush vnc auth: %w", err)
+			return nil, br, fmt.Errorf("flush vnc auth: %w", err)
 		}
+	case rfb.SecurityVeNCrypt:
+		tlsCfg, err := p.server.config.VeNCrypt.BuildTLSConfig()
+		if err != nil {
+			return nil, br, fmt.Errorf("vencrypt tls config: %w", err)
+		}
+		vncPassword := p.session.Password
+		vCfg := security.VeNCryptClientConfig{
+			PreferredSubTypes: p.server.config.VeNCrypt.PreferredSubTypes,
+			TLSConfig:         tlsCfg,
+			VNCPassword:       vncPassword,
+			Username:          p.server.config.VeNCrypt.Username,
+			Password:          vncPassword,
+		}
+		upgConn, newBR, newBW, err := security.VeNCryptClient(conn, br, bw, vCfg)
+		if err != nil {
+			return nil, br, fmt.Errorf("vencrypt: %w", err)
+		}
+		// Update session TCP conn so relayBrowserToVNC writes to the TLS conn.
+		p.session.TCPConn = upgConn
+		conn = upgConn
+		br = newBR
+		bw = newBW
+		vencryptHandled = true
 	default:
-		return nil, fmt.Errorf("unsupported security type: %d", chosenType)
+		return nil, br, fmt.Errorf("unsupported security type: %d", chosenType)
 	}
 
-	// Read SecurityResult
-	var secResult uint32
-	if err := binary.Read(br, binary.BigEndian, &secResult); err != nil {
-		return nil, fmt.Errorf("read security result: %w", err)
-	}
-	if secResult != 0 {
-		var reasonLen uint32
-		if err := binary.Read(br, binary.BigEndian, &reasonLen); err != nil {
-			return nil, fmt.Errorf("authentication failed (cannot read reason)")
+	// Read SecurityResult. VeNCrypt inner auth already consumed it, so skip when
+	// VeNCrypt was used.
+	if !vencryptHandled {
+		var secResult uint32
+		if err := binary.Read(br, binary.BigEndian, &secResult); err != nil {
+			return nil, br, fmt.Errorf("read security result: %w", err)
 		}
-		reason := make([]byte, reasonLen)
-		if _, err := io.ReadFull(br, reason); err != nil {
-			return nil, fmt.Errorf("authentication failed (cannot read reason text)")
+		if secResult != 0 {
+			var reasonLen uint32
+			if err := binary.Read(br, binary.BigEndian, &reasonLen); err != nil {
+				return nil, br, fmt.Errorf("authentication failed (cannot read reason)")
+			}
+			reason := make([]byte, reasonLen)
+			if _, err := io.ReadFull(br, reason); err != nil {
+				return nil, br, fmt.Errorf("authentication failed (cannot read reason text)")
+			}
+			return nil, br, fmt.Errorf("authentication failed: %s", string(reason))
 		}
-		return nil, fmt.Errorf("authentication failed: %s", string(reason))
 	}
 
 	// Send ClientInit with shared=1
 	if err := binary.Write(bw, binary.BigEndian, uint8(1)); err != nil {
-		return nil, fmt.Errorf("write client init: %w", err)
+		return nil, br, fmt.Errorf("write client init: %w", err)
 	}
 	if err := bw.Flush(); err != nil {
-		return nil, fmt.Errorf("flush client init: %w", err)
+		return nil, br, fmt.Errorf("flush client init: %w", err)
 	}
 
 	// Read ServerInit
 	init := &rfb.ServerInit{}
 	if err := binary.Read(br, binary.BigEndian, &init.Width); err != nil {
-		return nil, fmt.Errorf("read width: %w", err)
+		return nil, br, fmt.Errorf("read width: %w", err)
 	}
 	if err := binary.Read(br, binary.BigEndian, &init.Height); err != nil {
-		return nil, fmt.Errorf("read height: %w", err)
+		return nil, br, fmt.Errorf("read height: %w", err)
 	}
 	if err := binary.Read(br, binary.BigEndian, &init.PixelFormat); err != nil {
-		return nil, fmt.Errorf("read pixel format: %w", err)
+		return nil, br, fmt.Errorf("read pixel format: %w", err)
 	}
 	var nameLen uint32
 	if err := binary.Read(br, binary.BigEndian, &nameLen); err != nil {
-		return nil, fmt.Errorf("read name length: %w", err)
+		return nil, br, fmt.Errorf("read name length: %w", err)
 	}
 	if nameLen > 4096 {
-		return nil, fmt.Errorf("server name too long: %d", nameLen)
+		return nil, br, fmt.Errorf("server name too long: %d", nameLen)
 	}
 	nameBytes := make([]byte, nameLen)
 	if _, err := io.ReadFull(br, nameBytes); err != nil {
-		return nil, fmt.Errorf("read name: %w", err)
+		return nil, br, fmt.Errorf("read name: %w", err)
 	}
 	init.NameLength = nameLen
 	init.Name = string(nameBytes)
 
-	return init, nil
+	return init, br, nil
 }
 
 // sendSessionInit sends the session init extension message to the browser.
@@ -378,7 +408,14 @@ func (p *Proxy) handleExtensionMessage(ctx context.Context, msgType uint8, data 
 	}
 }
 
-func chooseSecurityType(available []uint8, password string) uint8 {
+func chooseSecurityType(available []uint8, password string, vencryptEnabled bool) uint8 {
+	if vencryptEnabled {
+		for _, t := range available {
+			if t == rfb.SecurityVeNCrypt {
+				return rfb.SecurityVeNCrypt
+			}
+		}
+	}
 	if password != "" {
 		for _, t := range available {
 			if t == rfb.SecurityVNCAuth {

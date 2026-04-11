@@ -1,6 +1,8 @@
 package wsproxy
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -35,6 +37,72 @@ type SecurityFileConfig struct {
 	VNCPassword       string         `json:"vnc_password"`
 	VNCPasswordFile   string         `json:"vnc_password_file"`
 	RateLimit         *RateLimitFileConfig `json:"rate_limit,omitempty"`
+	// VeNCrypt configures VeNCrypt authentication when connecting to upstream VNC servers.
+	VeNCrypt   *VeNCryptFileConfig `json:"vencrypt,omitempty"`
+	VNCUsername string             `json:"vnc_username,omitempty"`
+}
+
+// VeNCryptFileConfig holds VeNCrypt upstream connection settings from the config file.
+type VeNCryptFileConfig struct {
+	// Enabled enables VeNCrypt when connecting to upstream VNC servers.
+	Enabled bool `json:"enabled"`
+	// Insecure skips server certificate verification for TLS sub-types (257–259).
+	// X509 sub-types (260–262) always verify the server certificate.
+	Insecure bool `json:"insecure"`
+	// CACertFile is the path to a PEM CA certificate for verifying the VNC server
+	// certificate in X509 sub-types.
+	CACertFile string `json:"ca_cert,omitempty"`
+	// ClientCertFile and ClientKeyFile enable mutual TLS authentication.
+	ClientCertFile string `json:"client_cert,omitempty"`
+	ClientKeyFile  string `json:"client_key,omitempty"`
+	// Username for Plain-based sub-types (256, 259, 262).
+	Username string `json:"username,omitempty"`
+	// PreferredSubTypes is the ordered list of preferred VeNCrypt sub-types.
+	// If empty, defaults to [X509VNCAuth, TLSVNCAuth, X509Plain, TLSPlain, X509None, TLSNone, Plain].
+	PreferredSubTypes []uint32 `json:"preferred_subtypes,omitempty"`
+}
+
+// VeNCryptConfig holds the runtime VeNCrypt configuration for upstream VNC connections.
+type VeNCryptConfig struct {
+	Enabled           bool
+	Insecure          bool
+	CACertFile        string
+	ClientCertFile    string
+	ClientKeyFile     string
+	Username          string
+	PreferredSubTypes []uint32
+}
+
+// BuildTLSConfig constructs a *tls.Config from the VeNCrypt settings.
+// It loads CA cert and client cert/key if configured.
+func (c *VeNCryptConfig) BuildTLSConfig() (*tls.Config, error) {
+	cfg := &tls.Config{}
+
+	if c.Insecure {
+		cfg.InsecureSkipVerify = true //nolint:gosec // intentional for VeNCrypt TLS sub-types
+	}
+
+	if c.CACertFile != "" {
+		caPEM, err := os.ReadFile(c.CACertFile)
+		if err != nil {
+			return nil, fmt.Errorf("vencrypt: read ca cert %q: %w", c.CACertFile, err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caPEM) {
+			return nil, fmt.Errorf("vencrypt: no valid certificates in ca cert %q", c.CACertFile)
+		}
+		cfg.RootCAs = pool
+	}
+
+	if c.ClientCertFile != "" && c.ClientKeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(c.ClientCertFile, c.ClientKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("vencrypt: load client cert/key: %w", err)
+		}
+		cfg.Certificates = append(cfg.Certificates, cert)
+	}
+
+	return cfg, nil
 }
 
 // RateLimitFileConfig holds rate limit settings from the config file.
@@ -106,6 +174,11 @@ func ValidateFileConfig(cfg *FileConfig) []string {
 				if _, err := time.ParseDuration(cfg.Security.RateLimit.Lockout); err != nil {
 					errs = append(errs, fmt.Sprintf("security.rate_limit.lockout: invalid duration %q", cfg.Security.RateLimit.Lockout))
 				}
+			}
+		}
+		if v := cfg.Security.VeNCrypt; v != nil {
+			if (v.ClientCertFile == "") != (v.ClientKeyFile == "") {
+				errs = append(errs, "security.vencrypt.client_cert and security.vencrypt.client_key must both be set or both be empty")
 			}
 		}
 	}
