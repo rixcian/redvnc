@@ -1,6 +1,8 @@
 package rfb
 
 import (
+	"bytes"
+	"image"
 	"sync"
 	"time"
 )
@@ -37,6 +39,13 @@ type PipelinedCapturer struct {
 	notify chan struct{} // capacity 1; closed/sent when a new frame lands
 	done   chan struct{} // closed to stop the background goroutine
 	once   sync.Once    // guards Start
+
+	// Dirty rect detection via frame differencing.
+	diffPrev     []byte           // previous frame for comparison
+	diffPrevW    uint16           // width of previous frame
+	diffPrevH    uint16           // height of previous frame
+	dirtyRects   []image.Rectangle // result of last Diff, consumed by LastDirtyRects
+	dirtyComputed bool            // true after Capture() runs a diff
 }
 
 // NewPipelinedCapturer wraps inner in a PipelinedCapturer.
@@ -139,7 +148,83 @@ func (p *PipelinedCapturer) Capture() ([]byte, int, error) {
 	copy(out, src)
 	p.mu.Unlock()
 
+	// Run tile-based frame diff to detect dirty rectangles.
+	w, h := p.Bounds()
+	p.dirtyRects = p.frameDiff(out, w, h, stride)
+	p.dirtyComputed = true
+
 	return out, stride, nil
+}
+
+// LastDirtyRects returns the dirty rectangles detected by the last Capture() call.
+// Must be called from the same goroutine as Capture(), and only once per Capture().
+func (p *PipelinedCapturer) LastDirtyRects() []image.Rectangle {
+	if !p.dirtyComputed {
+		return nil // no diff was run yet
+	}
+	p.dirtyComputed = false
+	return p.dirtyRects
+}
+
+const diffTileSize = 64
+
+// frameDiff compares pixels against the previously stored frame at 64x64 tile
+// granularity. Returns nil on first frame, empty slice on no change, or the
+// list of changed tile-aligned rectangles.
+func (p *PipelinedCapturer) frameDiff(pixels []byte, width, height uint16, stride int) []image.Rectangle {
+	bpp := 4
+	pixelLen := len(pixels)
+
+	// First frame or resolution change: store and signal full-frame.
+	if p.diffPrev == nil || p.diffPrevW != width || p.diffPrevH != height {
+		if len(p.diffPrev) < pixelLen {
+			p.diffPrev = make([]byte, pixelLen)
+		}
+		p.diffPrev = p.diffPrev[:pixelLen]
+		copy(p.diffPrev, pixels)
+		p.diffPrevW = width
+		p.diffPrevH = height
+		return nil
+	}
+
+	w := int(width)
+	h := int(height)
+
+	var dirty []image.Rectangle
+
+	for tileY := 0; tileY < h; tileY += diffTileSize {
+		tileH := min(diffTileSize, h-tileY)
+		for tileX := 0; tileX < w; tileX += diffTileSize {
+			tileW := min(diffTileSize, w-tileX)
+
+			changed := false
+			for row := 0; row < tileH; row++ {
+				y := tileY + row
+				off := y*stride + tileX*bpp
+				end := off + tileW*bpp
+				if end > pixelLen {
+					changed = true
+					break
+				}
+				if !bytes.Equal(pixels[off:end], p.diffPrev[off:end]) {
+					changed = true
+					break
+				}
+			}
+
+			if changed {
+				dirty = append(dirty, image.Rect(tileX, tileY, tileX+tileW, tileY+tileH))
+			}
+		}
+	}
+
+	// Update stored frame.
+	copy(p.diffPrev, pixels)
+
+	if dirty == nil {
+		return []image.Rectangle{}
+	}
+	return dirty
 }
 
 // Bounds delegates to the inner capturer.
