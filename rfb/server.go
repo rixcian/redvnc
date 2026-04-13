@@ -584,7 +584,7 @@ func (c *ClientConn) handleFramebufferRequestTimed(req *FramebufferUpdateRequest
 	// Query dirty rectangles if the capturer supports it.
 	// nil  → full-frame change (default when interface not implemented).
 	// []   → no change; encodeAndSendFrame will send an empty FBU.
-	// [..] → partial update; Tight path will encode only changed regions.
+	// [..] → partial update; encode only changed regions.
 	var dirtyRects []image.Rectangle
 	if dc, ok := capturer.(dirtyRectCapturer); ok {
 		dirtyRects = dc.LastDirtyRects()
@@ -599,19 +599,6 @@ func (c *ClientConn) encodeAndSendFrame(req *FramebufferUpdateRequest, pixels []
 	capW, capH := capturer.Bounds()
 
 	bpp := 4
-	w := int(req.Width)
-	h := int(req.Height)
-	rectData := make([]byte, 0, w*h*bpp)
-
-	for row := 0; row < h; row++ {
-		srcY := int(req.Y) + row
-		srcOffset := srcY*stride + int(req.X)*bpp
-		srcEnd := srcOffset + w*bpp
-		if srcEnd > len(pixels) {
-			break
-		}
-		rectData = append(rectData, pixels[srcOffset:srcEnd]...)
-	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -658,6 +645,22 @@ func (c *ClientConn) encodeAndSendFrame(req *FramebufferUpdateRequest, pixels []
 		return
 	}
 
+	// Compute the list of regions to encode. If dirty rects are available,
+	// intersect them with the FBU request region; otherwise encode the full region.
+	regions := encodeRegions(req, dirtyRects)
+	if len(regions) == 0 {
+		// All dirty rects fell outside the requested region — nothing to encode.
+		encode = 0
+		sendStart := time.Now()
+		if writeErr := WriteFramebufferUpdate(c.bw, pseudoRects); writeErr != nil {
+			err = writeErr
+			return
+		}
+		err = c.bw.Flush()
+		send = time.Since(sendStart)
+		return
+	}
+
 	encodeStart := time.Now()
 
 	switch bestEnc {
@@ -666,32 +669,16 @@ func (c *ClientConn) encodeAndSendFrame(req *FramebufferUpdateRequest, pixels []
 			c.tightEnc = c.server.config.NewTightEncoder()
 		}
 		var rects []Rectangle
-		if len(dirtyRects) > 0 {
-			// Dirty-rect path: encode only the changed regions intersected with req.
-			reqRect := image.Rect(int(req.X), int(req.Y), int(req.X)+int(req.Width), int(req.Y)+int(req.Height))
-			for _, dr := range dirtyRects {
-				ix := dr.Intersect(reqRect)
-				if ix.Empty() {
-					continue
-				}
-				tileRects, encErr := c.tightEnc.EncodeMulti(
-					uint16(ix.Min.X), uint16(ix.Min.Y),
-					uint16(ix.Dx()), uint16(ix.Dy()),
-					pixels, stride)
-				if encErr != nil {
-					err = fmt.Errorf("tight encode: %w", encErr)
-					return
-				}
-				rects = append(rects, tileRects...)
-			}
-		} else {
-			// Full-frame path (dirtyRects == nil: full change or no dirty-rect support).
-			var encErr error
-			rects, encErr = c.tightEnc.EncodeMulti(req.X, req.Y, req.Width, req.Height, pixels, stride)
+		for _, region := range regions {
+			tileRects, encErr := c.tightEnc.EncodeMulti(
+				uint16(region.Min.X), uint16(region.Min.Y),
+				uint16(region.Dx()), uint16(region.Dy()),
+				pixels, stride)
 			if encErr != nil {
 				err = fmt.Errorf("tight encode: %w", encErr)
 				return
 			}
+			rects = append(rects, tileRects...)
 		}
 		rects = append(pseudoRects, rects...)
 		encode = time.Since(encodeStart)
@@ -705,85 +692,88 @@ func (c *ClientConn) encodeAndSendFrame(req *FramebufferUpdateRequest, pixels []
 		return
 
 	case EncodingZRLE:
-		// Convert pixels to the client's pixel format first, then extract CPIXELs.
 		clientBpp := int(c.pixelFormat.BitsPerPixel) / 8
 		cpixelSize, cpixelOff := zrleCPixel(c.pixelFormat)
 
-		// Build a tightly-packed pixel buffer in client format for the requested region.
-		clientPixels := make([]byte, w*h*clientBpp)
-		for row := 0; row < h; row++ {
-			srcY := int(req.Y) + row
-			srcOffset := srcY*stride + int(req.X)*4
-			srcEnd := srcOffset + w*4
-			if srcEnd > len(pixels) {
-				break
-			}
-			copy(clientPixels[row*w*4:(row+1)*w*4], pixels[srcOffset:srcEnd])
-		}
-		clientPixels = ConvertPixels(c.pixelFormat, c.server.config.PixelFormat, clientPixels, w, h)
-
 		// ZRLE uses a single persistent zlib stream per connection (RFC 6143 §7.7.6).
-		c.zrleBuf.Reset()
 		if c.zrleWriter == nil {
 			c.zrleWriter = zlib.NewWriter(&c.zrleBuf)
 		}
 
-		tileSize := 64
-		for tileY := 0; tileY < h; tileY += tileSize {
-			tileH := min(tileSize, h-tileY)
-			for tileX := 0; tileX < w; tileX += tileSize {
-				tileW := min(tileSize, w-tileX)
+		var rects []Rectangle
+		for _, region := range regions {
+			rw := region.Dx()
+			rh := region.Dy()
 
-				// Extract tile CPIXELs from the converted pixel buffer.
-				tilePixels := make([]byte, tileW*tileH*cpixelSize)
-				for row := 0; row < tileH; row++ {
-					for col := 0; col < tileW; col++ {
-						srcOff := ((tileY+row)*w + (tileX + col)) * clientBpp
-						dstOff := (row*tileW + col) * cpixelSize
-						copy(tilePixels[dstOff:dstOff+cpixelSize], clientPixels[srcOff+cpixelOff:srcOff+cpixelOff+cpixelSize])
-					}
+			// Build a tightly-packed pixel buffer in client format for this region.
+			clientPixels := make([]byte, rw*rh*clientBpp)
+			for row := 0; row < rh; row++ {
+				srcY := region.Min.Y + row
+				srcOffset := srcY*stride + region.Min.X*4
+				srcEnd := srcOffset + rw*4
+				if srcEnd > len(pixels) {
+					break
 				}
+				copy(clientPixels[row*rw*4:(row+1)*rw*4], pixels[srcOffset:srcEnd])
+			}
+			clientPixels = ConvertPixels(c.pixelFormat, c.server.config.PixelFormat, clientPixels, rw, rh)
 
-				// Check if solid tile
-				solid := true
-				for i := cpixelSize; i < len(tilePixels); i += cpixelSize {
-					if !bytesEqual(tilePixels[i:i+cpixelSize], tilePixels[0:cpixelSize]) {
-						solid = false
-						break
+			c.zrleBuf.Reset()
+			tileSize := 64
+			for tileY := 0; tileY < rh; tileY += tileSize {
+				tileH := min(tileSize, rh-tileY)
+				for tileX := 0; tileX < rw; tileX += tileSize {
+					tileW := min(tileSize, rw-tileX)
+
+					tilePixels := make([]byte, tileW*tileH*cpixelSize)
+					for row := 0; row < tileH; row++ {
+						for col := 0; col < tileW; col++ {
+							srcOff := ((tileY+row)*rw + (tileX + col)) * clientBpp
+							dstOff := (row*tileW + col) * cpixelSize
+							copy(tilePixels[dstOff:dstOff+cpixelSize], clientPixels[srcOff+cpixelOff:srcOff+cpixelOff+cpixelSize])
+						}
 					}
-				}
 
-				if solid {
-					c.zrleWriter.Write([]byte{1}) // solid subtype
-					c.zrleWriter.Write(tilePixels[0:cpixelSize])
-				} else {
-					c.zrleWriter.Write([]byte{0}) // raw subtype
-					c.zrleWriter.Write(tilePixels)
+					solid := true
+					for i := cpixelSize; i < len(tilePixels); i += cpixelSize {
+						if !bytesEqual(tilePixels[i:i+cpixelSize], tilePixels[0:cpixelSize]) {
+							solid = false
+							break
+						}
+					}
+
+					if solid {
+						c.zrleWriter.Write([]byte{1})
+						c.zrleWriter.Write(tilePixels[0:cpixelSize])
+					} else {
+						c.zrleWriter.Write([]byte{0})
+						c.zrleWriter.Write(tilePixels)
+					}
 				}
 			}
-		}
 
-		if flushErr := c.zrleWriter.Flush(); flushErr != nil {
-			err = fmt.Errorf("zrle zlib flush: %w", flushErr)
-			return
-		}
+			if flushErr := c.zrleWriter.Flush(); flushErr != nil {
+				err = fmt.Errorf("zrle zlib flush: %w", flushErr)
+				return
+			}
 
-		compressedLen := c.zrleBuf.Len()
-		data := make([]byte, 4+compressedLen)
-		binary.BigEndian.PutUint32(data[0:4], uint32(compressedLen))
-		copy(data[4:], c.zrleBuf.Bytes())
+			compressedLen := c.zrleBuf.Len()
+			data := make([]byte, 4+compressedLen)
+			binary.BigEndian.PutUint32(data[0:4], uint32(compressedLen))
+			copy(data[4:], c.zrleBuf.Bytes())
 
-		rect := Rectangle{
-			Header: RectHeader{
-				X:        req.X,
-				Y:        req.Y,
-				Width:    req.Width,
-				Height:   req.Height,
-				Encoding: EncodingZRLE,
-			},
-			Data: data,
+			rects = append(rects, Rectangle{
+				Header: RectHeader{
+					X:        uint16(region.Min.X),
+					Y:        uint16(region.Min.Y),
+					Width:    uint16(rw),
+					Height:   uint16(rh),
+					Encoding: EncodingZRLE,
+				},
+				Data: data,
+			})
 		}
-		allRects := append(pseudoRects, rect)
+		allRects := append(pseudoRects, rects...)
 		encode = time.Since(encodeStart)
 		sendStart := time.Now()
 		if writeErr := WriteFramebufferUpdate(c.bw, allRects); writeErr != nil {
@@ -795,37 +785,55 @@ func (c *ClientConn) encodeAndSendFrame(req *FramebufferUpdateRequest, pixels []
 		return
 
 	case EncodingZlib:
-		rectData = ConvertPixels(c.pixelFormat, c.server.config.PixelFormat, rectData, w, h)
-
-		c.zlibBuf.Reset()
 		if c.zlibWriter == nil {
 			c.zlibWriter = zlib.NewWriter(&c.zlibBuf)
 		}
-		if _, zlibErr := c.zlibWriter.Write(rectData); zlibErr != nil {
-			err = fmt.Errorf("zlib write: %w", zlibErr)
-			return
-		}
-		if zlibErr := c.zlibWriter.Flush(); zlibErr != nil {
-			err = fmt.Errorf("zlib flush: %w", zlibErr)
-			return
-		}
 
-		compressedLen := c.zlibBuf.Len()
-		data := make([]byte, 4+compressedLen)
-		binary.BigEndian.PutUint32(data[0:4], uint32(compressedLen))
-		copy(data[4:], c.zlibBuf.Bytes())
+		var rects []Rectangle
+		for _, region := range regions {
+			rw := region.Dx()
+			rh := region.Dy()
 
-		rect := Rectangle{
-			Header: RectHeader{
-				X:        req.X,
-				Y:        req.Y,
-				Width:    req.Width,
-				Height:   req.Height,
-				Encoding: EncodingZlib,
-			},
-			Data: data,
+			// Extract pixel data for this region.
+			regionData := make([]byte, 0, rw*rh*bpp)
+			for row := 0; row < rh; row++ {
+				srcY := region.Min.Y + row
+				srcOffset := srcY*stride + region.Min.X*bpp
+				srcEnd := srcOffset + rw*bpp
+				if srcEnd > len(pixels) {
+					break
+				}
+				regionData = append(regionData, pixels[srcOffset:srcEnd]...)
+			}
+			regionData = ConvertPixels(c.pixelFormat, c.server.config.PixelFormat, regionData, rw, rh)
+
+			c.zlibBuf.Reset()
+			if _, zlibErr := c.zlibWriter.Write(regionData); zlibErr != nil {
+				err = fmt.Errorf("zlib write: %w", zlibErr)
+				return
+			}
+			if zlibErr := c.zlibWriter.Flush(); zlibErr != nil {
+				err = fmt.Errorf("zlib flush: %w", zlibErr)
+				return
+			}
+
+			compressedLen := c.zlibBuf.Len()
+			data := make([]byte, 4+compressedLen)
+			binary.BigEndian.PutUint32(data[0:4], uint32(compressedLen))
+			copy(data[4:], c.zlibBuf.Bytes())
+
+			rects = append(rects, Rectangle{
+				Header: RectHeader{
+					X:        uint16(region.Min.X),
+					Y:        uint16(region.Min.Y),
+					Width:    uint16(rw),
+					Height:   uint16(rh),
+					Encoding: EncodingZlib,
+				},
+				Data: data,
+			})
 		}
-		allRects := append(pseudoRects, rect)
+		allRects := append(pseudoRects, rects...)
 		encode = time.Since(encodeStart)
 		sendStart := time.Now()
 		if writeErr := WriteFramebufferUpdate(c.bw, allRects); writeErr != nil {
@@ -837,20 +845,36 @@ func (c *ClientConn) encodeAndSendFrame(req *FramebufferUpdateRequest, pixels []
 		return
 
 	default:
-		rectData = ConvertPixels(c.pixelFormat, c.server.config.PixelFormat, rectData, w, h)
+		var rects []Rectangle
+		for _, region := range regions {
+			rw := region.Dx()
+			rh := region.Dy()
 
-		rect := Rectangle{
-			Header: RectHeader{
-				X:        req.X,
-				Y:        req.Y,
-				Width:    req.Width,
-				Height:   req.Height,
-				Encoding: EncodingRaw,
-			},
-			Data: rectData,
+			regionData := make([]byte, 0, rw*rh*bpp)
+			for row := 0; row < rh; row++ {
+				srcY := region.Min.Y + row
+				srcOffset := srcY*stride + region.Min.X*bpp
+				srcEnd := srcOffset + rw*bpp
+				if srcEnd > len(pixels) {
+					break
+				}
+				regionData = append(regionData, pixels[srcOffset:srcEnd]...)
+			}
+			regionData = ConvertPixels(c.pixelFormat, c.server.config.PixelFormat, regionData, rw, rh)
+
+			rects = append(rects, Rectangle{
+				Header: RectHeader{
+					X:        uint16(region.Min.X),
+					Y:        uint16(region.Min.Y),
+					Width:    uint16(rw),
+					Height:   uint16(rh),
+					Encoding: EncodingRaw,
+				},
+				Data: regionData,
+			})
 		}
 
-		allRects := append(pseudoRects, rect)
+		allRects := append(pseudoRects, rects...)
 		encode = time.Since(encodeStart)
 		sendStart := time.Now()
 		if writeErr := WriteFramebufferUpdate(c.bw, allRects); writeErr != nil {
@@ -861,6 +885,25 @@ func (c *ClientConn) encodeAndSendFrame(req *FramebufferUpdateRequest, pixels []
 		send = time.Since(sendStart)
 		return
 	}
+}
+
+// encodeRegions computes the list of rectangles that need encoding. If dirtyRects
+// is non-nil, each dirty rect is intersected with the FBU request region. If
+// dirtyRects is nil (full-frame change), returns a single rectangle covering the
+// full request region.
+func encodeRegions(req *FramebufferUpdateRequest, dirtyRects []image.Rectangle) []image.Rectangle {
+	reqRect := image.Rect(int(req.X), int(req.Y), int(req.X)+int(req.Width), int(req.Y)+int(req.Height))
+	if dirtyRects == nil {
+		return []image.Rectangle{reqRect}
+	}
+	var regions []image.Rectangle
+	for _, dr := range dirtyRects {
+		ix := dr.Intersect(reqRect)
+		if !ix.Empty() {
+			regions = append(regions, ix)
+		}
+	}
+	return regions
 }
 
 // NotifyDesktopResize notifies all connected clients that support the DesktopSize
