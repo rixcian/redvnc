@@ -1,3 +1,4 @@
+import { pointerToFramebufferPixels } from './coordinate-map';
 import type { Framebuffer } from './framebuffer';
 import type { IRenderer } from './renderer-interface';
 
@@ -103,24 +104,23 @@ export class CanvasRenderer implements IRenderer {
     fbWidth: number,
     fbHeight: number,
   ): { x: number; y: number } {
+    return this.translatePointer(event.clientX, event.clientY, fbWidth, fbHeight);
+  }
+
+  translatePointer(
+    clientX: number,
+    clientY: number,
+    fbWidth: number,
+    fbHeight: number,
+  ): { x: number; y: number } {
     if (!this.canvas) return { x: 0, y: 0 };
-
-    const rect = this.canvas.getBoundingClientRect();
-    const canvasX = event.clientX - rect.left;
-    const canvasY = event.clientY - rect.top;
-
-    if (this.scaleToFit) {
-      const scaleX = fbWidth / rect.width;
-      const scaleY = fbHeight / rect.height;
-      return {
-        x: Math.floor(canvasX * scaleX),
-        y: Math.floor(canvasY * scaleY),
-      };
-    }
-
-    return {
-      x: Math.floor(canvasX),
-      y: Math.floor(canvasY),
-    };
+    return pointerToFramebufferPixels(
+      clientX,
+      clientY,
+      this.canvas.getBoundingClientRect(),
+      fbWidth,
+      fbHeight,
+      this.scaleToFit,
+    );
   }
 }

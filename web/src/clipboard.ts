@@ -4,6 +4,9 @@ import type { ClipboardEntry } from './types';
 
 const MAX_HISTORY = 50;
 
+/** Remote clipboard updates within this window after we send the same text are treated as echo (hide from history). */
+const CLIPBOARD_ECHO_MS = 3000;
+
 export class ClipboardHandler {
   private sendFn: SendFn;
   private clipboardCallback: ((text: string) => void) | null = null;
@@ -13,6 +16,8 @@ export class ClipboardHandler {
   private _nextId = 1;
   private canvas: HTMLCanvasElement | null = null;
   private boundPaste: (e: ClipboardEvent) => void;
+  /** Recent outbound texts (newest last); used to drop immediate echo-back into history. */
+  private outboundEchoGuards: { text: string; sentAt: number }[] = [];
 
   constructor(sendFn: SendFn, autoSync: boolean = true) {
     this.sendFn = sendFn;
@@ -60,6 +65,10 @@ export class ClipboardHandler {
   sendClipboard(text: string): void {
     this.sendFn(writeClipboardSet(text));
     this.addEntry(text, 'local');
+    const now = Date.now();
+    const cutoff = now - CLIPBOARD_ECHO_MS;
+    this.outboundEchoGuards = this.outboundEchoGuards.filter((g) => g.sentAt >= cutoff);
+    this.outboundEchoGuards.push({ text, sentAt: now });
   }
 
   /**
@@ -72,7 +81,22 @@ export class ClipboardHandler {
       autoSync: this._autoSync,
     });
 
-    this.addEntry(text, 'remote');
+    const now = Date.now();
+    const cutoff = now - CLIPBOARD_ECHO_MS;
+    this.outboundEchoGuards = this.outboundEchoGuards.filter((g) => g.sentAt >= cutoff);
+
+    let skipHistory = false;
+    const guardIdx = this.outboundEchoGuards.findIndex(
+      (g) => g.text === text && now - g.sentAt < CLIPBOARD_ECHO_MS,
+    );
+    if (guardIdx >= 0) {
+      skipHistory = true;
+      this.outboundEchoGuards.splice(guardIdx, 1);
+    }
+
+    if (!skipHistory) {
+      this.addEntry(text, 'remote');
+    }
     this.clipboardCallback?.(text);
 
     if (this._autoSync) {

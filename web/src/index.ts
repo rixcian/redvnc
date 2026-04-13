@@ -1,3 +1,5 @@
+import './styles/redvnc-ui.css';
+
 import { VncConnection } from './connection';
 import { parseServerMessage } from './rfb-parser';
 import type { UploadStatusMessage } from './rfb-parser';
@@ -43,7 +45,7 @@ import {
 } from './types';
 
 export type { VncClientOptions, UploadOptions, UploadResult, UploadProgress, ConnectionStats, ClipboardEntry };
-export type { VncViewerProps } from './types';
+export type { VncViewerProps, VncCanvasClient } from './types';
 
 const ENCODING_NAMES: Record<number, string> = {
   [EncodingRaw]: 'Raw',
@@ -624,5 +626,15 @@ export class VncClient {
 export { VncViewer } from './components/VncViewer';
 export { DebugOverlay } from './components/DebugOverlay';
 export { FileUploadDropZone } from './components/FileUpload';
-export { Toolbar } from './components/Toolbar';
+export { Toolbar, parseTargetParts } from './components/Toolbar';
+export type { ToolbarConnectionStatus } from './components/Toolbar';
 export { ClipboardPanel } from './components/ClipboardPanel';
+export { SettingsPanel } from './components/SettingsPanel';
+export type {
+  ScaleMode,
+  ImageQuality,
+  CursorMode,
+  IdleTimeout,
+} from './components/SettingsPanel';
+export { ConnectionForm } from './components/ConnectionForm';
+export type { ConnectionFormProps } from './components/ConnectionForm';

@@ -107,17 +107,15 @@ export interface VncClientOptions {
   reconnectMaxDelay?: number;        // default: 30000 (ms)
 }
 
+/** Minimal surface for binding the viewer canvas (implemented by VncClient). */
+export interface VncCanvasClient {
+  attachCanvas(canvas: HTMLCanvasElement): void;
+  detachCanvas(): void;
+}
+
 export interface VncViewerProps {
-  url: string;
-  target: string;
-  password?: string;
-  viewOnly?: boolean;
+  client: VncCanvasClient | null;
   scaleToFit?: boolean;
-  clipboardSync?: boolean;
-  uploadDir?: string;
-  onConnect?: () => void;
-  onDisconnect?: (reason: string) => void;
-  onBell?: () => void;
   className?: string;
   style?: React.CSSProperties;
 }

@@ -5,9 +5,11 @@
 *.dll
 *.so
 *.dylib
+.claude/worktrees/
 
 # C shared library output
 redvnc.h
+redvnc-wsproxy
 
 # Test/example output
 *.ppm

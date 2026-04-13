@@ -5,11 +5,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>redvnc - Web Client Demo</title>
   <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { background: #111; color: #eee; font-family: system-ui, sans-serif; }
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+    }
   </style>
 </head>
-<body>
+<body class="min-h-screen bg-zinc-950 text-zinc-100 antialiased">
   <div id="root"></div>
   <script type="module" src="./main.tsx"></script>
 </body>

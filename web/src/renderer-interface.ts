@@ -12,4 +12,6 @@ export interface IRenderer {
   render(fb: Framebuffer): void;
   setCursor(imageData: Uint8Array, width: number, height: number, hotX: number, hotY: number): void;
   translateCoordinates(event: MouseEvent, fbWidth: number, fbHeight: number): { x: number; y: number };
+  /** Same mapping as translateCoordinates, for touch / programmatic use. */
+  translatePointer(clientX: number, clientY: number, fbWidth: number, fbHeight: number): { x: number; y: number };
 }
