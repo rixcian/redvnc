@@ -41,15 +41,15 @@ func NewFrameDiffer() *FrameDiffer {
 // The caller must not retain pixels — Diff copies what it needs internally.
 func (d *FrameDiffer) Diff(pixels []byte, width, height uint16, stride int) []image.Rectangle {
 	bpp := 4
-	frameSize := int(height) * stride
+	pixelLen := len(pixels)
 
 	// First frame or resolution change: store and signal full-frame.
 	if d.prev == nil || d.prevW != width || d.prevH != height {
-		if len(d.prev) < frameSize {
-			d.prev = make([]byte, frameSize)
+		if len(d.prev) < pixelLen {
+			d.prev = make([]byte, pixelLen)
 		}
-		d.prev = d.prev[:frameSize]
-		copy(d.prev, pixels[:frameSize])
+		d.prev = d.prev[:pixelLen]
+		copy(d.prev, pixels)
 		d.prevW = width
 		d.prevH = height
 		return nil
@@ -71,6 +71,10 @@ func (d *FrameDiffer) Diff(pixels []byte, width, height uint16, stride int) []im
 				y := tileY + row
 				off := y*stride + tileX*bpp
 				end := off + tileW*bpp
+				if end > pixelLen {
+					changed = true
+					break
+				}
 				if !bytes.Equal(pixels[off:end], d.prev[off:end]) {
 					changed = true
 					break
@@ -84,7 +88,7 @@ func (d *FrameDiffer) Diff(pixels []byte, width, height uint16, stride int) []im
 	}
 
 	// Update stored frame.
-	copy(d.prev, pixels[:frameSize])
+	copy(d.prev, pixels)
 
 	if dirty == nil {
 		// No changes — return empty (not nil) to signal "nothing changed".

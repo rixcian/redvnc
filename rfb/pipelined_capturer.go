@@ -173,15 +173,15 @@ const diffTileSize = 64
 // list of changed tile-aligned rectangles.
 func (p *PipelinedCapturer) frameDiff(pixels []byte, width, height uint16, stride int) []image.Rectangle {
 	bpp := 4
-	frameSize := int(height) * stride
+	pixelLen := len(pixels)
 
 	// First frame or resolution change: store and signal full-frame.
 	if p.diffPrev == nil || p.diffPrevW != width || p.diffPrevH != height {
-		if len(p.diffPrev) < frameSize {
-			p.diffPrev = make([]byte, frameSize)
+		if len(p.diffPrev) < pixelLen {
+			p.diffPrev = make([]byte, pixelLen)
 		}
-		p.diffPrev = p.diffPrev[:frameSize]
-		copy(p.diffPrev, pixels[:frameSize])
+		p.diffPrev = p.diffPrev[:pixelLen]
+		copy(p.diffPrev, pixels)
 		p.diffPrevW = width
 		p.diffPrevH = height
 		return nil
@@ -202,6 +202,10 @@ func (p *PipelinedCapturer) frameDiff(pixels []byte, width, height uint16, strid
 				y := tileY + row
 				off := y*stride + tileX*bpp
 				end := off + tileW*bpp
+				if end > pixelLen {
+					changed = true
+					break
+				}
 				if !bytes.Equal(pixels[off:end], p.diffPrev[off:end]) {
 					changed = true
 					break
@@ -215,7 +219,7 @@ func (p *PipelinedCapturer) frameDiff(pixels []byte, width, height uint16, strid
 	}
 
 	// Update stored frame.
-	copy(p.diffPrev, pixels[:frameSize])
+	copy(p.diffPrev, pixels)
 
 	if dirty == nil {
 		return []image.Rectangle{}
