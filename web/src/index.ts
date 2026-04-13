@@ -106,6 +106,8 @@ export class VncClient {
   private _bytesReceived = 0;
   private _fbuTimestamps: number[] = []; // timestamps of recent FramebufferUpdate messages
   private _bytesReceivedSamples: { time: number; bytes: number }[] = []; // for data rate calculation
+  private _lastFbuRequestTime = 0; // timestamp when the last FBU request was sent
+  private _latencySamples: number[] = []; // recent round-trip latency measurements (ms)
 
   private eventHandlers: { [K in keyof VncEventMap]?: VncEventMap[K][] } = {};
   private rafId: number | null = null;
@@ -181,6 +183,14 @@ export class VncClient {
       encodings[name] = count;
     }
 
+    // Compute average latency from recent samples (keep last 30)
+    if (this._latencySamples.length > 30) {
+      this._latencySamples = this._latencySamples.slice(-30);
+    }
+    const latency = this._latencySamples.length > 0
+      ? this._latencySamples.reduce((a, b) => a + b, 0) / this._latencySamples.length
+      : 0;
+
     return {
       serverName: this._name,
       resolution: { width: this._width, height: this._height },
@@ -190,6 +200,7 @@ export class VncClient {
       totalRectangles: this._totalRectangles,
       bytesReceived: this._bytesReceived,
       dataRate,
+      latency,
     };
   }
 
@@ -199,6 +210,8 @@ export class VncClient {
     this._bytesReceived = 0;
     this._fbuTimestamps = [];
     this._bytesReceivedSamples = [];
+    this._lastFbuRequestTime = 0;
+    this._latencySamples = [];
   }
 
   async connect(): Promise<void> {
@@ -241,6 +254,7 @@ export class VncClient {
     this.connection.send(writeSetEncodings(encodings));
 
     // Request initial full framebuffer update
+    this._lastFbuRequestTime = performance.now();
     this.connection.send(
       writeFramebufferUpdateRequest(false, 0, 0, this._width, this._height),
     );
@@ -405,12 +419,19 @@ export class VncClient {
   ): Promise<void> {
     if (!this.framebuffer) return;
 
-    this._fbuTimestamps.push(performance.now());
+    const now = performance.now();
+    this._fbuTimestamps.push(now);
+
+    // Record round-trip latency (time from FBU request to FBU response)
+    if (this._lastFbuRequestTime > 0) {
+      this._latencySamples.push(now - this._lastFbuRequestTime);
+    }
 
     // Request next FBU immediately BEFORE decoding. This pipelines server
     // encoding with client decoding — the server starts preparing the next
     // frame while we're still processing the current one. Without this,
     // we pay a full round-trip delay between each frame.
+    this._lastFbuRequestTime = performance.now();
     this.connection.send(
       writeFramebufferUpdateRequest(true, 0, 0, this._width, this._height),
     );
@@ -583,6 +604,7 @@ export class VncClient {
     this.connection.send(writeSetEncodings(encodings));
 
     // Request full framebuffer update
+    this._lastFbuRequestTime = performance.now();
     this.connection.send(
       writeFramebufferUpdateRequest(false, 0, 0, this._width, this._height),
     );

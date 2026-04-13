@@ -65,6 +65,8 @@ export interface ConnectionStats {
   bytesReceived: number;
   /** Data rate in bytes per second (measured over the last 2 seconds). */
   dataRate: number;
+  /** Round-trip latency in milliseconds (FBU request → response, averaged over recent samples). */
+  latency: number;
 }
 
 export interface RectHeader {

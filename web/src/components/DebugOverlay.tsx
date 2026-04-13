@@ -71,6 +71,7 @@ export const DebugOverlay: React.FC<DebugOverlayProps> = ({ client, visible }) =
       <Row label="Resolution" value={`${stats.resolution.width}x${stats.resolution.height}`} />
       <Row label="Auth" value={stats.authType} />
       <Row label="Renderer" value={client?.rendererType ?? 'unknown'} />
+      <Row label="Latency" value={stats.latency > 0 ? `${Math.round(stats.latency)} ms` : '—'} />
       <Row label="FPS" value={String(stats.fps)} />
       <Row label="Data rate" value={formatRate(stats.dataRate)} />
       <Row label="Data received" value={formatBytes(stats.bytesReceived)} />
