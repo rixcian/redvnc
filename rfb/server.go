@@ -597,7 +597,12 @@ func (c *ClientConn) handleFramebufferRequestTimed(req *FramebufferUpdateRequest
 	// []   → no change; encodeAndSendFrame will send an empty FBU.
 	// [..] → partial update; encode only changed regions.
 	var dirtyRects []image.Rectangle
-	if dc, ok := capturer.(dirtyRectCapturer); ok {
+	if req.Incremental == 0 {
+		// RFC 6143 §7.5.3: non-incremental request — client needs the full
+		// framebuffer contents (e.g. first frame after connect). Force a
+		// full-frame encode regardless of the capturer's dirty state.
+		dirtyRects = nil
+	} else if dc, ok := capturer.(dirtyRectCapturer); ok {
 		dirtyRects = dc.LastDirtyRects()
 	}
 
