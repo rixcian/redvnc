@@ -104,6 +104,10 @@ type ServerConfig struct {
 	// If nil, Tight encoding is not available.
 	NewTightEncoder TightEncoderFactory
 
+	// NewH264Encoder creates an H.264 encoder for a client connection.
+	// If nil, H.264 encoding is not available.
+	NewH264Encoder TightEncoderFactory
+
 	// CursorProvider supplies cursor images for the Cursor pseudo-encoding.
 	// If nil, cursor pseudo-encoding is not used.
 	CursorProvider CursorProvider
@@ -240,6 +244,7 @@ type ClientConn struct {
 	errCh   chan error                     // errors from the fb writer goroutine
 
 	tightEnc   MultiEncoder // lazy-initialized per-connection Tight encoder
+	h264Enc    MultiEncoder // lazy-initialized per-connection H.264 encoder
 	zlibBuf    bytes.Buffer // persistent zlib buffer for Zlib encoding
 	zlibWriter  *zlib.Writer // persistent zlib writer for Zlib encoding
 	zrleBuf     bytes.Buffer // buffer for one ZRLE rectangle's zlib stream
@@ -268,6 +273,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 		}
 		if c.tightEnc != nil {
 			c.tightEnc.Reset()
+		}
+		if c.h264Enc != nil {
+			c.h264Enc.Reset()
 		}
 		s.removeClient(c)
 		conn.Close()
@@ -530,8 +538,11 @@ func boolToAction(down bool) string {
 // with clients that advertise both but only decode ZRLE correctly when it matches
 // their exact pixel layout (ZRLE CPIXEL must follow the client's SetPixelFormat).
 func (c *ClientConn) bestEncoding() int32 {
-	preference := []int32{EncodingTight, EncodingZlib, EncodingZRLE, EncodingRaw}
+	preference := []int32{EncodingH264, EncodingTight, EncodingZlib, EncodingZRLE, EncodingRaw}
 	for _, pref := range preference {
+		if pref == EncodingH264 && c.server.config.NewH264Encoder == nil {
+			continue
+		}
 		if pref == EncodingTight && c.server.config.NewTightEncoder == nil {
 			continue
 		}
@@ -664,6 +675,33 @@ func (c *ClientConn) encodeAndSendFrame(req *FramebufferUpdateRequest, pixels []
 	encodeStart := time.Now()
 
 	switch bestEnc {
+	case EncodingH264:
+		// H.264 always encodes the full frame — it uses inter-frame compression
+		// internally (P-frames reference previous frames), so dirty rects are
+		// irrelevant. The encoder handles its own keyframe scheduling.
+		if c.h264Enc == nil {
+			c.h264Enc = c.server.config.NewH264Encoder()
+		}
+		rects, encErr := c.h264Enc.EncodeMulti(0, 0, capW, capH, pixels, stride)
+		if encErr != nil {
+			err = fmt.Errorf("h264 encode: %w", encErr)
+			return
+		}
+		if rects == nil {
+			// Encoder hasn't produced output yet (startup latency).
+			rects = []Rectangle{}
+		}
+		allRects := append(pseudoRects, rects...)
+		encode = time.Since(encodeStart)
+		sendStart := time.Now()
+		if writeErr := WriteFramebufferUpdate(c.bw, allRects); writeErr != nil {
+			err = writeErr
+			return
+		}
+		err = c.bw.Flush()
+		send = time.Since(sendStart)
+		return
+
 	case EncodingTight:
 		if c.tightEnc == nil {
 			c.tightEnc = c.server.config.NewTightEncoder()

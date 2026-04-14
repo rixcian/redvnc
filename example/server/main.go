@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rixcian/redvnc/h264"
 	"github.com/rixcian/redvnc/rfb"
 	"github.com/rixcian/redvnc/rfb/encodings"
 	"github.com/rixcian/redvnc/rfb/security"
@@ -122,6 +123,27 @@ func main() {
 		}
 	}
 
+	// Test H.264 encoder availability. If it works, set the factory.
+	var h264Factory rfb.TightEncoderFactory
+	{
+		w, h := capturer.Bounds()
+		testEnc, err := h264.NewEncoder(int(w), int(h))
+		if err != nil {
+			log.Printf("H.264 encoder unavailable: %v (will use Tight)", err)
+		} else {
+			testEnc.Reset()
+			log.Println("H.264 encoder available")
+			h264Factory = func() rfb.MultiEncoder {
+				enc, err := h264.NewEncoder(int(w), int(h))
+				if err != nil {
+					log.Printf("H.264 encoder init failed: %v", err)
+					return encodings.NewTight(75) // fallback
+				}
+				return enc
+			}
+		}
+	}
+
 	config := rfb.ServerConfig{
 		Name:           "redvnc",
 		Capturer:       capturer,
@@ -130,6 +152,7 @@ func main() {
 		NewTightEncoder: func() rfb.MultiEncoder {
 			return encodings.NewTight(75)
 		},
+		NewH264Encoder: h264Factory,
 	}
 
 	if *password != "" {

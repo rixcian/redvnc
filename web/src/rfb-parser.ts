@@ -136,6 +136,10 @@ function tryGetEncodingDataLength(
     case 16: // ZRLE
       if (remaining < 4) return -1;
       return 4 + view.getUint32(offset);
+    case 50: // H.264
+      // flags(4) + nalLen(4) + nalData
+      if (remaining < 8) return -1;
+      return 8 + view.getUint32(offset + 4);
     case -239: // Cursor
       return width * height * 4 + Math.ceil(width / 8) * height;
     case -223: // DesktopSize
@@ -282,6 +286,10 @@ function getEncodingDataLength(header: RectHeader, data: DataView): number {
     case 16: // ZRLE
       // 4-byte length prefix + compressed data (same framing as Zlib)
       return 4 + data.getUint32(0);
+
+    case 50: // H.264
+      // flags(4) + nalLen(4) + nalData
+      return 8 + data.getUint32(4);
 
     case -239: // Cursor
       return width * height * 4 + Math.ceil(width / 8) * height;

@@ -131,6 +131,9 @@ func (r *rfbReader) readEncodingData(buf *bytes.Buffer, w, h int, enc int32, bpp
 		return r.readTightData(buf, w, h, cpixel)
 	case 16: // ZRLE
 		return r.readLengthPrefixed32(buf)
+	case 50: // H.264
+		// flags(4) + nalLen(4) + nalData(N)
+		return r.readH264(buf)
 	case -239: // Cursor
 		pixelLen := w * h * bpp
 		maskLen := ((w + 7) / 8) * h
@@ -278,6 +281,17 @@ func (r *rfbReader) readExact(buf *bytes.Buffer, n int) error {
 	}
 	buf.Write(data)
 	return nil
+}
+
+func (r *rfbReader) readH264(buf *bytes.Buffer) error {
+	// Read 8-byte header: flags(4) + nalLen(4)
+	hdr := make([]byte, 8)
+	if _, err := io.ReadFull(r.br, hdr); err != nil {
+		return err
+	}
+	buf.Write(hdr)
+	nalLen := int(binary.BigEndian.Uint32(hdr[4:8]))
+	return r.readExact(buf, nalLen)
 }
 
 func (r *rfbReader) readLengthPrefixed32(buf *bytes.Buffer) error {

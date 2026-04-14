@@ -20,6 +20,7 @@ import { decodeCopyRect } from './encodings/copyrect';
 import { ZlibDecoder } from './encodings/zlib';
 import { TightDecoder } from './encodings/tight';
 import { ZrleDecoder } from './encodings/zrle';
+import { H264Decoder } from './encodings/h264';
 import {
   MsgFramebufferUpdate,
   MsgBell,
@@ -31,6 +32,7 @@ import {
   EncodingZlib,
   EncodingTight,
   EncodingZRLE,
+  EncodingH264,
   EncodingCursor,
   EncodingDesktopSize,
   RGBA_PIXEL_FORMAT,
@@ -53,6 +55,7 @@ const ENCODING_NAMES: Record<number, string> = {
   [EncodingZlib]: 'Zlib',
   [EncodingTight]: 'Tight',
   [EncodingZRLE]: 'ZRLE',
+  [EncodingH264]: 'H.264',
   [EncodingCursor]: 'Cursor',
   [EncodingDesktopSize]: 'DesktopSize',
 };
@@ -92,6 +95,7 @@ export class VncClient {
   private zlibDecoder: ZlibDecoder;
   private tightDecoder: TightDecoder;
   private zrleDecoder: ZrleDecoder;
+  private h264Decoder: H264Decoder;
 
   private _connected = false;
   private _width = 0;
@@ -129,6 +133,7 @@ export class VncClient {
     this.zlibDecoder = new ZlibDecoder();
     this.tightDecoder = new TightDecoder();
     this.zrleDecoder = new ZrleDecoder();
+    this.h264Decoder = new H264Decoder();
 
     const sendFn = (data: ArrayBuffer | Uint8Array) => this.connection.send(data);
     this.inputHandler = new InputHandler(this.renderer, sendFn, options.viewOnly ?? false);
@@ -220,6 +225,7 @@ export class VncClient {
       this.zlibDecoder.init(),
       this.tightDecoder.init(),
       this.zrleDecoder.init(),
+      this.h264Decoder.init(),
     ]);
 
     // Set up message handler
@@ -249,8 +255,11 @@ export class VncClient {
     // Send SetPixelFormat (request RGBA for direct ImageData compatibility)
     this.connection.send(writeSetPixelFormat(RGBA_PIXEL_FORMAT));
 
-    // Send SetEncodings
-    const encodings = this.options.encodings ?? DEFAULT_ENCODINGS;
+    // Send SetEncodings — filter out H.264 if WebCodecs is unavailable.
+    let encodings = this.options.encodings ?? DEFAULT_ENCODINGS;
+    if (!H264Decoder.isSupported()) {
+      encodings = encodings.filter(e => e !== EncodingH264);
+    }
     this.connection.send(writeSetEncodings(encodings));
 
     // Request initial full framebuffer update
@@ -460,6 +469,9 @@ export class VncClient {
           case EncodingZRLE:
             this.zrleDecoder.decode(this.framebuffer, header, data);
             break;
+          case EncodingH264:
+            asyncTasks.push(this.h264Decoder.decode(this.framebuffer, header, data));
+            break;
           case EncodingCursor:
             this.handleCursor(header, data);
             break;
@@ -563,10 +575,12 @@ export class VncClient {
 
   private async performReconnect(): Promise<void> {
     // Re-init decoders
+    this.h264Decoder.reset();
     await Promise.all([
       this.zlibDecoder.init(),
       this.tightDecoder.init(),
       this.zrleDecoder.init(),
+      this.h264Decoder.init(),
     ]);
 
     // Re-wire send function for handlers
@@ -600,7 +614,10 @@ export class VncClient {
 
     // Re-send pixel format and encodings
     this.connection.send(writeSetPixelFormat(RGBA_PIXEL_FORMAT));
-    const encodings = this.options.encodings ?? DEFAULT_ENCODINGS;
+    let encodings = this.options.encodings ?? DEFAULT_ENCODINGS;
+    if (!H264Decoder.isSupported()) {
+      encodings = encodings.filter(e => e !== EncodingH264);
+    }
     this.connection.send(writeSetEncodings(encodings));
 
     // Request full framebuffer update
