@@ -7,11 +7,51 @@ import {
   Toolbar,
   ConnectionForm,
 } from '../src/index';
+import {
+  EncodingRaw,
+  EncodingCopyRect,
+  EncodingZlib,
+  EncodingTight,
+  EncodingZRLE,
+  EncodingH264,
+  EncodingCursor,
+  EncodingDesktopSize,
+} from '../src/types';
+
+type EncodingPreset = 'auto' | 'h264' | 'tight' | 'zrle' | 'zlib' | 'raw';
+
+const ENCODING_PRESETS: Record<EncodingPreset, { label: string; encodings: number[] }> = {
+  auto: {
+    label: 'Auto (H.264 > Tight > ZRLE)',
+    encodings: [EncodingH264, EncodingTight, EncodingZRLE, EncodingZlib, EncodingCopyRect, EncodingRaw, EncodingCursor, EncodingDesktopSize],
+  },
+  h264: {
+    label: 'H.264',
+    encodings: [EncodingH264, EncodingCopyRect, EncodingRaw, EncodingCursor, EncodingDesktopSize],
+  },
+  tight: {
+    label: 'Tight (JPEG tiles)',
+    encodings: [EncodingTight, EncodingCopyRect, EncodingRaw, EncodingCursor, EncodingDesktopSize],
+  },
+  zrle: {
+    label: 'ZRLE',
+    encodings: [EncodingZRLE, EncodingCopyRect, EncodingRaw, EncodingCursor, EncodingDesktopSize],
+  },
+  zlib: {
+    label: 'Zlib',
+    encodings: [EncodingZlib, EncodingCopyRect, EncodingRaw, EncodingCursor, EncodingDesktopSize],
+  },
+  raw: {
+    label: 'Raw (uncompressed)',
+    encodings: [EncodingCopyRect, EncodingRaw, EncodingCursor, EncodingDesktopSize],
+  },
+};
 
 function App() {
   const [wsUrl, setWsUrl] = useState('ws://localhost:8080/ws');
   const [target, setTarget] = useState('');
   const [password, setPassword] = useState('');
+  const [encoding, setEncoding] = useState<EncodingPreset>('auto');
   const [sessionOpen, setSessionOpen] = useState(false);
 
   const handleConnect = (e: React.FormEvent) => {
@@ -34,7 +74,23 @@ function App() {
         onTargetChange={setTarget}
         onPasswordChange={setPassword}
         onSubmit={handleConnect}
-      />
+      >
+        <div className="space-y-2">
+          <label htmlFor="encoding" className="text-sm font-medium leading-none text-zinc-200">
+            Encoding
+          </label>
+          <select
+            id="encoding"
+            value={encoding}
+            onChange={e => setEncoding(e.target.value as EncodingPreset)}
+            className="flex h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-50 ring-offset-zinc-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-400 focus-visible:ring-offset-2"
+          >
+            {Object.entries(ENCODING_PRESETS).map(([key, preset]) => (
+              <option key={key} value={key}>{preset.label}</option>
+            ))}
+          </select>
+        </div>
+      </ConnectionForm>
     );
   }
 
@@ -44,6 +100,7 @@ function App() {
         wsUrl={wsUrl}
         target={target}
         password={password || undefined}
+        encodings={ENCODING_PRESETS[encoding].encodings}
         onLeave={handleLeaveSession}
       />
     </div>
@@ -56,11 +113,13 @@ function VncSession({
   wsUrl,
   target,
   password,
+  encodings,
   onLeave,
 }: {
   wsUrl: string;
   target: string;
   password?: string;
+  encodings?: number[];
   onLeave: () => void;
 }) {
   const [status, setStatus] = useState<SessionStatus>('disconnected');
@@ -84,6 +143,7 @@ function VncSession({
       target,
       password,
       scaleToFit: true,
+      encodings,
     });
 
     vnc.on('connect', () => {
@@ -142,7 +202,7 @@ function VncSession({
       vnc.disconnect();
       setClient(null);
     };
-  }, [wsUrl, target, password, onLeave]);
+  }, [wsUrl, target, password, encodings, onLeave]);
 
   return (
     <>

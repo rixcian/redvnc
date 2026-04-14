@@ -19,6 +19,7 @@ export interface ConnectionFormProps {
   onTargetChange: (value: string) => void;
   onPasswordChange: (value: string) => void;
   onSubmit: (e: React.FormEvent) => void;
+  children?: React.ReactNode;
 }
 
 export const ConnectionForm: React.FC<ConnectionFormProps> = ({
@@ -29,6 +30,7 @@ export const ConnectionForm: React.FC<ConnectionFormProps> = ({
   onTargetChange,
   onPasswordChange,
   onSubmit,
+  children,
 }) => (
   <div className="flex min-h-screen items-center justify-center bg-zinc-950 p-6">
     <Card className="w-full max-w-md border-zinc-800">
@@ -72,6 +74,7 @@ export const ConnectionForm: React.FC<ConnectionFormProps> = ({
               autoComplete="off"
             />
           </div>
+          {children}
         </CardContent>
         <CardFooter>
           <Button type="submit" className="w-full">
