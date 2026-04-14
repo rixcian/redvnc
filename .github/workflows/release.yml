@@ -68,7 +68,8 @@ jobs:
 
   server-darwin-amd64:
     needs: assert-main
-    runs-on: macos-13
+    # macos-13 was retired; Intel/x86_64 builds use the dedicated image (see GitHub changelog).
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
