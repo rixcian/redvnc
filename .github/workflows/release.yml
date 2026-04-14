@@ -1,0 +1,193 @@
+# Build and publish prebuilt binaries when a SemVer tag v* is pushed.
+# Tags must point at a commit on main. Assets are raw executables (no archives).
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  assert-main:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify tag is on main
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor "${{ github.sha }}" origin/main || {
+            echo "::error::Release tags must point to a commit reachable from origin/main"
+            exit 1
+          }
+
+  server-linux-amd64:
+    needs: assert-main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Install Linux build deps
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxtst-dev libx264-dev
+      - name: Build redvnc-server
+        run: |
+          VERSION="${{ github.ref_name }}"
+          go build -trimpath -ldflags "-X main.version=${VERSION}" \
+            -o "redvnc-server_${VERSION}_linux_amd64" ./example/server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-linux-amd64
+          path: redvnc-server_*
+
+  server-linux-arm64:
+    needs: assert-main
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Install Linux build deps
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxtst-dev libx264-dev
+      - name: Build redvnc-server
+        run: |
+          VERSION="${{ github.ref_name }}"
+          go build -trimpath -ldflags "-X main.version=${VERSION}" \
+            -o "redvnc-server_${VERSION}_linux_arm64" ./example/server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-linux-arm64
+          path: redvnc-server_*
+
+  server-darwin-amd64:
+    needs: assert-main
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Install x264
+        run: brew install x264
+      - name: Build redvnc-server
+        run: |
+          VERSION="${{ github.ref_name }}"
+          go build -trimpath -ldflags "-X main.version=${VERSION}" \
+            -o "redvnc-server_${VERSION}_darwin_amd64" ./example/server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-darwin-amd64
+          path: redvnc-server_*
+
+  server-darwin-arm64:
+    needs: assert-main
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Install x264
+        run: brew install x264
+      - name: Build redvnc-server
+        run: |
+          VERSION="${{ github.ref_name }}"
+          go build -trimpath -ldflags "-X main.version=${VERSION}" \
+            -o "redvnc-server_${VERSION}_darwin_arm64" ./example/server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-darwin-arm64
+          path: redvnc-server_*
+
+  server-windows-amd64:
+    needs: assert-main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Build redvnc-server (Windows, cross-compile)
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: |
+          VERSION="${{ github.ref_name }}"
+          go build -trimpath -ldflags "-X main.version=${VERSION}" \
+            -o "redvnc-server_${VERSION}_windows_amd64.exe" ./example/server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-windows-amd64
+          path: redvnc-server_*.exe
+
+  wsproxy:
+    needs: assert-main
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Build redvnc-wsproxy
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          VERSION="${{ github.ref_name }}"
+          OUT="redvnc-wsproxy_${VERSION}_${GOOS}_${GOARCH}"
+          if [ "$GOOS" = "windows" ]; then OUT="${OUT}.exe"; fi
+          go build -trimpath -ldflags "-X main.version=${VERSION}" -o "$OUT" ./wsproxy/cmd
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wsproxy-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: redvnc-wsproxy_*
+
+  release:
+    needs:
+      - server-linux-amd64
+      - server-linux-arm64
+      - server-darwin-amd64
+      - server-darwin-arm64
+      - server-windows-amd64
+      - wsproxy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Generate checksums
+        run: |
+          cd assets
+          sha256sum redvnc-* > checksums.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            assets/redvnc-*
+            assets/checksums.txt

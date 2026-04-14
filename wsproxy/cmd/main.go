@@ -13,6 +13,9 @@ import (
 	"github.com/rixcian/redvnc/wsproxy"
 )
 
+// version is set at link time via -ldflags "-X main.version=...".
+var version = "dev"
+
 type stringSlice []string
 
 func (s *stringSlice) String() string { return fmt.Sprintf("%v", *s) }
@@ -38,6 +41,7 @@ func main() {
 		logFormat      = flag.String("log-format", "", "Log format: text or json")
 		logLevel       = flag.String("log-level", "", "Log level: debug, info, warn, error")
 		shutdownTimeout = flag.Duration("shutdown-timeout", 0, "Maximum time to wait for sessions to drain during shutdown")
+		showVersion     = flag.Bool("version", false, "Print version and exit")
 
 		allowedTargets stringSlice
 		allowedOrigins stringSlice
@@ -48,6 +52,11 @@ func main() {
 	flag.Var(&allowedOrigins, "allowed-origin", "Allowed WebSocket origin (repeatable)")
 	flag.Var(&allowedUpDirs, "allowed-upload-dir", "Allowed upload directory (repeatable)")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version)
+		os.Exit(0)
+	}
 
 	// Track which flags were explicitly set
 	flagSet := make(map[string]bool)

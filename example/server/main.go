@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"os"
 	"sync"
 	"time"
 
@@ -23,6 +24,9 @@ import (
 	"github.com/rixcian/redvnc/rfb/encodings"
 	"github.com/rixcian/redvnc/rfb/security"
 )
+
+// version is set at link time via -ldflags "-X main.version=...".
+var version = "dev"
 
 // ---------------------------------------------------------------------------
 // Gradient screen capturer – generates a colour pattern that shifts over time
@@ -96,7 +100,13 @@ func main() {
 	width := flag.Int("width", 800, "Framebuffer width")
 	height := flag.Int("height", 600, "Framebuffer height")
 	demo := flag.Bool("demo", false, "Use gradient test pattern instead of real screen")
+	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version)
+		os.Exit(0)
+	}
 
 	var capturer rfb.ScreenCapturer
 	var inputHandler rfb.InputHandler

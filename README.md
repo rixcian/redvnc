@@ -76,6 +76,19 @@ For building the C shared library (`capi/`), a C compiler is required:
 - **Windows:** MinGW or MSVC
 - **macOS:** Xcode command-line tools
 
+## Prebuilt binaries (GitHub Releases)
+
+Cut a release by pushing a **SemVer tag** from `main` (for example `v1.2.3`). The [Release workflow](.github/workflows/release.yml) runs only for tags matching `v*` and requires the tagged commit to be **reachable from `origin/main`**.
+
+Published assets are **raw executables** (no `.zip` / `.tar.gz`), plus `checksums.txt` (SHA256):
+
+| Asset | Notes |
+| --- | --- |
+| `redvnc-server_<tag>_<os>_<arch>` | Example VNC server; on Windows the name ends with `.exe` |
+| `redvnc-wsproxy_<tag>_<os>_<arch>` | WebSocket proxy; `.exe` on Windows |
+
+Both programs support `-version` (prints the embedded tag). **Linux and macOS** server builds link platform libraries dynamically (X11/Xtst and **x264** on Linux; ScreenCaptureKit/frameworks and **x264** on macOS via Homebrew at build time). Install the corresponding runtime packages on the target machine if the binary fails to start with missing-library errors. The **wsproxy** binaries are built with `CGO_ENABLED=0` and are easy to copy to servers.
+
 ## Development Setup
 
 ```bash
