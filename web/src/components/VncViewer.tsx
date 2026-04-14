@@ -11,6 +11,7 @@ export const VncViewer: React.FC<VncViewerProps> = ({
   scaleToFit = false,
   clipboardSync = true,
   uploadDir,
+  encodings,
   onConnect,
   onDisconnect,
   onBell,
@@ -39,6 +40,7 @@ export const VncViewer: React.FC<VncViewerProps> = ({
       scaleToFit,
       clipboardSync,
       uploadDir,
+      encodings,
     });
 
     clientRef.current = client;
@@ -87,7 +89,7 @@ export const VncViewer: React.FC<VncViewerProps> = ({
       setStatus('disconnected');
       setError(err instanceof Error ? err.message : 'Connection failed');
     }
-  }, [url, target, password, viewOnly, scaleToFit, clipboardSync, uploadDir, onConnect, onDisconnect, onBell]);
+  }, [url, target, password, viewOnly, scaleToFit, clipboardSync, uploadDir, encodings, onConnect, onDisconnect, onBell]);
 
   useEffect(() => {
     connect();

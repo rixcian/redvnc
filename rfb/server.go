@@ -640,6 +640,13 @@ func (c *ClientConn) encodeAndSendFrame(req *FramebufferUpdateRequest, pixels []
 	bestEnc := c.bestEncoding()
 	c.server.logger.Debug("best encoding", "encoding", bestEnc, "encodings", c.encodings, "tight_available", c.server.config.NewTightEncoder != nil)
 
+	// H.264 always encodes full frames — it uses inter-frame compression
+	// internally and needs continuous frame input for proper rate control and
+	// timing. Bypass dirty-rect optimizations for H.264.
+	if bestEnc == EncodingH264 {
+		dirtyRects = nil // force full-frame encode
+	}
+
 	// If dirtyRects is non-nil and empty, the capturer signalled no change.
 	// Send an empty FBU (RFC 6143 §7.6.1 permits zero rectangles) so the client
 	// can issue its next request. Pseudo-rects (cursor, desktop resize) are still

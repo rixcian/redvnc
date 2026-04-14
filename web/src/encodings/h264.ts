@@ -12,10 +12,9 @@ import type { RectHeader } from '../types';
 export class H264Decoder {
   private decoder: VideoDecoder | null = null;
   private fb: Framebuffer | null = null;
-  private canvas: OffscreenCanvas | null = null;
-  private ctx: OffscreenCanvasRenderingContext2D | null = null;
-  private pendingFrame: Promise<void> | null = null;
-  private resolvePending: (() => void) | null = null;
+  private configuredWidth = 0;
+  private configuredHeight = 0;
+  private pendingResolve: (() => void) | null = null;
 
   /**
    * Returns true if WebCodecs VideoDecoder is available in this browser.
@@ -42,15 +41,13 @@ export class H264Decoder {
     if (
       this.decoder === null ||
       this.fb !== fb ||
-      (this.canvas && (this.canvas.width !== header.width || this.canvas.height !== header.height))
+      this.configuredWidth !== header.width ||
+      this.configuredHeight !== header.height
     ) {
       this.reset();
       this.fb = fb;
-      this.canvas = new OffscreenCanvas(header.width, header.height);
-      this.ctx = this.canvas.getContext('2d');
-      if (!this.ctx) {
-        throw new Error('H264Decoder: failed to get 2d context from OffscreenCanvas');
-      }
+      this.configuredWidth = header.width;
+      this.configuredHeight = header.height;
 
       // Choose codec string based on resolution.
       // Baseline Level 3.0 for <= 720p, High Level 4.0 for larger.
@@ -75,9 +72,8 @@ export class H264Decoder {
 
     // Create a promise that resolves when the decoded frame is written.
     const framePromise = new Promise<void>((resolve) => {
-      this.resolvePending = resolve;
+      this.pendingResolve = resolve;
     });
-    this.pendingFrame = framePromise;
 
     const chunk = new EncodedVideoChunk({
       type: isKeyframe ? 'key' : 'delta',
@@ -93,41 +89,31 @@ export class H264Decoder {
   }
 
   private handleFrame(frame: VideoFrame): void {
-    if (!this.ctx || !this.fb || !this.canvas) {
+    if (!this.fb) {
       frame.close();
+      this.pendingResolve?.();
+      this.pendingResolve = null;
       return;
     }
 
     const w = frame.displayWidth;
     const h = frame.displayHeight;
 
-    // Resize canvas if needed.
-    if (this.canvas.width !== w || this.canvas.height !== h) {
-      this.canvas.width = w;
-      this.canvas.height = h;
-    }
+    // Use createImageBitmap + drawBitmap — this is the same proven path used
+    // by Tight JPEG decoding.  drawBitmap internally does drawImage → getImageData
+    // → writeRect, which produces correct RGBA pixels without any manual swap.
+    createImageBitmap(frame).then((bitmap) => {
+      frame.close();
+      this.fb!.drawBitmap(bitmap, 0, 0, w, h);
+      bitmap.close();
 
-    // Draw VideoFrame to canvas, then extract pixels.
-    this.ctx.drawImage(frame, 0, 0);
-    frame.close();
-
-    const imageData = this.ctx.getImageData(0, 0, w, h);
-    // imageData is RGBA; framebuffer expects BGRA via writeRect.
-    // writeRect swaps B<->R, so we need to provide BGRA.
-    // Since imageData is RGBA, we need to swap R and B before passing to writeRect.
-    const pixels = imageData.data;
-    for (let i = 0; i < pixels.length; i += 4) {
-      const r = pixels[i];
-      pixels[i] = pixels[i + 2];     // B
-      pixels[i + 2] = r;              // R
-    }
-
-    this.fb.writeRect(0, 0, w, h, new Uint8Array(pixels.buffer));
-
-    if (this.resolvePending) {
-      this.resolvePending();
-      this.resolvePending = null;
-    }
+      this.pendingResolve?.();
+      this.pendingResolve = null;
+    }).catch(() => {
+      frame.close();
+      this.pendingResolve?.();
+      this.pendingResolve = null;
+    });
   }
 
   reset(): void {
@@ -139,10 +125,9 @@ export class H264Decoder {
       }
       this.decoder = null;
     }
-    this.canvas = null;
-    this.ctx = null;
     this.fb = null;
-    this.pendingFrame = null;
-    this.resolvePending = null;
+    this.configuredWidth = 0;
+    this.configuredHeight = 0;
+    this.pendingResolve = null;
   }
 }

@@ -116,6 +116,7 @@ export interface VncViewerProps {
   scaleToFit?: boolean;
   clipboardSync?: boolean;
   uploadDir?: string;
+  encodings?: number[];
   onConnect?: () => void;
   onDisconnect?: (reason: string) => void;
   onBell?: () => void;

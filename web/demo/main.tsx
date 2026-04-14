@@ -1,11 +1,51 @@
 import React, { useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { VncViewer } from '../src/index';
+import {
+  EncodingRaw,
+  EncodingCopyRect,
+  EncodingZlib,
+  EncodingTight,
+  EncodingZRLE,
+  EncodingH264,
+  EncodingCursor,
+  EncodingDesktopSize,
+} from '../src/types';
+
+type EncodingPreset = 'auto' | 'h264' | 'tight' | 'zrle' | 'zlib' | 'raw';
+
+const ENCODING_PRESETS: Record<EncodingPreset, { label: string; encodings: number[] }> = {
+  auto: {
+    label: 'Auto (H.264 > Tight > ZRLE)',
+    encodings: [EncodingH264, EncodingTight, EncodingZRLE, EncodingZlib, EncodingCopyRect, EncodingRaw, EncodingCursor, EncodingDesktopSize],
+  },
+  h264: {
+    label: 'H.264',
+    encodings: [EncodingH264, EncodingCopyRect, EncodingRaw, EncodingCursor, EncodingDesktopSize],
+  },
+  tight: {
+    label: 'Tight (JPEG tiles)',
+    encodings: [EncodingTight, EncodingCopyRect, EncodingRaw, EncodingCursor, EncodingDesktopSize],
+  },
+  zrle: {
+    label: 'ZRLE',
+    encodings: [EncodingZRLE, EncodingCopyRect, EncodingRaw, EncodingCursor, EncodingDesktopSize],
+  },
+  zlib: {
+    label: 'Zlib',
+    encodings: [EncodingZlib, EncodingCopyRect, EncodingRaw, EncodingCursor, EncodingDesktopSize],
+  },
+  raw: {
+    label: 'Raw (uncompressed)',
+    encodings: [EncodingCopyRect, EncodingRaw, EncodingCursor, EncodingDesktopSize],
+  },
+};
 
 function App() {
   const [wsUrl, setWsUrl] = useState('ws://localhost:8080/ws');
   const [target, setTarget] = useState('');
   const [password, setPassword] = useState('');
+  const [encoding, setEncoding] = useState<EncodingPreset>('auto');
   const [connected, setConnected] = useState(false);
   const [showForm, setShowForm] = useState(true);
 
@@ -50,6 +90,18 @@ function App() {
               style={inputStyle}
             />
           </label>
+          <label>
+            Encoding
+            <select
+              value={encoding}
+              onChange={e => setEncoding(e.target.value as EncodingPreset)}
+              style={inputStyle}
+            >
+              {Object.entries(ENCODING_PRESETS).map(([key, preset]) => (
+                <option key={key} value={key}>{preset.label}</option>
+              ))}
+            </select>
+          </label>
           <button type="submit" style={buttonStyle}>Connect</button>
         </form>
       </div>
@@ -73,6 +125,7 @@ function App() {
           target={target}
           password={password || undefined}
           scaleToFit
+          encodings={ENCODING_PRESETS[encoding].encodings}
           onConnect={() => console.log('VNC connected')}
           onDisconnect={(reason) => {
             console.log('VNC disconnected:', reason);
