@@ -83,6 +83,9 @@ var (
 	mfMTFrameSize     = comGUID{0x1652c33d, 0xd6b2, 0x4012, [8]byte{0xb8, 0x34, 0x72, 0x03, 0x08, 0x49, 0xa3, 0x7d}}
 	mfMTFrameRate     = comGUID{0xc459a2e8, 0x3d2c, 0x4e44, [8]byte{0xb1, 0x32, 0xfe, 0xe5, 0x15, 0x6c, 0x7b, 0xb0}}
 
+	// MF_MT_MPEG2_PROFILE
+	mfMTMPEG2Profile = comGUID{0xad76a80b, 0x2d5c, 0x4e0b, [8]byte{0xb3, 0x75, 0x64, 0xe5, 0x20, 0x13, 0x70, 0x36}}
+
 	// Low latency attribute
 	mfLowLatency = comGUID{0x9c27891a, 0xed7a, 0x40e1, [8]byte{0x88, 0xe8, 0xb2, 0x27, 0x27, 0xa0, 0x24, 0xee}}
 
@@ -120,8 +123,9 @@ const (
 	methBufferUnlock           = 4
 	methBufferSetCurrentLength = 6
 
-	// ICodecAPI
-	methCodecAPISetValue = 6
+	// ICodecAPI (IUnknown=3 + IsSupported=3, IsModifiable=4, GetParameterRange=5,
+	// GetParameterValues=6, GetDefaultValue=7, GetValue=8, SetValue=9)
+	methCodecAPISetValue = 9
 
 	// Constants
 	coinitMultithreaded = 0x0
@@ -137,8 +141,11 @@ const (
 	// MF_E_TRANSFORM_NEED_MORE_INPUT
 	mfETransformNeedMoreInput = 0xC00D6D72
 
-	// eAVEncCommonRateControlMode_CBR
-	eAVEncCommonRateControlModeCBR = 2
+	// eAVEncCommonRateControlMode_CBR = 0 (not 2, which is UnconstrainedVBR)
+	eAVEncCommonRateControlModeCBR = 0
+
+	// eAVEncH264VProfile_Base (Baseline profile = 66)
+	eAVEncH264VProfileBase = 66
 
 	// MFT_OUTPUT_STREAM_PROVIDES_SAMPLES
 	mftOutputStreamProvidesSamples = 0x100
@@ -208,6 +215,7 @@ type mfBackend struct {
 	sampleDur int64 // 100-ns units per frame
 	pts       int64 // presentation timestamp counter
 	mftProvidesSamples bool
+	outputBufSize      int // minimum output buffer size from GetOutputStreamInfo
 }
 
 func newBackend(width, height int) (h264Backend, error) {
@@ -268,12 +276,15 @@ func (b *mfBackend) init() error {
 	b.setCodecAPIUINT32(&codecapiAVEncH264CABACEnable, 0)
 	b.setCodecAPIUINT32(&codecapiAVEncCommonRateControlMode, eAVEncCommonRateControlModeCBR)
 
-	// Query output stream info to check if MFT provides samples.
+	// Query output stream info to check if MFT provides samples and get buffer size.
 	var streamInfo mftOutputStreamInfo
 	hr2, _, _ := syscall.SyscallN(mfComMethod(b.transform, methTransformGetOutputStreamInfo),
 		uintptr(b.transform), 0, uintptr(unsafe.Pointer(&streamInfo)))
 	if hr2 == 0 {
 		b.mftProvidesSamples = (streamInfo.Flags & mftOutputStreamProvidesSamples) != 0
+		if streamInfo.Size > 0 {
+			b.outputBufSize = int(streamInfo.Size)
+		}
 	}
 
 	// Begin streaming.
@@ -299,6 +310,7 @@ func (b *mfBackend) setOutputType() error {
 	setUINT32(mediaType, &mfMTInterlaceMode, mfVideoInterlaceProgressive)
 	setUINT64(mediaType, &mfMTFrameSize, pack64(uint32(b.width), uint32(b.height)))
 	setUINT64(mediaType, &mfMTFrameRate, pack64(30, 1))
+	setUINT32(mediaType, &mfMTMPEG2Profile, eAVEncH264VProfileBase) // Baseline profile
 
 	hr2, _, _ := syscall.SyscallN(mfComMethod(b.transform, methTransformSetOutputType),
 		uintptr(b.transform), 0, uintptr(mediaType), 0)
@@ -425,10 +437,22 @@ func (b *mfBackend) drainOutput() ([]byte, bool, error) {
 			return nil, false, fmt.Errorf("MFCreateSample (output): 0x%08X", hr)
 		}
 		// Create a buffer large enough for encoded data.
+		bufSize := 1024 * 1024 // 1 MB default
+		if b.outputBufSize > 0 {
+			bufSize = b.outputBufSize
+		}
 		var buf unsafe.Pointer
-		procMFCreateMemoryBuffer.Call(uintptr(1024*1024), uintptr(unsafe.Pointer(&buf)))
-		syscall.SyscallN(mfComMethod(s, methSampleAddBuffer), uintptr(s), uintptr(buf))
+		hr2, _, _ := procMFCreateMemoryBuffer.Call(uintptr(bufSize), uintptr(unsafe.Pointer(&buf)))
+		if hr2 != 0 {
+			mfComRelease(s)
+			return nil, false, fmt.Errorf("MFCreateMemoryBuffer (output): 0x%08X", hr2)
+		}
+		hr3, _, _ := syscall.SyscallN(mfComMethod(s, methSampleAddBuffer), uintptr(s), uintptr(buf))
 		mfComRelease(buf)
+		if hr3 != 0 {
+			mfComRelease(s)
+			return nil, false, fmt.Errorf("AddBuffer (output): 0x%08X", hr3)
+		}
 		outSample = s
 		outData.PSample = s
 	}
