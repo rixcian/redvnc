@@ -13,14 +13,11 @@ export class Framebuffer {
     this._width = width;
     this._height = height;
     this._imageData = new ImageData(width, height);
-    // Fill with magenta so un-decoded tiles are visually obvious.
-    // Black = server sent black data.  Magenta = tile was never decoded.
+    // ImageData is initialized to transparent black by spec.
+    // Set alpha to 255 so the canvas isn't transparent before the first frame.
     const d = this._imageData.data;
-    for (let i = 0; i < d.length; i += 4) {
-      d[i] = 255;     // R
-      d[i + 1] = 0;   // G
-      d[i + 2] = 255;  // B
-      d[i + 3] = 255;  // A
+    for (let i = 3; i < d.length; i += 4) {
+      d[i] = 255; // A
     }
     this.markDirty(0, 0, width, height);
   }
@@ -59,10 +56,9 @@ export class Framebuffer {
     this._width = width;
     this._height = height;
     this._imageData = new ImageData(width, height);
-    // Fill with magenta so un-decoded tiles are obvious
     const d = this._imageData.data;
-    for (let i = 0; i < d.length; i += 4) {
-      d[i] = 255; d[i + 1] = 0; d[i + 2] = 255; d[i + 3] = 255;
+    for (let i = 3; i < d.length; i += 4) {
+      d[i] = 255;
     }
     this._dirtyRects = [];
   }
