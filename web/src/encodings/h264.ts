@@ -5,6 +5,11 @@
  *   [4 bytes] flags (uint32 BE) - bit 0 = keyframe (IDR)
  *   [4 bytes] NAL data length (uint32 BE)
  *   [N bytes] H.264 NAL units (Annex B format)
+ *
+ * This decoder is non-blocking: decode() submits frames to the VideoDecoder
+ * and returns immediately. The decoded frame is written to the framebuffer
+ * asynchronously via the output callback. Stale frames are dropped using a
+ * generation counter — only the latest submitted frame is rendered.
  */
 import type { Framebuffer } from '../framebuffer';
 import type { RectHeader } from '../types';
@@ -14,7 +19,19 @@ export class H264Decoder {
   private fb: Framebuffer | null = null;
   private configuredWidth = 0;
   private configuredHeight = 0;
-  private pendingResolve: (() => void) | null = null;
+
+  /** Incremented on each decode() call; only the latest generation is rendered. */
+  private decodeGeneration = 0;
+
+  /** Reusable OffscreenCanvas for extracting pixels from decoded VideoFrames. */
+  private renderCanvas: OffscreenCanvas | null = null;
+  private renderCtx: OffscreenCanvasRenderingContext2D | null = null;
+
+  /**
+   * Called when a decoded frame is actually written to the framebuffer.
+   * Used by VncClient to record accurate rendered-FPS and end-to-end latency.
+   */
+  onFrameRendered: ((renderTime: number) => void) | null = null;
 
   /**
    * Returns true if WebCodecs VideoDecoder is available in this browser.
@@ -28,9 +45,12 @@ export class H264Decoder {
   }
 
   /**
-   * Decode an H.264 rectangle and write the result to the framebuffer.
+   * Submit an H.264 frame for decoding. Returns immediately — the decoded
+   * frame will be written to the framebuffer asynchronously via the output
+   * callback. Stale frames are dropped if a newer decode() call arrives
+   * before the previous frame is rendered.
    */
-  async decode(fb: Framebuffer, header: RectHeader, data: DataView): Promise<void> {
+  decode(fb: Framebuffer, header: RectHeader, data: DataView): void {
     const flags = data.getUint32(0);
     const nalLen = data.getUint32(4);
     const isKeyframe = (flags & 1) !== 0;
@@ -70,50 +90,55 @@ export class H264Decoder {
       });
     }
 
-    // Create a promise that resolves when the decoded frame is written.
-    const framePromise = new Promise<void>((resolve) => {
-      this.pendingResolve = resolve;
-    });
+    this.fb = fb;
+    this.decodeGeneration++;
 
     const chunk = new EncodedVideoChunk({
       type: isKeyframe ? 'key' : 'delta',
-      timestamp: 0, // We don't need presentation timestamps for VNC.
+      // Use generation counter as timestamp so we can identify stale frames
+      // in the output callback. VideoDecoder preserves this value on output.
+      timestamp: this.decodeGeneration,
       data: nalData,
     });
 
     this.decoder.decode(chunk);
-    await this.decoder.flush();
-
-    // Wait for the frame callback to complete.
-    await framePromise;
+    // No flush() — let the decoder output frames asynchronously.
+    // optimizeForLatency: true ensures frames are emitted ASAP without
+    // internal buffering or reordering.
   }
 
   private handleFrame(frame: VideoFrame): void {
     if (!this.fb) {
       frame.close();
-      this.pendingResolve?.();
-      this.pendingResolve = null;
+      return;
+    }
+
+    // Drop stale frames — only render the latest submitted generation.
+    // When the client is slower than the server, intermediate frames
+    // accumulate in the VideoDecoder queue. Rendering all of them would
+    // multiply the delay; dropping them keeps us current.
+    if (frame.timestamp !== this.decodeGeneration) {
+      frame.close();
       return;
     }
 
     const w = frame.displayWidth;
     const h = frame.displayHeight;
 
-    // Use createImageBitmap + drawBitmap — this is the same proven path used
-    // by Tight JPEG decoding.  drawBitmap internally does drawImage → getImageData
-    // → writeRect, which produces correct RGBA pixels without any manual swap.
-    createImageBitmap(frame).then((bitmap) => {
-      frame.close();
-      this.fb!.drawBitmap(bitmap, 0, 0, w, h);
-      bitmap.close();
+    // Draw VideoFrame directly to OffscreenCanvas (no createImageBitmap needed).
+    // CanvasRenderingContext2D.drawImage() accepts VideoFrame natively.
+    if (!this.renderCanvas || this.renderCanvas.width !== w || this.renderCanvas.height !== h) {
+      this.renderCanvas = new OffscreenCanvas(w, h);
+      this.renderCtx = this.renderCanvas.getContext('2d', { willReadFrequently: true })!;
+    }
 
-      this.pendingResolve?.();
-      this.pendingResolve = null;
-    }).catch(() => {
-      frame.close();
-      this.pendingResolve?.();
-      this.pendingResolve = null;
-    });
+    this.renderCtx!.drawImage(frame, 0, 0);
+    frame.close();
+
+    const imgData = this.renderCtx!.getImageData(0, 0, w, h);
+    this.fb.writeRect(0, 0, w, h, imgData.data);
+
+    this.onFrameRendered?.(performance.now());
   }
 
   reset(): void {
@@ -128,6 +153,8 @@ export class H264Decoder {
     this.fb = null;
     this.configuredWidth = 0;
     this.configuredHeight = 0;
-    this.pendingResolve = null;
+    this.decodeGeneration = 0;
+    this.renderCanvas = null;
+    this.renderCtx = null;
   }
 }

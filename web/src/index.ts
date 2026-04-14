@@ -125,6 +125,10 @@ export class VncClient {
   // next FBU, causing race conditions and visual artifacts.
   private fbuQueue: Promise<void> = Promise.resolve();
 
+  // Tracks the FBU request time associated with the current H.264 decode.
+  // Used by the onFrameRendered callback to compute end-to-end latency.
+  private _h264FbuRequestTime = 0;
+
   constructor(options: VncClientOptions) {
     this.options = options;
     this.connection = new VncConnection();
@@ -134,6 +138,16 @@ export class VncClient {
     this.tightDecoder = new TightDecoder();
     this.zrleDecoder = new ZrleDecoder();
     this.h264Decoder = new H264Decoder();
+
+    // H.264 frames are decoded asynchronously by the VideoDecoder. This
+    // callback fires when a frame is actually rendered to the framebuffer,
+    // giving us accurate FPS and end-to-end latency metrics.
+    this.h264Decoder.onFrameRendered = (renderTime: number) => {
+      this._fbuTimestamps.push(renderTime);
+      if (this._h264FbuRequestTime > 0) {
+        this._latencySamples.push(renderTime - this._h264FbuRequestTime);
+      }
+    };
 
     const sendFn = (data: ArrayBuffer | Uint8Array) => this.connection.send(data);
     this.inputHandler = new InputHandler(this.renderer, sendFn, options.viewOnly ?? false);
@@ -429,11 +443,22 @@ export class VncClient {
     if (!this.framebuffer) return;
 
     const now = performance.now();
-    this._fbuTimestamps.push(now);
 
-    // Record round-trip latency (time from FBU request to FBU response)
-    if (this._lastFbuRequestTime > 0) {
-      this._latencySamples.push(now - this._lastFbuRequestTime);
+    // Check if this FBU contains H.264 rectangles. H.264 decode is
+    // non-blocking (fire-and-forget) — the VideoDecoder writes to the
+    // framebuffer asynchronously and fires onFrameRendered for metrics.
+    // For all other encodings, FPS/latency are recorded synchronously here.
+    const hasH264 = msg.rectangles.some(r => r.header.encoding === EncodingH264);
+
+    if (hasH264) {
+      // Store the request time so the onFrameRendered callback can compute
+      // accurate end-to-end latency (request → render, not request → receive).
+      this._h264FbuRequestTime = this._lastFbuRequestTime;
+    } else {
+      this._fbuTimestamps.push(now);
+      if (this._lastFbuRequestTime > 0) {
+        this._latencySamples.push(now - this._lastFbuRequestTime);
+      }
     }
 
     // Request next FBU immediately BEFORE decoding. This pipelines server
@@ -470,7 +495,10 @@ export class VncClient {
             this.zrleDecoder.decode(this.framebuffer, header, data);
             break;
           case EncodingH264:
-            asyncTasks.push(this.h264Decoder.decode(this.framebuffer, header, data));
+            // Non-blocking: submits to VideoDecoder and returns immediately.
+            // The decoded frame is rendered asynchronously via the output
+            // callback, which also records FPS and latency metrics.
+            this.h264Decoder.decode(this.framebuffer, header, data);
             break;
           case EncodingCursor:
             this.handleCursor(header, data);
