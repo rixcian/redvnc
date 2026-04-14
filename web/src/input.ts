@@ -300,16 +300,12 @@ export class InputHandler {
   }
 
   private touchToVncCoords(touch: Touch): { x: number; y: number } {
-    if (!this.canvas) return { x: 0, y: 0 };
-    const rect = this.canvas.getBoundingClientRect();
-    const canvasX = touch.clientX - rect.left;
-    const canvasY = touch.clientY - rect.top;
-    const scaleX = this.fbWidth / rect.width;
-    const scaleY = this.fbHeight / rect.height;
-    return {
-      x: Math.floor(canvasX * scaleX),
-      y: Math.floor(canvasY * scaleY),
-    };
+    return this.renderer.translatePointer(
+      touch.clientX,
+      touch.clientY,
+      this.fbWidth,
+      this.fbHeight,
+    );
   }
 }
 

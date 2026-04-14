@@ -1,0 +1,10 @@
+@import "tailwindcss";
+
+@source "../**/*.{ts,tsx}";
+@source "../../demo/**/*.{ts,tsx}";
+
+@theme {
+  --radius-lg: 0.5rem;
+  --radius-md: calc(var(--radius-lg) - 2px);
+  --radius-sm: calc(var(--radius-lg) - 4px);
+}

@@ -1,6 +1,12 @@
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { VncViewer } from '../src/index';
+import {
+  VncClient,
+  VncViewer,
+  DebugOverlay,
+  Toolbar,
+  ConnectionForm,
+} from '../src/index';
 import {
   EncodingRaw,
   EncodingCopyRect,
@@ -46,120 +52,189 @@ function App() {
   const [target, setTarget] = useState('');
   const [password, setPassword] = useState('');
   const [encoding, setEncoding] = useState<EncodingPreset>('auto');
-  const [connected, setConnected] = useState(false);
-  const [showForm, setShowForm] = useState(true);
+  const [sessionOpen, setSessionOpen] = useState(false);
 
   const handleConnect = (e: React.FormEvent) => {
     e.preventDefault();
     if (!target) return;
-    setShowForm(false);
-    setConnected(true);
+    setSessionOpen(true);
   };
 
-  if (showForm) {
+  const handleLeaveSession = useCallback(() => {
+    setSessionOpen(false);
+  }, []);
+
+  if (!sessionOpen) {
     return (
-      <div style={{ maxWidth: 400, margin: '100px auto', padding: 24 }}>
-        <h1 style={{ marginBottom: 24 }}>redvnc Web Client</h1>
-        <form onSubmit={handleConnect} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          <label>
-            WebSocket URL
-            <input
-              type="text"
-              value={wsUrl}
-              onChange={e => setWsUrl(e.target.value)}
-              style={inputStyle}
-            />
-          </label>
-          <label>
-            VNC Target (host:port)
-            <input
-              type="text"
-              value={target}
-              onChange={e => setTarget(e.target.value)}
-              placeholder="192.168.1.50:5900"
-              style={inputStyle}
-              required
-            />
-          </label>
-          <label>
-            Password (optional)
-            <input
-              type="password"
-              value={password}
-              onChange={e => setPassword(e.target.value)}
-              style={inputStyle}
-            />
-          </label>
-          <label>
+      <ConnectionForm
+        wsUrl={wsUrl}
+        target={target}
+        password={password}
+        onWsUrlChange={setWsUrl}
+        onTargetChange={setTarget}
+        onPasswordChange={setPassword}
+        onSubmit={handleConnect}
+      >
+        <div className="space-y-2">
+          <label htmlFor="encoding" className="text-sm font-medium leading-none text-zinc-200">
             Encoding
-            <select
-              value={encoding}
-              onChange={e => setEncoding(e.target.value as EncodingPreset)}
-              style={inputStyle}
-            >
-              {Object.entries(ENCODING_PRESETS).map(([key, preset]) => (
-                <option key={key} value={key}>{preset.label}</option>
-              ))}
-            </select>
           </label>
-          <button type="submit" style={buttonStyle}>Connect</button>
-        </form>
-      </div>
+          <select
+            id="encoding"
+            value={encoding}
+            onChange={e => setEncoding(e.target.value as EncodingPreset)}
+            className="flex h-10 w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-50 ring-offset-zinc-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-400 focus-visible:ring-offset-2"
+          >
+            {Object.entries(ENCODING_PRESETS).map(([key, preset]) => (
+              <option key={key} value={key}>{preset.label}</option>
+            ))}
+          </select>
+        </div>
+      </ConnectionForm>
     );
   }
 
   return (
-    <div style={{ width: '100vw', height: '100vh', display: 'flex', flexDirection: 'column' }}>
-      <div style={{ padding: '8px 16px', background: '#1a1a1a', borderBottom: '1px solid #333', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <span>Connected to {target}</span>
-        <button
-          onClick={() => { setConnected(false); setShowForm(true); }}
-          style={buttonStyle}
-        >
-          Disconnect
-        </button>
-      </div>
-      {connected && (
-        <VncViewer
-          url={wsUrl}
-          target={target}
-          password={password || undefined}
-          scaleToFit
-          encodings={ENCODING_PRESETS[encoding].encodings}
-          onConnect={() => console.log('VNC connected')}
-          onDisconnect={(reason) => {
-            console.log('VNC disconnected:', reason);
-            setConnected(false);
-            setShowForm(true);
-          }}
-          onBell={() => console.log('Bell!')}
-          style={{ flex: 1 }}
-        />
-      )}
+    <div className="flex h-screen w-screen flex-col bg-zinc-950">
+      <VncSession
+        wsUrl={wsUrl}
+        target={target}
+        password={password || undefined}
+        encodings={ENCODING_PRESETS[encoding].encodings}
+        onLeave={handleLeaveSession}
+      />
     </div>
   );
 }
 
-const inputStyle: React.CSSProperties = {
-  display: 'block',
-  width: '100%',
-  padding: '8px 12px',
-  marginTop: 4,
-  background: '#222',
-  border: '1px solid #444',
-  borderRadius: 4,
-  color: '#eee',
-  fontSize: 14,
-};
+type SessionStatus = 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
 
-const buttonStyle: React.CSSProperties = {
-  padding: '8px 16px',
-  background: '#0066cc',
-  color: '#fff',
-  border: 'none',
-  borderRadius: 4,
-  cursor: 'pointer',
-  fontSize: 14,
-};
+function VncSession({
+  wsUrl,
+  target,
+  password,
+  encodings,
+  onLeave,
+}: {
+  wsUrl: string;
+  target: string;
+  password?: string;
+  encodings?: number[];
+  onLeave: () => void;
+}) {
+  const [status, setStatus] = useState<SessionStatus>('disconnected');
+  const [error, setError] = useState<string | null>(null);
+  const [reconnectAttempt, setReconnectAttempt] = useState(0);
+  const [showDebug, setShowDebug] = useState(false);
+  const [client, setClient] = useState<VncClient | null>(null);
+
+  const toolbarStatus = useMemo(() => {
+    if (error) return 'error' as const;
+    if (status === 'connecting') return 'connecting' as const;
+    if (status === 'reconnecting') return 'reconnecting' as const;
+    if (status === 'connected') return 'connected' as const;
+    return 'idle' as const;
+  }, [error, status]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const vnc = new VncClient({
+      url: wsUrl,
+      target,
+      password,
+      scaleToFit: true,
+      encodings,
+    });
+
+    vnc.on('connect', () => {
+      setStatus('connected');
+      setError(null);
+      console.log('VNC connected');
+    });
+
+    vnc.on('disconnect', (reason) => {
+      setStatus('disconnected');
+      console.log('VNC disconnected:', reason);
+      onLeave();
+    });
+
+    vnc.on('reconnecting', (attempt) => {
+      setStatus('reconnecting');
+      setReconnectAttempt(attempt);
+    });
+
+    vnc.on('reconnected', () => {
+      setStatus('connected');
+      setReconnectAttempt(0);
+      setError(null);
+    });
+
+    vnc.on('reconnect_failed', () => {
+      setStatus('disconnected');
+      setError('Failed to reconnect after multiple attempts');
+    });
+
+    vnc.on('bell', () => {
+      console.log('Bell!');
+    });
+
+    setStatus('connecting');
+    setError(null);
+
+    (async () => {
+      try {
+        await vnc.connect();
+        if (cancelled) {
+          vnc.disconnect();
+          return;
+        }
+        setClient(vnc);
+      } catch (err) {
+        if (!cancelled) {
+          setStatus('disconnected');
+          setError(err instanceof Error ? err.message : 'Connection failed');
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      vnc.disconnect();
+      setClient(null);
+    };
+  }, [wsUrl, target, password, encodings, onLeave]);
+
+  return (
+    <>
+      <Toolbar
+        client={client}
+        onDisconnect={onLeave}
+        target={target}
+        connectionStatus={toolbarStatus}
+        diagnosticsOpen={showDebug}
+        onToggleDiagnostics={() => setShowDebug((v) => !v)}
+      />
+      <div className="relative min-h-0 flex-1">
+        {error && (
+          <div className="absolute left-1/2 top-1/2 z-10 max-w-md -translate-x-1/2 -translate-y-1/2 rounded-lg bg-red-950/90 px-6 py-4 text-center text-red-200 shadow-xl">
+            {error}
+          </div>
+        )}
+        {status === 'reconnecting' && (
+          <div className="absolute left-1/2 top-1/2 z-10 -translate-x-1/2 -translate-y-1/2 rounded-lg bg-amber-950/90 px-6 py-4 text-center text-amber-100 shadow-xl">
+            Reconnecting... (attempt {reconnectAttempt})
+          </div>
+        )}
+        {status === 'connecting' && (
+          <div className="absolute left-1/2 top-1/2 z-10 -translate-x-1/2 -translate-y-1/2 rounded-lg bg-zinc-900/90 px-6 py-4 text-zinc-100 shadow-xl">
+            Connecting...
+          </div>
+        )}
+        <DebugOverlay client={client} visible={showDebug && status === 'connected'} />
+        <VncViewer client={client} scaleToFit className="h-full w-full" />
+      </div>
+    </>
+  );
+}
 
 createRoot(document.getElementById('root')!).render(<App />);

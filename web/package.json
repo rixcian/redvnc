@@ -11,13 +11,14 @@
       "import": "./dist/index.js",
       "require": "./dist/index.cjs",
       "types": "./dist/index.d.ts"
-    }
+    },
+    "./style.css": "./dist/style.css"
   },
   "files": [
     "dist"
   ],
   "scripts": {
-    "dev": "vite serve demo --host",
+    "dev": "vite demo --host",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
@@ -27,17 +28,31 @@
     "react-dom": ">=18.0.0"
   },
   "devDependencies": {
+    "@tailwindcss/postcss": "^4.2.2",
     "@types/react": "^18.2.0",
     "@types/react-dom": "^18.2.0",
     "@vitejs/plugin-react": "^4.2.0",
+    "autoprefixer": "^10.4.27",
+    "postcss": "^8.5.8",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
+    "tailwindcss": "^4.2.2",
     "typescript": "^5.3.0",
     "vite": "^5.0.0",
     "vite-plugin-dts": "^3.7.0",
     "vitest": "^4.1.0"
   },
   "dependencies": {
-    "fflate": "^0.8.2"
+    "@radix-ui/react-dialog": "^1.1.15",
+    "@radix-ui/react-label": "^2.1.8",
+    "@radix-ui/react-separator": "^1.1.8",
+    "@radix-ui/react-slot": "^1.2.4",
+    "@radix-ui/react-switch": "^1.2.6",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "fflate": "^0.8.2",
+    "framer-motion": "^12.4.7",
+    "lucide-react": "^1.0.1",
+    "tailwind-merge": "^3.5.0"
   }
 }
