@@ -46,6 +46,7 @@ const (
 	EncodingZlib    int32 = 6
 	EncodingTight   int32 = 7
 	EncodingZRLE    int32 = 16
+	EncodingH264    int32 = 50
 	EncodingCursor  int32 = -239
 	EncodingDesktopSize int32 = -223
 )

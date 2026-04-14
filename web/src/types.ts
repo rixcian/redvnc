@@ -19,6 +19,7 @@ export const EncodingRRE = 2;
 export const EncodingZlib = 6;
 export const EncodingTight = 7;
 export const EncodingZRLE = 16;
+export const EncodingH264 = 50;
 export const EncodingCursor = -239;
 export const EncodingDesktopSize = -223;
 
@@ -155,8 +156,11 @@ export interface ClipboardEntry {
   timestamp: number; // Date.now()
 }
 
-// Default encoding preference order
+// Default encoding preference order.
+// H.264 is listed first but filtered out at connect time if WebCodecs VideoDecoder
+// is not available in the browser.
 export const DEFAULT_ENCODINGS = [
+  EncodingH264,
   EncodingTight,
   EncodingZRLE,
   EncodingZlib,
