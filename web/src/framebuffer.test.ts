@@ -36,9 +36,11 @@ describe('Framebuffer', () => {
     expect(fb.pixels[offset]).toBe(255);
     expect(fb.pixels[offset + 1]).toBe(0);
 
-    // Pixel at (0, 0) was never written — stays magenta (undecoded sentinel)
-    expect(fb.pixels[0]).toBe(255);
-    expect(fb.pixels[2]).toBe(255);
+    // Pixel at (0, 0) was never written — stays opaque black
+    expect(fb.pixels[0]).toBe(0);
+    expect(fb.pixels[1]).toBe(0);
+    expect(fb.pixels[2]).toBe(0);
+    expect(fb.pixels[3]).toBe(255);
   });
 
   it('tracks dirty rectangles', () => {
@@ -64,9 +66,11 @@ describe('Framebuffer', () => {
     expect(fb.height).toBe(150);
     expect(fb.pixels.length).toBe(200 * 150 * 4);
     expect(fb.dirtyRects.length).toBe(0);
-    // Resize clears to magenta fill (same undecoded sentinel as constructor)
-    expect(fb.pixels[0]).toBe(255);
-    expect(fb.pixels[2]).toBe(255);
+    // Resize clears to opaque black (same as constructor)
+    expect(fb.pixels[0]).toBe(0);
+    expect(fb.pixels[1]).toBe(0);
+    expect(fb.pixels[2]).toBe(0);
+    expect(fb.pixels[3]).toBe(255);
   });
 
   it('copies a region within the framebuffer', () => {
