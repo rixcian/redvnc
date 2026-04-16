@@ -125,9 +125,6 @@ export class VncClient {
   // next FBU, causing race conditions and visual artifacts.
   private fbuQueue: Promise<void> = Promise.resolve();
 
-  // Tracks the FBU request time associated with the current H.264 decode.
-  // Used by the onFrameRendered callback to compute end-to-end latency.
-  private _h264FbuRequestTime = 0;
 
   constructor(options: VncClientOptions) {
     this.options = options;
@@ -141,12 +138,18 @@ export class VncClient {
 
     // H.264 frames are decoded asynchronously by the VideoDecoder. This
     // callback fires when a frame is actually rendered to the framebuffer,
-    // giving us accurate FPS and end-to-end latency metrics.
-    this.h264Decoder.onFrameRendered = (renderTime: number) => {
+    // giving us accurate FPS and per-frame end-to-end latency metrics.
+    // fbuRequestTime is the exact request timestamp for THIS frame (passed
+    // through via the pendingFrames map in H264Decoder), avoiding the
+    // scalar-overwrite race of the old _h264FbuRequestTime approach.
+    this.h264Decoder.onFrameRendered = (renderTime: number, fbuRequestTime: number, decodeLatencyMs: number) => {
       this._fbuTimestamps.push(renderTime);
-      if (this._h264FbuRequestTime > 0) {
-        this._latencySamples.push(renderTime - this._h264FbuRequestTime);
+      if (fbuRequestTime > 0) {
+        this._latencySamples.push(renderTime - fbuRequestTime);
       }
+      // Log decoder-internal latency at debug level (visible in browser console).
+      // This isolates VideoDecoder cost from the full end-to-end measurement.
+      console.debug('[H264] decode+readback latency:', decodeLatencyMs.toFixed(1), 'ms');
     };
 
     const sendFn = (data: ArrayBuffer | Uint8Array) => this.connection.send(data);
@@ -444,20 +447,19 @@ export class VncClient {
 
     const now = performance.now();
 
-    // Check if this FBU contains H.264 rectangles. H.264 decode is
-    // non-blocking (fire-and-forget) — the VideoDecoder writes to the
-    // framebuffer asynchronously and fires onFrameRendered for metrics.
-    // For all other encodings, FPS/latency are recorded synchronously here.
-    const hasH264 = msg.rectangles.some(r => r.header.encoding === EncodingH264);
+    // Capture the request time that produced THIS FBU before updating.
+    // For H.264, this is passed to decode() and threaded through pendingFrames
+    // so onFrameRendered can compute per-frame end-to-end latency accurately.
+    // For other encodings, latency is recorded synchronously below.
+    const thisFbuRequestTime = this._lastFbuRequestTime;
 
-    if (hasH264) {
-      // Store the request time so the onFrameRendered callback can compute
-      // accurate end-to-end latency (request → render, not request → receive).
-      this._h264FbuRequestTime = this._lastFbuRequestTime;
-    } else {
+    // For non-H.264 encodings, record FPS and latency synchronously here
+    // (decode is synchronous so render == receive time).
+    const hasH264 = msg.rectangles.some(r => r.header.encoding === EncodingH264);
+    if (!hasH264) {
       this._fbuTimestamps.push(now);
-      if (this._lastFbuRequestTime > 0) {
-        this._latencySamples.push(now - this._lastFbuRequestTime);
+      if (thisFbuRequestTime > 0) {
+        this._latencySamples.push(now - thisFbuRequestTime);
       }
     }
 
@@ -496,9 +498,10 @@ export class VncClient {
             break;
           case EncodingH264:
             // Non-blocking: submits to VideoDecoder and returns immediately.
-            // The decoded frame is rendered asynchronously via the output
-            // callback, which also records FPS and latency metrics.
-            this.h264Decoder.decode(this.framebuffer, header, data);
+            // thisFbuRequestTime is threaded through pendingFrames so the
+            // onFrameRendered callback computes accurate per-frame latency
+            // even when intermediate frames are dropped.
+            this.h264Decoder.decode(this.framebuffer, header, data, thisFbuRequestTime);
             break;
           case EncodingCursor:
             this.handleCursor(header, data);
