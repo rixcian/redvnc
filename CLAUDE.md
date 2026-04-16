@@ -329,9 +329,22 @@ type SecurityHandler interface {
 
 | Platform | Screen Capture | Input Injection |
 |---|---|---|
-| Linux (X11/XShm + XTest) | implemented | implemented |
+| Linux — X11 (XShm + XTest) | implemented | implemented |
+| Linux — Wayland (portal + PipeWire) | implemented (build with `-tags wayland`) | implemented (build with `-tags wayland`) |
 | Windows (DXGI + SendInput) | implemented | implemented |
 | macOS (ScreenCaptureKit + CGEvent) | implemented | implemented |
+
+### Linux X11 vs Wayland
+
+At runtime the Linux factory functions `capture.NewScreenCapture()` and `input.NewInputInjector()` detect the display server by checking `XDG_SESSION_TYPE`, then `WAYLAND_DISPLAY`, then `DISPLAY`. On Wayland they delegate to the PipeWire/portal backend; on X11 they return the XShm/XTest implementation.
+
+The Wayland backend is gated behind the `wayland` build tag because it pulls in `libpipewire-0.3` as a CGo dependency:
+- Default `go build ./...` → X11-only. No new system dependencies.
+- `go build -tags wayland ./...` → includes Wayland. Requires `libpipewire-0.3-dev` + `libspa-0.2-dev` at compile time.
+
+On Wayland sessions both capture and input create their own `internal/portal.Session`, which triggers a one-time user consent dialog (persisted via `persist_mode=2` and a restore token stored in `$XDG_CONFIG_HOME/redvnc/portal-token`). Subsequent runs skip the dialog.
+
+Input injection on Wayland prefers `org.freedesktop.portal.RemoteDesktop.NotifyKeyboardKeysym` (same keysym space as VNC) and falls back to `NotifyKeyboardKeycode` with a small X11-keysym-to-evdev table in [keysym_evdev.go](input/keysym_evdev.go) when the portal backend lacks Keysym support.
 
 ---
 
@@ -339,9 +352,10 @@ type SecurityHandler interface {
 
 File: `.github/workflows/ci.yml`
 
-Two jobs:
+Three jobs:
 1. **test** — matrix over ubuntu/macos/windows with Go 1.24. Runs `go build`, `go vet`, and `go test` (with `-race` on Linux only). Uploads coverage artifacts.
-2. **web** — ubuntu-only. Runs `npm ci`, `npm run typecheck`, `npm test`.
+2. **linux-wayland** — ubuntu-only. Builds and tests with `-tags wayland` after installing `libpipewire-0.3-dev` and `libspa-0.2-dev`.
+3. **web** — ubuntu-only. Runs `npm ci`, `npm run typecheck`, `npm test`.
 
 Linux CI installs `libx11-dev` and `libxtst-dev` for the X11 stubs to compile.
 
