@@ -79,6 +79,23 @@ export class CanvasRenderer implements IRenderer {
   }
 
   /**
+   * H.264 fast path for Canvas2D: draw the decoded VideoFrame directly to
+   * the canvas via drawImage. This skips the OffscreenCanvas readback the
+   * H264Decoder would otherwise do.
+   *
+   * Returns false if the canvas isn't attached; caller falls back to the
+   * framebuffer readback path in that case.
+   */
+  renderVideoFrame(frame: VideoFrame, fbWidth: number, fbHeight: number): boolean {
+    if (!this.ctx || !this.canvas) return false;
+    if (frame.displayWidth !== fbWidth || frame.displayHeight !== fbHeight) {
+      return false;
+    }
+    this.ctx.drawImage(frame, 0, 0);
+    return true;
+  }
+
+  /**
    * Set a custom cursor on the canvas element.
    */
   setCursor(imageData: Uint8Array, width: number, height: number, hotX: number, hotY: number): void {

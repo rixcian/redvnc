@@ -7,17 +7,25 @@
  *   [N bytes] H.264 NAL units (Annex B format)
  *
  * This decoder is non-blocking: decode() submits frames to the VideoDecoder
- * and returns immediately. The decoded frame is written to the framebuffer
- * asynchronously via the output callback. Stale frames are dropped by
- * comparing each frame's submit timestamp against the latest — only the most
- * recently submitted frame is rendered.
+ * and returns immediately. The decoded frame is rendered asynchronously via
+ * the output callback. Stale frames are dropped by comparing each frame's
+ * submit timestamp against the latest — only the most recently submitted
+ * frame is rendered.
+ *
+ * Rendering path:
+ *   Fast path — renderer.renderVideoFrame(frame) does a GPU-to-GPU upload
+ *     (WebGL texSubImage2D with VideoFrame source, or Canvas2D drawImage).
+ *   Fallback — OffscreenCanvas drawImage → getImageData → fb.writeRect.
+ *     Used when the renderer rejects the frame (size mismatch, detached).
  */
 import type { Framebuffer } from '../framebuffer';
+import type { IRenderer } from '../renderer-interface';
 import type { RectHeader } from '../types';
 
 export class H264Decoder {
   private decoder: VideoDecoder | null = null;
   private fb: Framebuffer | null = null;
+  private renderer: IRenderer | null = null;
   private configuredWidth = 0;
   private configuredHeight = 0;
 
@@ -34,7 +42,11 @@ export class H264Decoder {
    */
   private pendingFrames = new Map<number, number>();
 
-  /** Reusable OffscreenCanvas for extracting pixels from decoded VideoFrames. */
+  /**
+   * Reusable OffscreenCanvas for the fallback readback path (only used when
+   * the renderer can't handle the VideoFrame directly). Not allocated
+   * otherwise — the fast path skips all CPU-side pixel work.
+   */
   private renderCanvas: OffscreenCanvas | null = null;
   private renderCtx: OffscreenCanvasRenderingContext2D | null = null;
 
@@ -59,13 +71,23 @@ export class H264Decoder {
 
   /**
    * Submit an H.264 frame for decoding. Returns immediately — the decoded
-   * frame will be written to the framebuffer asynchronously via the output
-   * callback.
+   * frame will be rendered asynchronously via the output callback.
    *
-   * @param fbuRequestTime — performance.now() timestamp when the FBU request
-   *   that triggered this frame was sent. Used for end-to-end latency tracking.
+   * @param fb              CPU framebuffer (used only for the fallback path).
+   * @param renderer        Active renderer for the GPU-to-GPU fast path.
+   * @param header          RFB rectangle header from the server.
+   * @param data            Wire bytes (flags + NAL length + NAL data).
+   * @param fbuRequestTime  performance.now() timestamp when the FBU request
+   *                        that triggered this frame was sent. Used for
+   *                        per-frame end-to-end latency tracking.
    */
-  decode(fb: Framebuffer, header: RectHeader, data: DataView, fbuRequestTime: number): void {
+  decode(
+    fb: Framebuffer,
+    renderer: IRenderer,
+    header: RectHeader,
+    data: DataView,
+    fbuRequestTime: number,
+  ): void {
     const flags = data.getUint32(0);
     const nalLen = data.getUint32(4);
     const isKeyframe = (flags & 1) !== 0;
@@ -81,6 +103,7 @@ export class H264Decoder {
     ) {
       this.reset();
       this.fb = fb;
+      this.renderer = renderer;
       this.configuredWidth = header.width;
       this.configuredHeight = header.height;
 
@@ -111,6 +134,7 @@ export class H264Decoder {
     }
 
     this.fb = fb;
+    this.renderer = renderer;
 
     // Use performance.now() in microseconds as the chunk timestamp.
     // This serves two purposes:
@@ -162,22 +186,29 @@ export class H264Decoder {
     const w = frame.displayWidth;
     const h = frame.displayHeight;
 
-    // Draw VideoFrame directly to OffscreenCanvas (no createImageBitmap needed).
-    // CanvasRenderingContext2D.drawImage() accepts VideoFrame natively.
-    if (!this.renderCanvas || this.renderCanvas.width !== w || this.renderCanvas.height !== h) {
-      this.renderCanvas = new OffscreenCanvas(w, h);
-      this.renderCtx = this.renderCanvas.getContext('2d', { willReadFrequently: true })!;
+    // Fast path: upload VideoFrame directly to the renderer's GPU texture.
+    // This avoids the ~13-20ms OffscreenCanvas.getImageData() GPU→CPU
+    // readback that dominated the old decode+readback cost.
+    const usedFastPath = this.renderer?.renderVideoFrame(frame, this.fb.width, this.fb.height) ?? false;
+
+    if (!usedFastPath) {
+      // Fallback: legacy readback path. Used when the renderer is detached,
+      // or when the decoded frame size doesn't match the framebuffer.
+      if (!this.renderCanvas || this.renderCanvas.width !== w || this.renderCanvas.height !== h) {
+        this.renderCanvas = new OffscreenCanvas(w, h);
+        this.renderCtx = this.renderCanvas.getContext('2d', { willReadFrequently: true })!;
+      }
+      this.renderCtx!.drawImage(frame, 0, 0);
+      const imgData = this.renderCtx!.getImageData(0, 0, w, h);
+      this.fb.writeRect(0, 0, w, h, imgData.data);
     }
 
-    this.renderCtx!.drawImage(frame, 0, 0);
     frame.close();
 
-    const imgData = this.renderCtx!.getImageData(0, 0, w, h);
-    this.fb.writeRect(0, 0, w, h, imgData.data);
-
     const renderTime = performance.now();
-    // decodeLatencyMs = time from chunk submission to framebuffer write.
-    // This covers: VideoDecoder internal processing + drawImage + getImageData.
+    // decodeLatencyMs = time from chunk submission to frame rendered.
+    // Fast path: mostly VideoDecoder work + a texSubImage2D GPU copy.
+    // Fallback: + drawImage + getImageData + writeRect.
     const decodeLatencyMs = renderTime - frame.timestamp / 1000;
     this.onFrameRendered?.(renderTime, fbuRequestTime, decodeLatencyMs);
   }

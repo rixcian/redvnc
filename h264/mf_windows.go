@@ -421,22 +421,61 @@ func (b *mfBackend) Encode(nv12 []byte, forceIDR bool) ([]byte, bool, error) {
 		return nil, false, fmt.Errorf("ProcessInput: 0x%08X", hr2)
 	}
 
-	// ProcessOutput.
-	return b.drainOutput()
+	// Drain ALL queued output samples in a single call. The MFT can emit
+	// multiple samples per ProcessInput — especially during startup, after
+	// IDRs, or when it has internally queued P-frames waiting behind
+	// reference headers. Calling ProcessOutput only once would fall one frame
+	// behind per queued output and never recover, compounding into seconds
+	// of visible lag.
+	//
+	// We concatenate all NAL buffers and flag the batch as a keyframe if any
+	// of the contained frames is an IDR. Since a single Encode() call maps
+	// to one network rectangle, concatenation preserves the stream order.
+	var (
+		allNAL       []byte
+		anyKeyframe  bool
+	)
+	for {
+		nal, isKey, hasOutput, drainErr := b.processOneOutput()
+		if drainErr != nil {
+			if len(allNAL) > 0 {
+				// Return what we already drained — better than losing the batch.
+				return allNAL, anyKeyframe, nil
+			}
+			return nil, false, drainErr
+		}
+		if !hasOutput {
+			break // MF_E_TRANSFORM_NEED_MORE_INPUT — nothing more to drain.
+		}
+		allNAL = append(allNAL, nal...)
+		if isKey {
+			anyKeyframe = true
+		}
+	}
+	if len(allNAL) == 0 {
+		return nil, false, nil // Encoder still warming up (first few frames).
+	}
+	return allNAL, anyKeyframe, nil
 }
 
-func (b *mfBackend) drainOutput() ([]byte, bool, error) {
+// processOneOutput calls ProcessOutput exactly once and returns one NAL buffer
+// if available. Returns (nalData, isKeyframe, hasOutput, err):
+//   hasOutput=false with err=nil means the MFT has no more output right now
+//     (MF_E_TRANSFORM_NEED_MORE_INPUT) — normal drain termination.
+//   hasOutput=true with len(nalData)==0 can happen for a metadata-only sample;
+//     callers should treat it as no-op but continue draining.
+func (b *mfBackend) processOneOutput() (nalData []byte, isKeyframe bool, hasOutput bool, err error) {
 	var outData mftOutputDataBuffer
 	var outSample unsafe.Pointer
 
-	// If MFT doesn't provide samples, we must create one.
+	// If MFT doesn't provide samples, we must create one per drain iteration.
 	if !b.mftProvidesSamples {
 		var s unsafe.Pointer
 		hr, _, _ := procMFCreateSample.Call(uintptr(unsafe.Pointer(&s)))
 		if hr != 0 {
-			return nil, false, fmt.Errorf("MFCreateSample (output): 0x%08X", hr)
+			err = fmt.Errorf("MFCreateSample (output): 0x%08X", hr)
+			return
 		}
-		// Create a buffer large enough for encoded data.
 		bufSize := 1024 * 1024 // 1 MB default
 		if b.outputBufSize > 0 {
 			bufSize = b.outputBufSize
@@ -445,13 +484,15 @@ func (b *mfBackend) drainOutput() ([]byte, bool, error) {
 		hr2, _, _ := procMFCreateMemoryBuffer.Call(uintptr(bufSize), uintptr(unsafe.Pointer(&buf)))
 		if hr2 != 0 {
 			mfComRelease(s)
-			return nil, false, fmt.Errorf("MFCreateMemoryBuffer (output): 0x%08X", hr2)
+			err = fmt.Errorf("MFCreateMemoryBuffer (output): 0x%08X", hr2)
+			return
 		}
 		hr3, _, _ := syscall.SyscallN(mfComMethod(s, methSampleAddBuffer), uintptr(s), uintptr(buf))
 		mfComRelease(buf)
 		if hr3 != 0 {
 			mfComRelease(s)
-			return nil, false, fmt.Errorf("AddBuffer (output): 0x%08X", hr3)
+			err = fmt.Errorf("AddBuffer (output): 0x%08X", hr3)
+			return
 		}
 		outSample = s
 		outData.PSample = s
@@ -467,18 +508,19 @@ func (b *mfBackend) drainOutput() ([]byte, bool, error) {
 		if outSample != nil {
 			mfComRelease(outSample)
 		}
-		return nil, false, nil // No output yet (latency).
+		return nil, false, false, nil // No more output — drain complete.
 	}
 	if hr != 0 {
 		if outSample != nil {
 			mfComRelease(outSample)
 		}
-		return nil, false, fmt.Errorf("ProcessOutput: 0x%08X", hr)
+		err = fmt.Errorf("ProcessOutput: 0x%08X", hr)
+		return
 	}
 
 	resultSample := outData.PSample
 	if resultSample == nil {
-		return nil, false, nil
+		return nil, false, false, nil
 	}
 	if b.mftProvidesSamples {
 		defer mfComRelease(resultSample)
@@ -486,7 +528,6 @@ func (b *mfBackend) drainOutput() ([]byte, bool, error) {
 		defer mfComRelease(outSample)
 	}
 
-	// Clean up events if any.
 	if outData.PEvents != nil {
 		mfComRelease(outData.PEvents)
 	}
@@ -497,7 +538,8 @@ func (b *mfBackend) drainOutput() ([]byte, bool, error) {
 	hr2, _, _ := syscall.SyscallN(mfComMethod(resultSample, 41),
 		uintptr(resultSample), uintptr(unsafe.Pointer(&outBuf)))
 	if hr2 != 0 {
-		return nil, false, fmt.Errorf("ConvertToContiguousBuffer: 0x%08X", hr2)
+		err = fmt.Errorf("ConvertToContiguousBuffer: 0x%08X", hr2)
+		return
 	}
 	defer mfComRelease(outBuf)
 
@@ -509,19 +551,16 @@ func (b *mfBackend) drainOutput() ([]byte, bool, error) {
 		uintptr(unsafe.Pointer(&maxLen2)),
 		uintptr(unsafe.Pointer(&curLen2)))
 
-	nalData := make([]byte, curLen2)
+	nalData = make([]byte, curLen2)
 	copy(nalData, unsafe.Slice((*byte)(bufPtr), curLen2))
 
 	syscall.SyscallN(mfComMethod(outBuf, methBufferUnlock), uintptr(outBuf))
 
-	// Detect keyframe: check if NAL data starts with IDR NAL unit.
-	isKeyframe := false
 	if len(nalData) > 4 {
-		// Look for IDR NAL type (5) in Annex B stream.
 		isKeyframe = isIDRFrame(nalData)
 	}
-
-	return nalData, isKeyframe, nil
+	hasOutput = true
+	return
 }
 
 func (b *mfBackend) Close() {

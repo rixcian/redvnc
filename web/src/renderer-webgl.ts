@@ -243,6 +243,55 @@ export class WebGLRenderer implements IRenderer {
     fb.clearDirty();
   }
 
+  /**
+   * H.264 fast path: upload a decoded VideoFrame directly into the GPU
+   * texture (single GPU-to-GPU copy via texSubImage2D) and draw. Bypasses
+   * the CPU-side framebuffer entirely — no getImageData readback, no
+   * CPU→GPU re-upload.
+   *
+   * Returns false if fast path isn't possible (not attached, dimension
+   * mismatch, missing texture). The caller should fall back to
+   * OffscreenCanvas readback + fb.writeRect in that case.
+   */
+  renderVideoFrame(frame: VideoFrame, fbWidth: number, fbHeight: number): boolean {
+    const gl = this.gl;
+    if (!gl || !this.texture || !this.program || !this.vao) return false;
+
+    // Our texture is pre-allocated at fb dimensions. If the decoded frame
+    // doesn't match we can't blit directly into it without resizing — and
+    // resizing would break the interleaved non-H.264 (pseudo-rect) path.
+    if (frame.displayWidth !== fbWidth || frame.displayHeight !== fbHeight) {
+      return false;
+    }
+    // Canvas might not be sized to fb yet (race between attach + first frame).
+    if (this.texWidth !== fbWidth || this.texHeight !== fbHeight) {
+      return false;
+    }
+
+    gl.bindTexture(gl.TEXTURE_2D, this.texture);
+    // WebGL 2 accepts VideoFrame as a TexImageSource. This is a direct
+    // GPU-to-GPU copy on supported drivers — no CPU round-trip.
+    try {
+      gl.texSubImage2D(
+        gl.TEXTURE_2D, 0,
+        0, 0,
+        gl.RGBA, gl.UNSIGNED_BYTE,
+        frame as unknown as TexImageSource,
+      );
+    } catch (err) {
+      // Some older browsers/drivers throw for VideoFrame sources; bail out
+      // so the caller can use the slow path.
+      console.warn('[WebGL] texSubImage2D(VideoFrame) failed, falling back:', err);
+      return false;
+    }
+
+    gl.useProgram(this.program);
+    gl.bindVertexArray(this.vao);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.bindVertexArray(null);
+    return true;
+  }
+
   setCursor(imageData: Uint8Array, width: number, height: number, hotX: number, hotY: number): void {
     if (!this.canvas) return;
 
