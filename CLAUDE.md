@@ -554,7 +554,67 @@ The browser `Framebuffer` class (`web/src/framebuffer.ts`) exposes several write
 | `web/src/rfb-writer.ts` | Client→server message serialization |
 | `web/src/framebuffer.ts` | Pixel buffer, dirty tracking, WebGL texture upload |
 | `web/src/encodings/tight.ts` | Tight decoder with fflate `ZlibStream`, parallel JPEG |
+| `web/src/encodings/h264.ts` | H.264 decoder (WebCodecs `VideoDecoder`) with stale-frame dropping + per-frame latency tracking |
+| `h264/encoder.go` | H.264 encoder dispatcher + BGRA→NV12 conversion (single-threaded Go) |
+| `h264/mf_windows.go` | Windows Media Foundation H.264 encoder (CBR @ 5 Mbps, Baseline profile) |
+| `h264/x264_cgo.go` | Linux/macOS x264 H.264 encoder via CGo (CRF 23, Baseline, `ultrafast`+`zerolatency`) |
 | `web/src/components/VncViewer.tsx` | Main React component |
 | `capi/exports.go` | C FFI exports for P/Invoke |
 | `PLAN.md` | Phased implementation roadmap |
 | `docs/WEBSOCKET_PROXY_AND_BROWSER_CLIENT_SPEC.md` | Extension message protocol spec |
+
+---
+
+## Current Investigation: H.264 Perceived Latency (handoff notes)
+
+H.264 encoding is implemented end-to-end and works, but when connecting a browser client to a Windows VNC server with H.264 the perceived click-to-pixel latency is ~1 s even though the overlay reports 60–80 ms. Video playback and scrolling are smoother than with Tight, but the lag is obvious on discrete events (e.g. opening a new browser tab).
+
+### Measured numbers (1920×1080 Windows → browser, WebGL renderer)
+
+| Metric | H.264 | Tight |
+|---|---|---|
+| FPS (overlay) | 15–21 | 27–28 |
+| Reported latency (overlay) | 60–80 ms | ~38 ms |
+| Idle data rate | 50–100 KB/s | < 1 KB/s |
+| Server `avg_capture` | 3–7 ms | — |
+| Server `avg_encode` | 9–18 ms | — |
+| Server `avg_send` | < 0.5 ms | — |
+| Client `decode+readback` avg | 13–20 ms | — |
+| Client `decode+readback` max spikes | 60–75 ms | — |
+
+Client per-frame decode latency log (enabled in 9b818fc): browser console prints `[H264] decode+readback avg=X.Xms max=Y.Yms` once per second via `console.info`.
+
+### Confirmed hypotheses (what we know)
+
+1. **FPS gap is MaxFPS-bound, not a bug.** At 13 ms total server frame time with `MaxFPS=30` (33 ms min interval), the cycle is `encode + sleep ≈ 20 ms + 20 ms = 40–46 ms` → ~21.7 FPS. Tight reaches higher FPS because dirty-rect encoding skips most of the work on static frames; H.264 forces full-frame encode every time ([rfb/server.go:651-653](rfb/server.go:651)).
+2. **Idle bandwidth is CBR @ 5 Mbps on Windows.** [h264/mf_windows.go:309](h264/mf_windows.go:309) sets `mfMTAvgBitrate = 5_000_000` with `eAVEncCommonRateControlModeCBR`. x264 path uses CRF so idle bandwidth is lower there.
+3. **Client readback is the decode bottleneck.** `decode+readback avg 13–20 ms` for 1080p is dominated by `OffscreenCanvas.getImageData()` (GPU→CPU sync readback) in [web/src/encodings/h264.ts:156](web/src/encodings/h264.ts:156). Pure `VideoDecoder` work should be 3–5 ms.
+4. **Latency meter overlay under-reports.** It measures `fbuRequestTime → renderTime` but does not cover DXGI capture age or Media Foundation encoder-internal buffering. The 1 s perceived delay must live in one of those.
+
+### Rejected hypotheses (what we already tried)
+
+- **Switching codec string to Baseline `avc1.42E0xx`** (commit dab023c, reverted in 9b818fc): forced a hardware→software decoder fallback on common GPUs. FPS dropped, avg_encode worsened. Stuck with `avc1.640028` (High L4.0) / `avc1.42001e` (Baseline L3.0) — WebCodecs tolerates the profile mismatch and `optimizeForLatency:true` already prevents reorder buffering.
+
+### Next candidates (in priority order for the 1 s lag)
+
+1. **Drain all MFT output per encode call.** [h264/mf_windows.go:428-477](h264/mf_windows.go:428) calls `ProcessOutput` exactly once. If MFT ever queues multiple output frames (it does during startup and after IDRs), we fall one frame behind per queued output and never catch up — compounding into seconds. Fix: loop `ProcessOutput` until `MF_E_TRANSFORM_NEED_MORE_INPUT`, emit the last (newest) buffer.
+2. **Upload `VideoFrame` directly to WebGL texture.** WebGL 2's `texImage2D` accepts a `VideoFrame` as source, making it a single GPU-to-GPU copy. Eliminates the `drawImage`→`getImageData`→`writeRect` round-trip in [h264.ts:150-160](web/src/encodings/h264.ts:150), which should cut `decode+readback` from 13–20 ms to ~3–5 ms and remove the 60–75 ms spikes.
+3. **Switch Windows MFT from CBR → VBR or Quality.** [h264/mf_windows.go:277](h264/mf_windows.go:277) is currently `eAVEncCommonRateControlModeCBR`. Changing to `UnconstrainedVBR` (2) or `Quality` (3) cuts idle bandwidth dramatically. Unrelated to the 1 s lag but a clear win.
+4. **Dirty-rect / motion-aware H.264.** Currently [rfb/server.go:651-653](rfb/server.go:651) forces full-frame encode for H.264. Could skip encoding when `LastDirtyRects()` returns empty (and simply re-send the last NAL or a "no change" marker — but this is complex because the H.264 stream must remain temporally consistent).
+5. **SIMD or parallel NV12 conversion.** [h264/encoder.go:141-181](h264/encoder.go:141) is pure scalar Go BT.601 conversion. ~6 ms of the 9–18 ms encode cost. Would require CGo or `golang.org/x/sys/cpu` intrinsics — last resort.
+
+### Per-frame latency instrumentation (already in place)
+
+[web/src/encodings/h264.ts](web/src/encodings/h264.ts) threads a `pendingFrames: Map<submitTimestampMicros, fbuRequestTimeMs>` through the async `VideoDecoder` pipeline. `onFrameRendered(renderTime, fbuRequestTime, decodeLatencyMs)` is called per rendered frame with:
+
+- `renderTime` — `performance.now()` when the frame hit the framebuffer
+- `fbuRequestTime` — `performance.now()` when the FBU request that produced this frame was sent (passed through `pendingFrames` per-frame, not a shared scalar)
+- `decodeLatencyMs` — time from `decoder.decode()` submission to framebuffer write (pure client-side decode+readback)
+
+If you need more instrumentation, add it here and in [web/src/index.ts](web/src/index.ts) where `onFrameRendered` is wired (search for `_h264DecodeLatencies`).
+
+### Commits in this investigation
+
+- `165acc9` (main) — initial fix for 2–3 s H.264 decode pipeline lag: non-blocking decode, stale-frame dropping, reusable OffscreenCanvas
+- `dab023c` — **reverted** — tried Baseline codec string
+- `9b818fc` — reverted codec string, kept per-frame latency instrumentation + visible `console.info` logging

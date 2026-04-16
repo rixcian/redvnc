@@ -515,7 +515,7 @@ export class VncClient {
             // thisFbuRequestTime is threaded through pendingFrames so the
             // onFrameRendered callback computes accurate per-frame latency
             // even when intermediate frames are dropped.
-            this.h264Decoder.decode(this.framebuffer, header, data, thisFbuRequestTime);
+            this.h264Decoder.decode(this.framebuffer, this.renderer, header, data, thisFbuRequestTime);
             break;
           case EncodingCursor:
             this.handleCursor(header, data);
