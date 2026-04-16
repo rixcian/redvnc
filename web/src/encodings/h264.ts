@@ -94,12 +94,18 @@ export class H264Decoder {
       });
 
       this.decoder.configure({
-        // Always use Baseline profile — the server encodes Baseline on all
-        // platforms (x264 with "baseline" preset, MFT with eAVEncH264VProfileBase=66).
-        // Using a High-profile codec string causes some browsers to allocate a
-        // B-frame reorder buffer (even with optimizeForLatency:true), adding
-        // 200–800ms of decoder-side lag. Baseline has no B-frames by spec.
-        codec: this.getCodecString(header.width, header.height),
+        // Choose codec string based on resolution.
+        // Baseline L3.0 for <= 720p, High L4.0 for larger.
+        // NOTE: attempted switching to Baseline at 1080p to avoid theoretical
+        // B-frame reorder buffering, but this forced a hardware→software
+        // decoder fallback on common GPUs (Intel QSV, NVDEC often don't
+        // accelerate Baseline at L4.0+), which dropped FPS and raised latency.
+        // The High profile codec string works fine: WebCodecs tolerates the
+        // profile mismatch with the Baseline-encoded server stream, and
+        // optimizeForLatency:true prevents any reorder buffering.
+        codec: header.width * header.height > 1280 * 720
+          ? 'avc1.640028'  // High L4.0
+          : 'avc1.42001e', // Baseline L3.0
         optimizeForLatency: true,
       });
     }
@@ -125,27 +131,6 @@ export class H264Decoder {
     // No flush() — let the decoder output frames asynchronously.
     // optimizeForLatency: true ensures frames are emitted ASAP without
     // internal buffering or reordering.
-  }
-
-  /**
-   * Returns the AVC codec string for the given resolution, always using
-   * Baseline profile. Levels are chosen to just cover each resolution tier:
-   *   ≤ 720p   → Baseline L3.1 (avc1.42E01F)
-   *   ≤ 1080p  → Baseline L4.0 (avc1.42E028)
-   *   ≤ 1440p  → Baseline L5.0 (avc1.42E032)
-   *   > 1440p  → Baseline L5.1 (avc1.42E033)
-   *
-   * Codec string format: avc1.PPCCLL
-   *   PP = profile_idc hex (42 = Baseline)
-   *   CC = constraint flags hex (E0 = constraint_set0|1|2, required for Baseline)
-   *   LL = level_idc hex (28=40=L4.0, 1F=31=L3.1, etc.)
-   */
-  private getCodecString(width: number, height: number): string {
-    const pixels = width * height;
-    if (pixels <= 1280 * 720)  return 'avc1.42E01F'; // Baseline L3.1
-    if (pixels <= 1920 * 1080) return 'avc1.42E028'; // Baseline L4.0
-    if (pixels <= 2560 * 1440) return 'avc1.42E032'; // Baseline L5.0
-    return 'avc1.42E033';                             // Baseline L5.1
   }
 
   private handleFrame(frame: VideoFrame): void {

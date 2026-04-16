@@ -125,6 +125,10 @@ export class VncClient {
   // next FBU, causing race conditions and visual artifacts.
   private fbuQueue: Promise<void> = Promise.resolve();
 
+  // H.264 decode+readback cost sampling (logged once per second).
+  private _h264DecodeLatencies: number[] = [];
+  private _h264LastDecodeLog = 0;
+
 
   constructor(options: VncClientOptions) {
     this.options = options;
@@ -147,9 +151,19 @@ export class VncClient {
       if (fbuRequestTime > 0) {
         this._latencySamples.push(renderTime - fbuRequestTime);
       }
-      // Log decoder-internal latency at debug level (visible in browser console).
-      // This isolates VideoDecoder cost from the full end-to-end measurement.
-      console.debug('[H264] decode+readback latency:', decodeLatencyMs.toFixed(1), 'ms');
+      // Track decode+readback cost separately from end-to-end latency so we
+      // can isolate VideoDecoder cost. Logged once per second as an average.
+      this._h264DecodeLatencies.push(decodeLatencyMs);
+      if (renderTime - this._h264LastDecodeLog > 1000) {
+        const samples = this._h264DecodeLatencies;
+        if (samples.length > 0) {
+          const avg = samples.reduce((a, b) => a + b, 0) / samples.length;
+          const max = Math.max(...samples);
+          console.info(`[H264] decode+readback avg=${avg.toFixed(1)}ms max=${max.toFixed(1)}ms (${samples.length} frames)`);
+        }
+        this._h264DecodeLatencies = [];
+        this._h264LastDecodeLog = renderTime;
+      }
     };
 
     const sendFn = (data: ArrayBuffer | Uint8Array) => this.connection.send(data);
