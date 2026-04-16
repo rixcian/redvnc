@@ -4,6 +4,7 @@ package main
 
 import (
 	"log"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -29,25 +30,46 @@ func (a *inputInjectorAdapter) PointerEvent(buttonMask uint8, x, y uint16) {
 	}
 }
 
-// SetClipboard implements rfb.ClipboardSetter for Linux.
-//
-// It sets the X11 CLIPBOARD selection via xclip or xsel (whichever is
-// available). The browser sends Ctrl+V which is the correct Linux paste
-// shortcut, so no additional key injection is needed.
+// SetClipboard implements rfb.ClipboardSetter for Linux. It tries
+// Wayland tools first (`wl-copy`) when running under a Wayland session
+// and falls back to X11 tools (`xclip`, `xsel`). The browser sends
+// Ctrl+V, which is the correct Linux paste shortcut, so no additional
+// key injection is required.
 func (a *inputInjectorAdapter) SetClipboard(text string) error {
-	for _, args := range [][]string{
-		{"xclip", "-sel", "clip"},
-		{"xsel", "--clipboard", "--input"},
-	} {
+	candidates := clipboardCandidates()
+	for _, args := range candidates {
 		cmd := exec.Command(args[0], args[1:]...)
 		cmd.Stdin = strings.NewReader(text)
 		if err := cmd.Run(); err == nil {
 			return nil
 		}
 	}
-	// Neither xclip nor xsel is installed. The browser-sent Ctrl+V will still
+	// None of the tools succeeded. The browser-sent Ctrl+V will still
 	// paste whatever the Linux clipboard currently holds.
 	return nil
+}
+
+// clipboardCandidates returns the clipboard CLI tools to try in order.
+// On Wayland we prefer wl-copy; on X11 we use xclip or xsel.
+func clipboardCandidates() [][]string {
+	wayland := [][]string{
+		{"wl-copy"},
+	}
+	x11 := [][]string{
+		{"xclip", "-sel", "clip"},
+		{"xsel", "--clipboard", "--input"},
+	}
+	if isWaylandSession() {
+		return append(wayland, x11...)
+	}
+	return append(x11, wayland...)
+}
+
+func isWaylandSession() bool {
+	if os.Getenv("XDG_SESSION_TYPE") == "wayland" {
+		return true
+	}
+	return os.Getenv("WAYLAND_DISPLAY") != ""
 }
 
 func setupPlatformCaptureAndInput() (rfb.ScreenCapturer, rfb.InputHandler, rfb.CursorProvider, error) {
@@ -69,7 +91,11 @@ func setupPlatformCaptureAndInput() (rfb.ScreenCapturer, rfb.InputHandler, rfb.C
 		return nil, nil, nil, err
 	}
 
-	log.Println("using X11 screen capture and input injection")
+	if isWaylandSession() {
+		log.Println("detected Wayland session; using portal/PipeWire for capture and input (requires -tags wayland build)")
+	} else {
+		log.Println("detected X11 session; using X11 screen capture and input injection")
+	}
 	w, h := cap.Bounds()
 	log.Printf("display resolution: %dx%d", w, h)
 
