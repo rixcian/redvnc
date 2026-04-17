@@ -112,8 +112,11 @@ type ServerConfig struct {
 	// If nil, cursor pseudo-encoding is not used.
 	CursorProvider CursorProvider
 
-	// MaxFPS limits the maximum framebuffer update rate per client.
-	// If zero, defaults to 30.
+	// MaxFPS caps the background capture rate (PipelinedCapturer). The
+	// per-client encode loop is no longer gated here — it is paced by the
+	// client's FBU request cadence and the capacity-1 fbReqCh. MaxFPS is
+	// therefore the upper bound on how fresh the captured pixels can be.
+	// If zero, defaults to 60.
 	MaxFPS int
 
 	// TLSConfig enables TLS encryption on the server. If non-nil, the server
@@ -147,7 +150,7 @@ func NewServer(config ServerConfig) *Server {
 		config.Security = []SecurityHandler{&noneSecurity{}}
 	}
 	if config.MaxFPS <= 0 {
-		config.MaxFPS = 30
+		config.MaxFPS = 60
 	}
 	if config.Capturer != nil {
 		config.Width, config.Height = config.Capturer.Bounds()
@@ -250,8 +253,7 @@ type ClientConn struct {
 	zrleBuf     bytes.Buffer // buffer for one ZRLE rectangle's zlib stream
 	zrleWriter  *zlib.Writer // persistent zlib writer for ZRLE encoding
 
-	lastCursor    *CursorImage // last cursor sent to this client
-	lastFrameTime time.Time   // last framebuffer update time for FPS limiting
+	lastCursor *CursorImage // last cursor sent to this client
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
@@ -465,30 +467,26 @@ func (c *ClientConn) serveMessages() error {
 // framebufferWriter runs in a separate goroutine and processes framebuffer
 // update requests. This prevents slow screen captures from blocking the
 // message reading loop where input events are processed.
+//
+// No per-frame MaxFPS floor is applied here: the client's FBU request
+// cadence combined with the capacity-1 fbReqCh self-regulates the encode
+// rate. The overall ceiling is set by PipelinedCapturer's capture loop,
+// which is driven by ServerConfig.MaxFPS. Removing the sleep here shaved
+// ~9 ms/frame at MaxFPS=30 and lets the client pull frames as fast as
+// the capturer produces them.
 func (c *ClientConn) framebufferWriter() {
-	minInterval := time.Second / time.Duration(c.server.config.MaxFPS)
-
 	// Frame timing: track FPS and per-frame timing breakdown.
 	var frameCount int64
 	var totalCapture, totalEncode, totalSend time.Duration
 	lastReport := time.Now()
 
 	for req := range c.fbReqCh {
-		// Enforce MaxFPS: sleep if the last frame was sent too recently
-		if !c.lastFrameTime.IsZero() {
-			elapsed := time.Since(c.lastFrameTime)
-			if elapsed < minInterval {
-				time.Sleep(minInterval - elapsed)
-			}
-		}
-
 		frameStart := time.Now()
 		captureDur, encodeDur, sendDur, err := c.handleFramebufferRequestTimed(req)
 		if err != nil {
 			c.errCh <- err
 			return
 		}
-		c.lastFrameTime = time.Now()
 
 		frameCount++
 		totalCapture += captureDur
