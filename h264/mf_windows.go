@@ -143,6 +143,11 @@ const (
 
 	// eAVEncCommonRateControlMode_CBR = 0 (not 2, which is UnconstrainedVBR)
 	eAVEncCommonRateControlModeCBR = 0
+	// eAVEncCommonRateControlMode_Quality = 3. CBR with the default ~1s VBV
+	// buffer held frames for rate smoothing and caused ~1s click-to-pixel lag
+	// even with MF_LOW_LATENCY=1. Quality mode has no VBV buffer and emits
+	// frames as soon as the encoder is done.
+	eAVEncCommonRateControlModeQuality = 3
 
 	// eAVEncH264VProfile_Base (Baseline profile = 66)
 	eAVEncH264VProfileBase = 66
@@ -274,7 +279,7 @@ func (b *mfBackend) init() error {
 
 	// Set Baseline profile (disable CABAC) via CodecAPI.
 	b.setCodecAPIUINT32(&codecapiAVEncH264CABACEnable, 0)
-	b.setCodecAPIUINT32(&codecapiAVEncCommonRateControlMode, eAVEncCommonRateControlModeCBR)
+	b.setCodecAPIUINT32(&codecapiAVEncCommonRateControlMode, eAVEncCommonRateControlModeQuality)
 
 	// Query output stream info to check if MFT provides samples and get buffer size.
 	var streamInfo mftOutputStreamInfo
