@@ -4,6 +4,7 @@ package h264
 
 import (
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -277,9 +278,14 @@ func (b *mfBackend) init() error {
 	// Set low-latency on transform attributes.
 	b.setLowLatency()
 
-	// Set Baseline profile (disable CABAC) via CodecAPI.
-	b.setCodecAPIUINT32(&codecapiAVEncH264CABACEnable, 0)
-	b.setCodecAPIUINT32(&codecapiAVEncCommonRateControlMode, eAVEncCommonRateControlModeQuality)
+	// Set Baseline profile (disable CABAC) and Quality rate control via
+	// CodecAPI. Log the HRESULT for each — many MFTs silently reject these
+	// settings, so without the log we cannot tell whether the encoder is
+	// actually in the mode we asked for.
+	logCodecAPIResult("AVEncH264CABACEnable=0",
+		b.setCodecAPIUINT32(&codecapiAVEncH264CABACEnable, 0))
+	logCodecAPIResult("AVEncCommonRateControlMode=Quality",
+		b.setCodecAPIUINT32(&codecapiAVEncCommonRateControlMode, eAVEncCommonRateControlModeQuality))
 
 	// Query output stream info to check if MFT provides samples and get buffer size.
 	var streamInfo mftOutputStreamInfo
@@ -358,18 +364,23 @@ func (b *mfBackend) setLowLatency() {
 	setUINT32(attrs, &mfLowLatency, 1)
 }
 
-func (b *mfBackend) setCodecAPIUINT32(guid *comGUID, val uint32) {
+// setCodecAPIUINT32 calls ICodecAPI::SetValue with a UINT32 variant. Returns
+// the HRESULT so callers can tell whether the MFT actually honored the request
+// — many encoder parameters are silently rejected (returning S_FALSE or an
+// error HRESULT) if the MFT does not support them or is already streaming.
+func (b *mfBackend) setCodecAPIUINT32(guid *comGUID, val uint32) uintptr {
 	if b.codecAPI == nil {
-		return
+		return 0x80004005 // E_FAIL — no ICodecAPI available
 	}
 	// VARIANT: vt(2) + padding(6) + value(8) = 16 bytes on 64-bit
 	var variant [24]byte
 	*(*uint16)(unsafe.Pointer(&variant[0])) = vtUI4
 	*(*uint32)(unsafe.Pointer(&variant[8])) = val
-	syscall.SyscallN(mfComMethod(b.codecAPI, methCodecAPISetValue),
+	hr, _, _ := syscall.SyscallN(mfComMethod(b.codecAPI, methCodecAPISetValue),
 		uintptr(b.codecAPI),
 		uintptr(unsafe.Pointer(guid)),
 		uintptr(unsafe.Pointer(&variant[0])))
+	return hr
 }
 
 func (b *mfBackend) Encode(nv12 []byte, forceIDR bool) ([]byte, bool, error) {
@@ -580,6 +591,20 @@ func (b *mfBackend) Close() {
 		b.codecAPI = nil
 	}
 	mfRelease()
+}
+
+// logCodecAPIResult prints the HRESULT from a SetValue call. S_OK (0) and
+// S_FALSE (1) both indicate the call was accepted; anything else means the
+// parameter was rejected and the encoder may silently be in a different mode.
+func logCodecAPIResult(name string, hr uintptr) {
+	switch hr {
+	case 0:
+		log.Printf("h264 MFT: SetValue(%s) → S_OK", name)
+	case 1:
+		log.Printf("h264 MFT: SetValue(%s) → S_FALSE (accepted, unchanged)", name)
+	default:
+		log.Printf("h264 MFT: SetValue(%s) FAILED: 0x%08X (setting ignored)", name, hr)
+	}
 }
 
 // ---- IMFAttributes helpers ----

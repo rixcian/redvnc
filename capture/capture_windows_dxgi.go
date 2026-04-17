@@ -8,13 +8,37 @@ import (
 	"log"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
 var (
 	d3d11dll              = syscall.NewLazyDLL("d3d11.dll")
 	procD3D11CreateDevice = d3d11dll.NewProc("D3D11CreateDevice")
+
+	kernel32DLL                   = syscall.NewLazyDLL("kernel32.dll")
+	procQueryPerformanceCounter   = kernel32DLL.NewProc("QueryPerformanceCounter")
+	procQueryPerformanceFrequency = kernel32DLL.NewProc("QueryPerformanceFrequency")
 )
+
+// qpcFreq is the QueryPerformanceCounter tick frequency (set once on first use).
+// Used to convert DXGI LastPresentTime (QPC ticks) to wall-clock ms.
+var qpcFreq int64
+
+func qpcNow() int64 {
+	var v int64
+	procQueryPerformanceCounter.Call(uintptr(unsafe.Pointer(&v)))
+	return v
+}
+
+func qpcFrequency() int64 {
+	if qpcFreq == 0 {
+		var v int64
+		procQueryPerformanceFrequency.Call(uintptr(unsafe.Pointer(&v)))
+		qpcFreq = v
+	}
+	return qpcFreq
+}
 
 // COM GUID structure.
 type comGUID struct {
@@ -161,6 +185,12 @@ type DXGICapture struct {
 	//   [..] = specific changed regions
 	lastDirtyRects []image.Rectangle
 	metaBuf        []byte // reusable metadata scratch buffer for GetFrameDirtyRects
+
+	// Capture-age diagnostics (rate-limited to once per second).
+	ageLogLast    time.Time
+	ageSamplesMax int64 // max age seen in the current 1s window (ms)
+	ageSamplesN   int   // number of successful AcquireNextFrame in window
+	ageSamplesSum int64 // sum of ages in window (ms)
 
 	gdi *GDICapture // fallback if DXGI unavailable
 }
@@ -339,6 +369,35 @@ func (d *DXGICapture) Capture() ([]byte, int, error) {
 
 	if hr != 0 {
 		return nil, 0, fmt.Errorf("AcquireNextFrame: 0x%08X", hr)
+	}
+
+	// Capture-age diagnostic: frameInfo.LastPresentTime is a QueryPerformanceCounter
+	// tick count marking when the desktop image was last composited. The delta from
+	// now tells us how stale the frame is by the time we receive it. Aggregated and
+	// logged once per second to avoid log spam.
+	if freq := qpcFrequency(); freq > 0 && frameInfo.LastPresentTime > 0 {
+		ageTicks := qpcNow() - frameInfo.LastPresentTime
+		if ageTicks < 0 {
+			ageTicks = 0
+		}
+		ageMs := ageTicks * 1000 / freq
+		d.ageSamplesN++
+		d.ageSamplesSum += ageMs
+		if ageMs > d.ageSamplesMax {
+			d.ageSamplesMax = ageMs
+		}
+		if d.ageLogLast.IsZero() {
+			d.ageLogLast = time.Now()
+		}
+		if time.Since(d.ageLogLast) >= time.Second && d.ageSamplesN > 0 {
+			avg := d.ageSamplesSum / int64(d.ageSamplesN)
+			log.Printf("DXGI capture age: avg=%dms max=%dms frames=%d accum=%d",
+				avg, d.ageSamplesMax, d.ageSamplesN, frameInfo.AccumulatedFrames)
+			d.ageLogLast = time.Now()
+			d.ageSamplesN = 0
+			d.ageSamplesSum = 0
+			d.ageSamplesMax = 0
+		}
 	}
 
 	// Get the desktop texture from the resource
