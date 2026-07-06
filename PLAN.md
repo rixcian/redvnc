@@ -596,6 +596,183 @@ services:
 
 ---
 
+## Phase 5: UDP (WebRTC) Transport for H.264 Video
+
+Opt-in, H.264-only unreliable transport that bypasses TCP head-of-line blocking. Delivers meaningful latency and stability gains on lossy links (WiFi, 4G/5G); near-zero benefit on clean LAN. See the research notes in the "Research: UDP vs TCP for RedVNC" section of `CLAUDE.md` for the underlying rationale and expected gains.
+
+**Scope boundary — critical:** Only H.264 NALUs travel over the UDP DataChannel. Tight/Zlib/ZRLE MUST continue over the existing WebSocket path because they rely on persistent zlib stream dictionaries (invariants #1 and #6 in `CLAUDE.md`). A lost UDP packet would permanently desync those decoders.
+
+**Expected gains (per research):**
+- LAN: ~0% FPS, −2 to −5 ms latency, no quality change.
+- Typical home WiFi (0.5–2% loss, 10–30 ms RTT): P95 jitter cut ~50%, −15 to −40 ms latency.
+- Bad WiFi / 4G (3–10% loss, 50–100 ms RTT): 1.5–3× more stable FPS, −100 to −500 ms latency.
+- Tight/Zlib/ZRLE: unchanged (still WebSocket).
+
+---
+
+### 5.1 WebRTC Signalling on the Proxy
+
+**Files:** New `wsproxy/webrtc.go`, modifications to `wsproxy/server.go`, `wsproxy/config.go`, `wsproxy/proxy.go`
+
+**What to build:**
+- Add `pion/webrtc/v4` as a Go dependency (pure-Go WebRTC stack, no CGo).
+- Extend `Config` with UDP-transport knobs: `WebRTCEnabled bool`, `WebRTCPortRange [2]uint16` (for ICE UDP allocation), `WebRTCPublicIP string` (for NAT'd deployments), `WebRTCSTUNServers []string` (default `stun:stun.l.google.com:19302`), `WebRTCTURNServers []TURNConfig`. Wire env vars in `wsproxy/config.go`.
+- New extension messages (all initiated over the existing WebSocket, which stays the signalling and control channel):
+  - `136` — `ExtWebRTCOffer` (proxy→browser): SDP offer emitted by the proxy when the browser signals `WebRTCCapable=true` in a client-hello extension.
+  - `137` — `ExtWebRTCAnswer` (browser→proxy): SDP answer from the browser.
+  - `138` — `ExtWebRTCICE` (bidirectional): trickle ICE candidates.
+  - `139` — `ExtWebRTCReady` (proxy→browser): signals that the DataChannel is open and video will now flow over it.
+  - `140` — `ExtWebRTCTeardown` (bidirectional): explicit close reason; triggers fallback to WebSocket transport for video.
+- Create two DataChannels on the offer:
+  - `video` — `ordered: false`, `maxRetransmits: 0` (unreliable/unordered). Carries H.264 NALUs only.
+  - `control` — `ordered: true` (reliable). Carries keyframe requests and bandwidth hints. Small volume.
+- On DataChannel open, mark the session as `videoTransport = "webrtc"`; on close/error, revert to `"websocket"` and log with `session_id`.
+- Do NOT move Tight/Zlib/ZRLE/Raw traffic onto the DataChannel — those stay on the WebSocket unconditionally.
+
+**Testing:**
+- Unit test: SDP offer/answer round-trip against `pion/webrtc` in loopback mode.
+- Integration test: full connect over loopback with `WebRTCEnabled=true`, verify DataChannel opens within 3 s.
+
+---
+
+### 5.2 WebRTC Signalling on the Browser
+
+**Files:** New `web/src/webrtc-transport.ts`, modifications to `web/src/index.ts`, `web/src/connection.ts`, `web/src/types.ts`
+
+**What to build:**
+- Extend `VncClientOptions` with `preferUDP?: boolean` (default `false`) and `iceServers?: RTCIceServer[]`.
+- On connect, if `preferUDP === true` AND the negotiated encoding is or will be H.264, include a `WebRTCCapable` bit in the initial client-hello extension.
+- On receiving `ExtWebRTCOffer`, create `RTCPeerConnection`, call `setRemoteDescription`, generate answer, send `ExtWebRTCAnswer`.
+- Trickle-ICE: each `onicecandidate` sends `ExtWebRTCICE`; each incoming `ExtWebRTCICE` calls `addIceCandidate`.
+- Handle both DataChannels:
+  - `video`: `onmessage` feeds NALUs into the existing H.264 decode pipeline (see 5.3).
+  - `control`: reliable channel for keyframe requests initiated by the browser.
+- 3-second ICE connection timeout. On failure, tear down the peer connection and continue on the WebSocket path unchanged (video keeps flowing over WS). Fire a `webrtc-fallback` event on `VncClient` so the UI can show a warning if desired.
+- Watch `connectionState`: if it transitions to `disconnected` or `failed` mid-session, tear down and revert to WebSocket transport.
+
+**Testing:**
+- Vitest: mock `RTCPeerConnection`, verify SDP round-trip and ICE candidate exchange sequencing.
+- Manual smoke test with the demo app against a local `redvnc-wsproxy` with WebRTC enabled.
+
+---
+
+### 5.3 H.264 NAL Packetization over DataChannel
+
+**Files:** New `wsproxy/h264packet.go`, new `web/src/encodings/h264-udp.ts`, modifications to `wsproxy/proxy.go`, `h264/encoder.go`, `web/src/encodings/h264.ts`
+
+**What to build:**
+
+Server side:
+- Intercept H.264 rectangles in the VNC→browser relay. When the active transport for the session is `webrtc`, extract the NALU payload (drop the RFB rectangle header — the browser reconstructs frame boundaries from NALU type) and send it via the `video` DataChannel; otherwise forward untouched over WebSocket.
+- Fragment NALUs larger than the DataChannel MTU (SCTP-safe: 1200 bytes) using RFC 6184 FU-A style framing:
+  - Byte 0: sequence number (uint16 wraparound) — 2 bytes.
+  - Byte 2: flags — bit 0 = first-fragment, bit 1 = last-fragment, bit 2 = IDR, bits 3–7 = reserved.
+  - Byte 3: NAL type (5 bits) + reserved (3 bits).
+  - Bytes 4–7: presentation timestamp in ms since session start (uint32).
+  - Bytes 8+: NALU fragment.
+- Never reorder NALUs on the server side. Sequence numbers are assigned monotonically at fragmentation time.
+
+Browser side:
+- New `H264UdpAssembler` in `web/src/encodings/h264-udp.ts` reassembles fragments by sequence number, buffers up to `jitterBufferMs` (default 20 ms) worth of packets, then emits complete NALUs into the existing `H264Decoder`.
+- On gap detection (missing sequence number after `jitterBufferMs`): drop the entire access unit up to the next IDR AND send `ExtWebRTCRequestIDR` over the control channel. Do NOT feed a partial access unit to `VideoDecoder` — it will produce visible corruption.
+- Reuse the existing `H264Decoder`, `pendingFrames`, and `onFrameRendered` instrumentation from `web/src/encodings/h264.ts`. The only difference is the input source (`DataChannel.onmessage` vs framebuffer rect).
+
+**Testing:**
+- Go unit test in `wsproxy/h264packet_test.go`: NALU fragmentation round-trip.
+- Vitest: assembler reorder tolerance (in-window shuffle), gap detection triggers IDR request, oversized-gap discards to next IDR.
+
+---
+
+### 5.4 Keyframe Request and Loss Recovery
+
+**Files:** Modifications to `h264/encoder.go`, `h264/mf_windows.go`, `h264/x264_cgo.go`, `wsproxy/proxy.go`, new `wsproxy/h264control.go`
+
+**What to build:**
+- New extension message `141` — `ExtH264ForceIDR` (browser→proxy via the reliable `control` DataChannel; also accepted over WebSocket as fallback).
+- On receipt, the proxy forwards a `ForceKeyframe()` call to the encoder for that session.
+- `H264Encoder` interface gains `ForceKeyframe() error`:
+  - Media Foundation: `IMFTransform::ProcessMessage(MFT_MESSAGE_COMMAND_REQUEST_KEY_FRAME, 0)` before the next input sample.
+  - x264 (via CGo): set `x264_picture_t.i_type = X264_TYPE_IDR` on the next `x264_encoder_encode`.
+- Rate-limit keyframe requests to at most 1 per 500 ms per session (prevent request storms from causing IDR spam that trashes bitrate).
+- Log keyframe requests at `INFO` level with `session_id`, `reason` ("gap", "startup", "user"), and `intervalMs` since last IDR — this is a key metric for the perf-tuning docs.
+
+**Testing:**
+- Windows integration test: force IDR, verify the next output NALU is type 5 (IDR).
+- x264 integration test: same, verify `x264_nal_t.i_type == NAL_SLICE_IDR`.
+
+---
+
+### 5.5 Adaptive Bitrate Feedback
+
+**Files:** Modifications to `wsproxy/proxy.go`, `h264/mf_windows.go`, `h264/x264_cgo.go`, new `wsproxy/h264control.go`
+
+**What to build:**
+- WebRTC's built-in congestion controller (Google Congestion Control in `pion/webrtc`) estimates available bandwidth. Poll `RTCPeerConnection.GetStats()` server-side every 1 s and read `availableOutgoingBitrate`.
+- Feed the estimate into the encoder as a target bitrate hint via new `H264Encoder.SetBitrate(bps uint32) error`:
+  - Media Foundation: `ICodecAPI::SetValue(CODECAPI_AVEncCommonMeanBitRate, ...)`. Currently hard-coded to `5_000_000` bps at [h264/mf_windows.go:309](h264/mf_windows.go:309) — replace with a mutable value guarded by a mutex.
+  - x264: `x264_encoder_reconfig` with the updated `i_bitrate`.
+- Clamp: min 500 kbps, max = `MaxBitrate` config (default 20 Mbps). Rate-limit updates to at most 1 per 2 s to avoid encoder thrashing.
+- When the session transport is WebSocket (fallback path), skip the estimator and use the static configured bitrate.
+- Consider dropping Windows MFT from CBR → `UnconstrainedVBR` at the same time (already listed as an independent next-step in `CLAUDE.md`) — with adaptive bitrate feedback, CBR's fixed idle floor becomes an active liability.
+
+**Testing:**
+- Unit test the bitrate-clamp / rate-limit logic.
+- Manual test with `tc netem` (see 5.7) that a simulated bandwidth drop is reflected in encoder output within 3 s.
+
+---
+
+### 5.6 Fallback, Negotiation, and Health Signalling
+
+**Files:** Modifications to `wsproxy/proxy.go`, `web/src/index.ts`, `web/src/components/DebugOverlay.tsx`
+
+**What to build:**
+- Auto-negotiation flow:
+  1. Browser opens WebSocket, sends client-hello with `webrtcCapable = preferUDP && supportsH264`.
+  2. Proxy responds with SDP offer only if `WebRTCEnabled && capable`.
+  3. If ICE completes within 3 s → set session `videoTransport = "webrtc"`, send `ExtWebRTCReady`, stop mirroring H.264 rects to WebSocket.
+  4. If ICE fails or times out → tear down peer connection, log, continue on WebSocket unchanged. No user-visible interruption.
+- Runtime transport swap:
+  - If DataChannel `close` fires mid-session, revert to WebSocket H.264 relay within one FBU cycle. Force an IDR when the swap happens so the browser doesn't decode against a stale reference frame.
+  - Emit an `ExtWebRTCTeardown` with `reason` field so the browser knows the swap happened.
+- Debug overlay: add a "Transport" row displaying `websocket` or `webrtc (rtt Xms, loss Y%, bwe Z Mbps)`. Values sourced from `RTCPeerConnection.GetStats()` on the browser side.
+- Metrics: add Prometheus counters `redvnc_video_transport_total{transport}` and `redvnc_webrtc_fallback_total{reason}` (ties into Phase 2.2).
+
+**Testing:**
+- Integration test simulating ICE timeout (block UDP with iptables in a container) — verify the connection continues over WebSocket without user-visible error.
+
+---
+
+### 5.7 Loss and Jitter Test Harness
+
+**Files:** New `docs/PERF_TESTING.md`, new `scripts/netem-setup.sh` (Linux) / `scripts/clumsy-profile.xml` (Windows)
+
+**What to build:**
+- Automated `tc netem` profiles for Linux for reproducible perf runs. Standard profiles: `lan` (0% loss, 0 ms), `wifi-good` (0.5% loss, 10 ms, ±2 ms jitter), `wifi-bad` (3% loss, 40 ms, ±10 ms jitter), `mobile` (7% loss, 80 ms, ±30 ms jitter, 5 Mbps rate cap).
+- Instrumentation harness: capture the per-frame overlay logs already emitted by [web/src/encodings/h264.ts](web/src/encodings/h264.ts) — `decode+readback avg/max`, `renderTime - fbuRequestTime`. Export as CSV for A/B comparison.
+- Baseline the current WebSocket path under each profile, then re-run with `preferUDP=true`. Table the deltas. Publish the results in `docs/PERFORMANCE.md`.
+- Do NOT ship UDP by default until this harness has produced numbers on at least the `wifi-good` and `wifi-bad` profiles showing measurable improvement.
+
+**Testing:**
+- The harness itself is the test. Also add a CI smoke job (Linux only) that runs one iteration under the `lan` profile to catch regressions.
+
+---
+
+### 5.8 Documentation
+
+**Files:** New `docs/UDP_TRANSPORT.md`, updates to `docs/PERFORMANCE.md`, `README.md`, `CLAUDE.md`
+
+**What to build:**
+- `docs/UDP_TRANSPORT.md`:
+  - When to enable `preferUDP` (H.264 users on lossy links) and when not to (LAN deployments, non-H.264 encodings).
+  - Firewall / NAT requirements: symmetric NAT problems, when TURN is needed, port-range recommendations.
+  - Extension message reference (136–141) with byte-level layouts.
+  - Fallback behaviour and how to detect it in the browser API (`webrtc-fallback` event).
+- `docs/PERFORMANCE.md`: add a section quoting the measured numbers from 5.7.
+- `README.md`: a short note under "Configuration" pointing at `docs/UDP_TRANSPORT.md`.
+- `CLAUDE.md`: update the "Data Flow" diagram to show the optional WebRTC DataChannel path, and add invariants (H.264-only, WS is source of truth for signalling, IDR-on-swap).
+
+---
+
 ## Implementation Order (Suggested Timeline)
 
 | Order | Item | Phase | Est. Complexity |
@@ -624,3 +801,11 @@ services:
 | 22 | 4.3 WebGL renderer | P4 | Medium |
 | 23 | 4.4 Web Worker parsing | P4 | Medium |
 | 24 | 4.5 Documentation | P4 | Medium |
+| 25 | 5.7 Loss/jitter test harness (baseline WS numbers) | P5 | Small |
+| 26 | 5.1 WebRTC signalling on proxy | P5 | Large |
+| 27 | 5.2 WebRTC signalling on browser | P5 | Medium |
+| 28 | 5.3 H.264 NAL packetization | P5 | Large |
+| 29 | 5.4 Keyframe request & loss recovery | P5 | Medium |
+| 30 | 5.6 Fallback & negotiation | P5 | Medium |
+| 31 | 5.5 Adaptive bitrate feedback | P5 | Medium |
+| 32 | 5.8 Documentation | P5 | Small |
